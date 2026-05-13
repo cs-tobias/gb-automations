@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     # but tracked here so .env validation is centralized.
     cloudflare_tunnel_token: str = ""
 
+    # Gmail Pub/Sub push (Stage 4c).
+    # PUBSUB_TOPIC: full topic name e.g. projects/PROJECT_ID/topics/gmail-events
+    # PUBSUB_AUDIENCE: audience claim Pub/Sub signs JWTs with — defaults to the
+    #   push endpoint URL (leave matching the value in the GCP subscription).
+    # PUBSUB_SERVICE_ACCOUNT_EMAIL: the SA that signs the JWTs (the one chosen
+    #   when creating the push subscription). Used to validate the iss/email claim.
+    pubsub_topic: str = ""
+    pubsub_audience: str = "https://hub.tobiaseek.com/webhooks/gmail"
+    pubsub_service_account_email: str = ""
+
 
 settings = Settings()
 

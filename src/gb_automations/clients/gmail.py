@@ -154,6 +154,57 @@ def list_threads_with_label(
 
 
 # ============================================================
+# Pub/Sub push: watch + history (Stage 4c)
+# ============================================================
+
+
+def start_watch(user_email: str, topic_name: str) -> dict[str, Any]:
+    """Start a Gmail push-notification watch on a mailbox.
+
+    Returns {"historyId": "<str>", "expiration": "<ms_since_epoch_str>"}.
+    Watch tokens expire after ~7 days — must be renewed before then.
+    """
+    service = gmail_for(user_email)
+    body = {
+        "topicName": topic_name,
+        # We're interested in label changes (admin tagging threads) AND new messages
+        # arriving on already-labeled threads. Both surface through the same watch.
+        "labelFilterBehavior": "INCLUDE",
+        # Subscribe to INBOX is broad but we filter on our side by checking which
+        # labels the changed thread carries. Narrower filters miss edge cases
+        # (e.g. a thread gets the project label *after* arriving in INBOX).
+        "labelIds": ["INBOX"],
+    }
+    return service.users().watch(userId="me", body=body).execute()
+
+
+def stop_watch(user_email: str) -> None:
+    """Stop the active Gmail watch for a user (cancels notifications)."""
+    service = gmail_for(user_email)
+    service.users().stop(userId="me").execute()
+
+
+def list_history(user_email: str, start_history_id: str, max_results: int = 100) -> dict[str, Any]:
+    """Fetch Gmail history starting from `start_history_id`.
+
+    Returns the raw response; caller iterates `history` entries to find affected
+    messages/threads. `historyId` on the response is the new cursor to save.
+    """
+    service = gmail_for(user_email)
+    return (
+        service.users()
+        .history()
+        .list(
+            userId="me",
+            startHistoryId=start_history_id,
+            historyTypes=["messageAdded", "labelAdded"],
+            maxResults=max_results,
+        )
+        .execute()
+    )
+
+
+# ============================================================
 # Internal: parse Gmail's nested message payload
 # ============================================================
 

@@ -175,7 +175,30 @@ parent_id = (parent.get("id") or parent.get("database_id") or "").replace("-", "
 
 ---
 
-## 9. Application logs need to be at WARNING level to be visible in `docker compose logs`
+## 9. Domain Restricted Sharing blocks adding `gmail-api-push@system.gserviceaccount.com` to a topic
+
+**Symptom:** when granting `gmail-api-push@system.gserviceaccount.com` the `Pub/Sub Publisher` role on your `gmail-events` topic, GCP errors:
+> *The 'Domain Restricted Sharing' organization policy (constraints/iam.allowedPolicyMemberDomains) is enforced. Only principals in allowed domains can be added as principals in the policy.*
+
+**Why:** another "Secure by Default" policy. New Workspace-linked GCP orgs restrict IAM membership to the org's own domain. Google's system service account (`gmail-api-push@system.gserviceaccount.com`) is not in that allowed list, so the grant is rejected.
+
+**Fix (Cloud Shell, project-scoped):**
+```
+cat > /tmp/allow-all-domains.yaml << 'EOF'
+name: projects/YOUR_PROJECT_ID/policies/iam.allowedPolicyMemberDomains
+spec:
+  rules:
+  - allowAll: true
+EOF
+gcloud org-policies set-policy /tmp/allow-all-domains.yaml
+```
+Wait ~30 sec, retry the IAM grant in the GCP UI.
+
+**Scope note:** `allowAll: true` only applies to this project. Org-wide enforcement stays in place. If you want to be narrower, add Google's customer ID to the allowed list instead — but for a single dev project, allowAll is the simplest move.
+
+---
+
+## 10. Application logs need to be at WARNING level to be visible in `docker compose logs`
 
 **Symptom:** you add `logger.info("...")` to debug a webhook handler. Hit it. See uvicorn's access log line in container output but none of your application logs.
 
@@ -189,7 +212,7 @@ WARNING+ propagates through default config. Switch back to `info` once the issue
 
 ---
 
-## 10. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
+## 11. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
 
 **Symptom:** Alembic migration fails on `CREATE INDEX ix_<table>_<col> ... already exists` even though the table didn't exist before this migration.
 

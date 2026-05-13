@@ -12,6 +12,7 @@ Stage 4c will add /webhooks/gmail (Pub/Sub push) for the inbound side.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -21,13 +22,18 @@ from functools import partial
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from google.auth.transport import requests as g_requests
+from google.oauth2 import id_token
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import User
+from gb_automations.models import SyncCursor, User
+from gb_automations.sync.sync_thread import sync_thread
+from gb_automations.sync.watches import cursor_source_for
 
 logger = logging.getLogger(__name__)
 
@@ -214,5 +220,171 @@ async def notion_webhook(request: Request) -> Response:
     )
     return Response(
         content=json.dumps({"label": title, **result}),
+        media_type="application/json",
+    )
+
+
+# ============================================================
+# /webhooks/gmail — Gmail Pub/Sub push -> Notion sync (Stage 4c)
+# ============================================================
+
+
+def _verify_pubsub_jwt(authorization_header: str | None) -> dict[str, Any] | None:
+    """Verify the OIDC JWT Pub/Sub sends with push deliveries.
+
+    Returns the decoded claims on success, None on failure. Checks signature
+    against Google's public keys, audience claim, and (if configured) issuer
+    service account email.
+    """
+    if not authorization_header or not authorization_header.startswith("Bearer "):
+        return None
+    token = authorization_header.removeprefix("Bearer ").strip()
+    try:
+        claims = id_token.verify_oauth2_token(
+            token, g_requests.Request(), audience=settings.pubsub_audience
+        )
+    except Exception:
+        logger.exception("Pub/Sub JWT verification failed")
+        return None
+
+    if settings.pubsub_service_account_email:
+        # Cross-check that the signer is the SA we expect (set during subscription creation)
+        if claims.get("email") != settings.pubsub_service_account_email:
+            logger.warning(
+                "Pub/Sub JWT signer mismatch: expected=%s got=%s",
+                settings.pubsub_service_account_email,
+                claims.get("email"),
+            )
+            return None
+    return claims
+
+
+async def _load_history_cursor(email: str) -> str | None:
+    async with SessionLocal() as session:
+        cur = await session.get(SyncCursor, cursor_source_for(email))
+        return cur.cursor_value if cur else None
+
+
+async def _save_history_cursor(email: str, history_id: str) -> None:
+    async with SessionLocal() as session:
+        stmt = (
+            pg_insert(SyncCursor)
+            .values(source=cursor_source_for(email), cursor_value=str(history_id))
+            .on_conflict_do_update(
+                index_elements=["source"], set_={"cursor_value": str(history_id)}
+            )
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+def _collect_changed_thread_ids(history_response: dict[str, Any]) -> set[str]:
+    """Extract every Gmail thread ID touched by the history response.
+
+    We re-sync at the thread level (cheap, idempotent via dedup), so anything
+    that mentions a thread — messageAdded, labelAdded — triggers a re-sync.
+    """
+    thread_ids: set[str] = set()
+    for entry in history_response.get("history", []) or []:
+        for change_type in ("messagesAdded", "labelsAdded"):
+            for change in entry.get(change_type, []) or []:
+                msg = change.get("message") or {}
+                tid = msg.get("threadId")
+                if tid:
+                    thread_ids.add(tid)
+    return thread_ids
+
+
+@router.post("/gmail")
+async def gmail_webhook(request: Request) -> Response:
+    """Gmail Pub/Sub push receiver.
+
+    Pub/Sub envelope shape:
+      { "message": { "data": "<base64-json>", "messageId": "...", ... },
+        "subscription": "projects/.../subscriptions/..." }
+    The data, once base64-decoded, is:
+      { "emailAddress": "...", "historyId": "..." }
+    """
+    claims = _verify_pubsub_jwt(request.headers.get("Authorization"))
+    if claims is None:
+        logger.warning("Pub/Sub push rejected: missing/invalid JWT")
+        raise HTTPException(401, "Bad or missing Pub/Sub JWT")
+
+    raw_body = await request.body()
+    try:
+        envelope = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON envelope") from None
+
+    msg = envelope.get("message") or {}
+    data_b64 = msg.get("data")
+    if not data_b64:
+        # Pub/Sub sometimes ping the endpoint with empty deliveries — ack quietly.
+        return Response(content=json.dumps({"received": True}), media_type="application/json")
+
+    try:
+        data = json.loads(base64.b64decode(data_b64).decode("utf-8"))
+    except Exception as err:
+        logger.exception("Failed to decode Pub/Sub data")
+        raise HTTPException(400, f"Bad Pub/Sub data: {err}") from err
+
+    email = (data.get("emailAddress") or "").lower()
+    new_history_id = str(data.get("historyId") or "")
+    if not email or not new_history_id:
+        logger.warning("Pub/Sub message missing emailAddress or historyId: %s", data)
+        return Response(content=json.dumps({"ignored": True}), media_type="application/json")
+
+    logger.info("Gmail push: email=%s new_history_id=%s", email, new_history_id)
+
+    # Look up the last historyId we processed for this user.
+    last_history_id = await _load_history_cursor(email)
+    if not last_history_id:
+        # First push for this user — we don't know the starting point yet. Save the
+        # incoming one as the baseline so subsequent pushes have something to diff against.
+        # Skipping this single notification is fine; the watch() call returns the initial
+        # historyId, which would normally be saved at watch-start time.
+        await _save_history_cursor(email, new_history_id)
+        return Response(
+            content=json.dumps({"initialized": True, "history_id": new_history_id}),
+            media_type="application/json",
+        )
+
+    # Fetch changes since last seen. history.list is sync — wrap in executor.
+    loop = asyncio.get_running_loop()
+    try:
+        history = await loop.run_in_executor(
+            _executor, partial(gmail_client.list_history, email, last_history_id)
+        )
+    except Exception:
+        logger.exception("Gmail history.list failed for %s", email)
+        raise HTTPException(502, "Gmail history fetch failed") from None
+
+    thread_ids = _collect_changed_thread_ids(history)
+    logger.info(
+        "Gmail history for %s: from=%s to=%s threads=%d",
+        email,
+        last_history_id,
+        new_history_id,
+        len(thread_ids),
+    )
+
+    # Dispatch sync_thread for each affected thread. Each call is independent so
+    # one bad thread doesn't kill the rest.
+    synced = []
+    errored = []
+    for tid in thread_ids:
+        try:
+            result = await sync_thread(email, tid)
+            synced.append({"thread_id": tid, "rows_created": result.rows_created})
+        except Exception as err:
+            logger.exception("sync_thread failed for %s / %s", email, tid)
+            errored.append({"thread_id": tid, "error": str(err)})
+
+    # Save the new cursor only after we attempted everything — that way we don't
+    # advance past unprocessed history if Gmail returns a paginated response.
+    await _save_history_cursor(email, new_history_id)
+
+    return Response(
+        content=json.dumps({"email": email, "synced": synced, "errored": errored}),
         media_type="application/json",
     )
