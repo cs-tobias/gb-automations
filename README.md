@@ -59,4 +59,4 @@ docs/reference/       Prior architecture chat + the existing Apps Script
 4. **Stage 4** — Gmail Pub/Sub push for the email side. Domain-wide delegation for multi-inbox.
 5. **Stage 5+** — Frame, Toggl, Fiken, meeting transcripts, MCP server, RAG.
 
-See [docs/reference/claude-chat.md](docs/reference/claude-chat.md) for the architecture conversation that led here, and [docs/gotchas.md](docs/gotchas.md) for setup pitfalls (Docker env reload, GCP org policy, DWD scopes, etc.) — read this before standing up the stack on a new machine.
+See [docs/setup.md](docs/setup.md) for a complete fresh-deployment runbook (GCP + Workspace + Notion + Cloudflare + bring-up — ~1 hour), [docs/gotchas.md](docs/gotchas.md) for the pitfalls that runbook explicitly prevents, and [docs/reference/claude-chat.md](docs/reference/claude-chat.md) for the architecture conversation that led here.
