@@ -122,6 +122,24 @@ Make sure `https://mail.google.com/` (with trailing slash) is in the DWD scopes 
 
 ---
 
+## 7. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
+
+**Symptom:** Alembic migration fails on `CREATE INDEX ix_<table>_<col> ... already exists` even though the table didn't exist before this migration.
+
+**Why:** `sa.Column(..., index=True)` inside `op.create_table(...)` *auto-generates* an index using Alembic's default naming convention (`ix_<table>_<col>`). If you also call `op.create_index("ix_<table>_<col>", ...)` afterwards, the explicit call collides with the auto-generated one.
+
+**Fix:** pick one. For migration files, prefer the explicit `op.create_index(...)` call (more readable) and leave `index=True` *off* the column:
+```
+sa.Column("gmail_thread_id", sa.String(64), nullable=False),  # no index=True
+...
+op.create_index("ix_email_rows_gmail_thread_id", "email_rows", ["gmail_thread_id"])
+```
+The `index=True` flag in the SQLAlchemy *model* (in `models.py`) is fine — that's only honored by `Base.metadata.create_all()`, which we don't use; Alembic ignores it.
+
+**Recovery:** Postgres uses transactional DDL with Alembic, so a failed migration rolls back fully — `alembic_version` stays at the previous head and no partial tables remain. After fixing the migration file, rebuild the api image (`docker compose up -d --build api`); the entrypoint re-runs `alembic upgrade head` cleanly.
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.
