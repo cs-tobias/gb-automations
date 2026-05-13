@@ -136,7 +136,7 @@ Place the service account JSON at `secrets/gcp-service-account.json`.
 ## 8. Bring up the stack *(2 min)*
 
 ```bash
-docker compose --profile tunnel up -d --build
+docker compose up -d --build
 ```
 
 Wait ~15 sec for Postgres to be healthy and the api to start. Verify:
@@ -158,7 +158,7 @@ Find the IDs for `Emails`, `Contacts`, `Project`. Paste into `.env` as `EMAILS_D
 
 **Recreate api to pick up the changes:**
 ```bash
-docker compose --profile tunnel up -d --force-recreate api
+docker compose up -d --force-recreate api
 ```
 
 > `docker compose restart` does NOT reload `.env` — must use `up -d --force-recreate`.
@@ -174,7 +174,7 @@ docker compose --profile tunnel up -d --force-recreate api
    ```
 3. Paste the `secret_…` token into Notion's "Verification token" field → confirm.
 4. Paste the **same** token into `.env` as `NOTION_WEBHOOK_SECRET`.
-5. Recreate api: `docker compose --profile tunnel up -d --force-recreate api`
+5. Recreate api: `docker compose up -d --force-recreate api`
 
 ## 11. Seed users + bootstrap Gmail watches *(2 min)*
 
@@ -214,7 +214,7 @@ docker compose logs -f api | grep -v "GET /health"
 
 ```bash
 git pull
-docker compose --profile tunnel up -d --build
+docker compose up -d --build
 ```
 
 Both api + cloudflared are managed by compose with `restart: unless-stopped`, so they survive reboots automatically. APScheduler renews Gmail watches every 5 days inside the api container.
@@ -225,7 +225,7 @@ Both api + cloudflared are managed by compose with `restart: unless-stopped`, so
 |---|---|
 | Gmail watches expired (>7 days outage) | `docker compose exec api python -m gb_automations.scripts.start_watches` |
 | Need to backfill a missed thread | `docker compose exec api python -m gb_automations.sync.sync_one --email USER --thread THREAD_ID` |
-| Container won't pick up new `.env` | `docker compose --profile tunnel up -d --force-recreate api` (not `restart`) |
+| Container won't pick up new `.env` | `docker compose up -d --force-recreate api` (not `restart`) |
 | Service account key compromised | Rotate: generate new JSON in GCP → swap `secrets/gcp-service-account.json` → restart api |
 
 ## See also
