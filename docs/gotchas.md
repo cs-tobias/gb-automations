@@ -122,7 +122,25 @@ Make sure `https://mail.google.com/` (with trailing slash) is in the DWD scopes 
 
 ---
 
-## 7. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
+## 7. Cloudflare proxied wildcard `*` records intercept new subdomains
+
+**Symptom:** you create a Cloudflare Tunnel public hostname (e.g. `hub.tobiaseek.com → api:8000`), the tunnel container shows the right ingress config, but hitting the hostname returns content from your *other* origin (in our case, Vercel). The Cloudflare DNS panel does show the `Tunnel` record for the subdomain.
+
+**Why:** if the zone has a wildcard `A *` record set to **Proxied** (orange cloud), Cloudflare's edge can intercept the new subdomain before the Tunnel route takes effect — even though specific records should beat wildcards in plain DNS. The wildcard's edge routing rule effectively shadows the tunnel route.
+
+**Fix:** in Cloudflare DNS → find every `*` (wildcard) record → toggle proxy status from **orange cloud → gray cloud** ("DNS only"). Specific records like `www`, the apex, and any tunnel hostnames keep their orange clouds. Now the wildcard only catches DNS lookups for subdomains that have no record at all, and doesn't sit in front of edge routing for `hub` etc.
+
+**Verify it worked:**
+```
+curl --resolve hub.YOURDOMAIN.com:443:104.21.54.242 https://hub.YOURDOMAIN.com/health
+```
+That forces curl to talk to a Cloudflare anycast IP. If the response has `server: cloudflare` and `cf-ray: ...` headers, Cloudflare's edge is now in the path. If you get back JSON from your service, end-to-end is working.
+
+**Bonus gotcha:** your laptop's local DNS resolver (or router) may cache the old wildcard answer for hours after the fix — making it look like the fix didn't take. Test with `dig @1.1.1.1 hub.YOURDOMAIN.com +short` to bypass local cache, or hit the IP directly with `--resolve` as above. External services like Notion / Google Pub/Sub use their own resolvers and won't have this problem.
+
+---
+
+## 8. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
 
 **Symptom:** Alembic migration fails on `CREATE INDEX ix_<table>_<col> ... already exists` even though the table didn't exist before this migration.
 

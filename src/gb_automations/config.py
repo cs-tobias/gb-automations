@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     emails_db_id: str = ""
     contacts_db_id: str = ""
 
+    # Webhook auth secrets
+    notion_webhook_secret: str = ""
+
+    # Cloudflare Tunnel — only consumed by docker-compose's cloudflared service,
+    # but tracked here so .env validation is centralized.
+    cloudflare_tunnel_token: str = ""
+
 
 settings = Settings()
 

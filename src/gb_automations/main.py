@@ -4,9 +4,11 @@ from sqlalchemy import text
 from gb_automations.config import settings
 from gb_automations.db import engine
 from gb_automations.routes import debug as debug_routes
+from gb_automations.routes import webhooks as webhook_routes
 
 app = FastAPI(title="gb-automations", version="0.1.0")
 app.include_router(debug_routes.router)
+app.include_router(webhook_routes.router)
 
 
 @app.get("/health")
