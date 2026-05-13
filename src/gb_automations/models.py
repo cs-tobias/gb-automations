@@ -9,7 +9,9 @@ from gb_automations.db import Base
 class SyncCursor(Base):
     """Per-source position marker for incremental syncs.
 
-    Placeholder for the skeleton — real models land when we port the Apps Script logic.
+    Will hold things like Gmail historyId per user (Stage 4 Pub/Sub) and
+    Notion last_edited_time. Generic key/value design so we don't need a
+    new table every time we add a source.
     """
 
     __tablename__ = "sync_cursors"
@@ -30,4 +32,45 @@ class User(Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class EmailRow(Base):
+    """Local cache of "Gmail message → Notion row" mappings.
+
+    Notion is the source of truth (we still query it on cache miss), but this
+    table avoids hitting Notion's API on every dedup check. One row per
+    Gmail message; message IDs are globally unique even when the same email
+    lands in multiple inboxes.
+    """
+
+    __tablename__ = "email_rows"
+
+    gmail_message_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Which user's mailbox surfaced this message to us (informational; for debugging
+    # multi-recipient cases). The notion_page_id is shared across all users.
+    seen_by_email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class ContactCache(Base):
+    """email → Notion contact page ID. Avoids Notion lookups on every sync.
+
+    Email is the natural key — a person can have multiple addresses but we treat
+    each address as its own contact (matches Apps Script behavior).
+    """
+
+    __tablename__ = "contact_cache"
+
+    email: Mapped[str] = mapped_column(String(254), primary_key=True)
+    notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
