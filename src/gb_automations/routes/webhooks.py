@@ -186,9 +186,21 @@ async def notion_webhook(request: Request) -> Response:
     )
 
     if not _is_project_page(payload):
-        logger.info("↳ ignored (not a page.created in the Projects DB)")
+        # Classify the ignore reason so the log is informative. The most common
+        # source of "ignored" events is our own writes echoing back from Notion:
+        # creating email rows and contacts fires page.created webhooks too.
+        parent_id_clean = (parent.get("id") or "").replace("-", "")
+        if parent_id_clean == settings.emails_db_id.replace("-", ""):
+            reason = "our own Emails-DB row write (feedback loop, fine)"
+        elif parent_id_clean == settings.contacts_db_id.replace("-", ""):
+            reason = "our own Contacts-DB row write (feedback loop, fine)"
+        elif event_type != "page.created":
+            reason = f"event type {event_type!r} is not page.created"
+        else:
+            reason = "parent is not the configured Projects DB"
+        logger.info("↳ ignored: %s", reason)
         return Response(
-            content=json.dumps({"ignored": True, "reason": f"not a project page ({event_type})"}),
+            content=json.dumps({"ignored": True, "reason": reason}),
             media_type="application/json",
         )
 
