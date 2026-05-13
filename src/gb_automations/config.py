@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Notion database IDs (find via /debug/databases after the integration is shared)
     emails_db_id: str = ""
     contacts_db_id: str = ""
+    # Optional: if set, the Notion webhook only acts on pages parented to this database.
+    # If empty, every page.created event the integration sees is treated as a project.
+    projects_db_id: str = ""
 
     # Webhook auth secrets
     notion_webhook_secret: str = ""

@@ -150,6 +150,14 @@ def reset_schema_cache() -> None:
     _emails_db_property_names_cache = None
 
 
+async def get_page(page_id: str) -> dict[str, Any]:
+    """Fetch a single page by ID."""
+    async with _client() as client:
+        response = await client.get(f"/pages/{page_id}")
+        _raise_for_status(response)
+        return response.json()
+
+
 async def find_email_row_by_message_id(message_id: str) -> dict[str, Any] | None:
     """Query the Emails DB for a non-archived row with this Gmail message ID."""
     if not settings.emails_db_id:

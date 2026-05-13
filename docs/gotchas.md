@@ -122,25 +122,74 @@ Make sure `https://mail.google.com/` (with trailing slash) is in the DWD scopes 
 
 ---
 
-## 7. Cloudflare proxied wildcard `*` records intercept new subdomains
+## 7. Cloudflare wildcard `A *` records hijack tunnel subdomains
 
-**Symptom:** you create a Cloudflare Tunnel public hostname (e.g. `hub.tobiaseek.com → api:8000`), the tunnel container shows the right ingress config, but hitting the hostname returns content from your *other* origin (in our case, Vercel). The Cloudflare DNS panel does show the `Tunnel` record for the subdomain.
+**Symptom:** you create a Cloudflare Tunnel public hostname (e.g. `hub.tobiaseek.com → api:8000`), the tunnel container shows the right ingress config, the Cloudflare DNS panel shows the `Tunnel` record — but hitting the hostname returns content from your *other* origin (Vercel in our case). Even after switching the wildcards to "DNS only", the problem can persist because of resolver caching at the edge and at remote ISPs.
 
-**Why:** if the zone has a wildcard `A *` record set to **Proxied** (orange cloud), Cloudflare's edge can intercept the new subdomain before the Tunnel route takes effect — even though specific records should beat wildcards in plain DNS. The wildcard's edge routing rule effectively shadows the tunnel route.
+**Why:** if the zone has a wildcard `A *` record (proxied OR DNS-only), it can intercept queries for unconfigured-or-just-added subdomains. With proxied wildcards, Cloudflare's edge serves them via the wildcard origin. With DNS-only wildcards, intermediate resolvers (Cloudflare's own 1.1.1.1, ISP resolvers) may return the wildcard's A records ahead of the new specific Tunnel record, especially if any resolver had cached an old answer.
 
-**Fix:** in Cloudflare DNS → find every `*` (wildcard) record → toggle proxy status from **orange cloud → gray cloud** ("DNS only"). Specific records like `www`, the apex, and any tunnel hostnames keep their orange clouds. Now the wildcard only catches DNS lookups for subdomains that have no record at all, and doesn't sit in front of edge routing for `hub` etc.
+**Fix that actually works: delete the wildcard `*` records entirely.** Specific records (`apex`, `www`, the Tunnel record) all keep working unchanged. Subdomains nobody has configured will return NXDOMAIN, which is what you want — caught explicitly instead of silently going to the wrong origin.
 
-**Verify it worked:**
+**Verify:**
 ```
+# from the public internet (use phone on cellular if your laptop has stale DNS)
+curl https://hub.YOURDOMAIN.com/health
+# or, force Cloudflare anycast directly to bypass any caching layer:
 curl --resolve hub.YOURDOMAIN.com:443:104.21.54.242 https://hub.YOURDOMAIN.com/health
 ```
-That forces curl to talk to a Cloudflare anycast IP. If the response has `server: cloudflare` and `cf-ray: ...` headers, Cloudflare's edge is now in the path. If you get back JSON from your service, end-to-end is working.
+A response with `server: cloudflare` + `cf-ray: ...` headers + your service's body means the path is fully working.
 
-**Bonus gotcha:** your laptop's local DNS resolver (or router) may cache the old wildcard answer for hours after the fix — making it look like the fix didn't take. Test with `dig @1.1.1.1 hub.YOURDOMAIN.com +short` to bypass local cache, or hit the IP directly with `--resolve` as above. External services like Notion / Google Pub/Sub use their own resolvers and won't have this problem.
+**Bonus: laptop/router DNS caches** can hold the old wildcard answer for hours. Test with `dig @8.8.8.8 hub.YOURDOMAIN.com +short` and your phone on cellular data to confirm the public view. External services (Notion, Google Pub/Sub) use their own infra and don't share your local cache.
 
 ---
 
-## 8. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
+## 8. Notion webhook payload uses `parent.type == "database"`, NOT `"database_id"`
+
+**Symptom:** `page.created` events arrive at your webhook, signatures verify, but your filter for "is this a row in the Projects database?" rejects every event.
+
+**Why:** Notion's REST API uses `parent.type == "database_id"` and stores the ID in `parent.database_id`. But Notion's *webhook* events use `parent.type == "database"` and store the ID in `parent.id`. They look almost identical — easy miss.
+
+**Reference payload (real, captured from `gb-automations-dev` integration):**
+```json
+{
+  "type": "page.created",
+  "entity": { "id": "<page-id>", "type": "page" },
+  "data": {
+    "parent": {
+      "id": "<database-id>",
+      "type": "database",
+      "data_source_id": "<...>"
+    }
+  }
+}
+```
+
+**Fix:** when filtering, accept both shapes (so the same code works against API responses and webhook payloads):
+```python
+if parent.get("type") not in ("database", "database_id"):
+    return False
+parent_id = (parent.get("id") or parent.get("database_id") or "").replace("-", "")
+```
+
+**Bonus:** signature verification uses HMAC-SHA256 of the raw body with the verification token (`secret_...`) as the key. Header is `X-Notion-Signature: sha256=<hex>`. Notion's first POST is the verification handshake — the body contains `verification_token`, no signature header; you echo the token back in the response body and `X-Notion-Verification-Token` header to confirm URL ownership. Save the same token as the signing secret for all future events.
+
+---
+
+## 9. Application logs need to be at WARNING level to be visible in `docker compose logs`
+
+**Symptom:** you add `logger.info("...")` to debug a webhook handler. Hit it. See uvicorn's access log line in container output but none of your application logs.
+
+**Why:** uvicorn's default log config emits its own access logs at INFO but suppresses application loggers below WARNING in many setups. Your `gb_automations.routes.webhooks` logger isn't visible in container output.
+
+**Fix:** for production, configure logging properly via `logging.dictConfig` or pydantic-settings → uvicorn `--log-config`. For ad-hoc debugging, just bump the level:
+```python
+logger.warning("debug info: %s", value)
+```
+WARNING+ propagates through default config. Switch back to `info` once the issue is fixed.
+
+---
+
+## 10. Don't pass `index=True` to `sa.Column` *and* call `op.create_index` for the same column
 
 **Symptom:** Alembic migration fails on `CREATE INDEX ix_<table>_<col> ... already exists` even though the table didn't exist before this migration.
 
