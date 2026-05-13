@@ -178,7 +178,7 @@ async def notion_webhook(request: Request) -> Response:
     entity_id = (payload.get("entity") or {}).get("id")
     parent = (payload.get("data") or {}).get("parent") or {}
     logger.info(
-        "Notion event: type=%s entity=%s parent_type=%s parent_id=%s",
+        "📓 Notion event: type=%s entity=%s parent_type=%s parent_id=%s",
         event_type,
         entity_id,
         parent.get("type"),
@@ -186,10 +186,13 @@ async def notion_webhook(request: Request) -> Response:
     )
 
     if not _is_project_page(payload):
+        logger.info("↳ ignored (not a page.created in the Projects DB)")
         return Response(
             content=json.dumps({"ignored": True, "reason": f"not a project page ({event_type})"}),
             media_type="application/json",
         )
+
+    logger.info("↳ accepted; fetching page title from Notion…")
 
     # Pull the page ID from the event and fetch the page to read its current title.
     # The webhook payload often omits the full properties, so fetching is safer.
@@ -206,17 +209,19 @@ async def notion_webhook(request: Request) -> Response:
 
     title = notion_client.extract_page_title(page)
     if not title:
+        logger.info("↳ page has no title yet, skipping label creation")
         return Response(
             content=json.dumps({"ignored": True, "reason": "page has no title"}),
             media_type="application/json",
         )
 
+    logger.info("↳ creating Gmail label %r in all active mailboxes…", title)
     result = await _create_label_for_all_users(title)
     logger.info(
-        "Created Gmail label %r for users: succeeded=%s failed=%s",
+        "↳ done. label=%r succeeded=%d failed=%d",
         title,
-        result["succeeded"],
-        result["failed"],
+        len(result["succeeded"]),
+        len(result["failed"]),
     )
     return Response(
         content=json.dumps({"label": title, **result}),
@@ -334,16 +339,15 @@ async def gmail_webhook(request: Request) -> Response:
         logger.warning("Pub/Sub message missing emailAddress or historyId: %s", data)
         return Response(content=json.dumps({"ignored": True}), media_type="application/json")
 
-    logger.info("Gmail push: email=%s new_history_id=%s", email, new_history_id)
+    logger.info("📬 Gmail push received: email=%s new_historyId=%s", email, new_history_id)
 
     # Look up the last historyId we processed for this user.
     last_history_id = await _load_history_cursor(email)
     if not last_history_id:
         # First push for this user — we don't know the starting point yet. Save the
         # incoming one as the baseline so subsequent pushes have something to diff against.
-        # Skipping this single notification is fine; the watch() call returns the initial
-        # historyId, which would normally be saved at watch-start time.
         await _save_history_cursor(email, new_history_id)
+        logger.info("↳ first push seen, saved as baseline (no sync yet)")
         return Response(
             content=json.dumps({"initialized": True, "history_id": new_history_id}),
             media_type="application/json",
@@ -360,12 +364,19 @@ async def gmail_webhook(request: Request) -> Response:
         raise HTTPException(502, "Gmail history fetch failed") from None
 
     thread_ids = _collect_changed_thread_ids(history)
+    if not thread_ids:
+        logger.info("↳ no relevant changes since %s (nothing to sync)", last_history_id)
+        await _save_history_cursor(email, new_history_id)
+        return Response(
+            content=json.dumps({"email": email, "synced": [], "errored": []}),
+            media_type="application/json",
+        )
+
     logger.info(
-        "Gmail history for %s: from=%s to=%s threads=%d",
-        email,
+        "↳ found %d changed thread(s) between historyId %s → %s. Syncing each…",
+        len(thread_ids),
         last_history_id,
         new_history_id,
-        len(thread_ids),
     )
 
     # Dispatch sync_thread for each affected thread. Each call is independent so
@@ -376,6 +387,18 @@ async def gmail_webhook(request: Request) -> Response:
         try:
             result = await sync_thread(email, tid)
             synced.append({"thread_id": tid, "rows_created": result.rows_created})
+            if result.project_page_id:
+                logger.info(
+                    "  ✓ thread %s [%s]: +%d rows, %d already present",
+                    tid,
+                    result.project_name,
+                    result.rows_created,
+                    result.rows_already_present,
+                )
+            else:
+                logger.info(
+                    "  ⊘ thread %s skipped: %s", tid, result.skipped_reason or "no project match"
+                )
         except Exception as err:
             logger.exception("sync_thread failed for %s / %s", email, tid)
             errored.append({"thread_id": tid, "error": str(err)})
