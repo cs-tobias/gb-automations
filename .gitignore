@@ -32,6 +32,9 @@ htmlcov/
 .env.local
 .env.*.local
 
+# Secrets (service account JSON, etc.) — never commit
+secrets/
+
 # IDE
 .idea/
 .vscode/
