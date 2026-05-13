@@ -15,5 +15,46 @@ class Settings(BaseSettings):
     notion_token: str = ""
     notion_api_version: str = "2022-06-28"
 
+    # Notion database IDs (find via /debug/databases after the integration is shared)
+    emails_db_id: str = ""
+    contacts_db_id: str = ""
+
 
 settings = Settings()
+
+
+# Names of the properties on the Emails database. Change here if you renamed them
+# in Notion. Property types expected:
+#   subject    (title)
+#   thread_id  (rich_text)
+#   message_id (rich_text)        ← dedup key
+#   project    (relation → Projects)
+#   contacts   (relation → Contacts DB)
+#   from_name  (rich_text)
+#   from_email (email)
+#   direction  (select: Incoming | Outgoing)
+#   date       (date)
+#   tags       (multi_select)
+#   preview    (rich_text)
+#   attachments (rich_text)       ← "had N attachments: [name1, name2]" text for now
+EMAILS_PROPS = {
+    "subject": "Subject",
+    "thread_id": "Thread ID",
+    "message_id": "Message ID",
+    "project": "Project",
+    "contacts": "Contacts",
+    "from_name": "From",
+    "from_email": "From Email",
+    "direction": "Direction",
+    "date": "Date",
+    "tags": "Tags",
+    "preview": "Preview",
+    "attachments": "Attachments",
+}
+
+CONTACTS_PROPS = {
+    "name": "Name",
+    "email": "Email",
+    "phone": "Phone",
+    "company": "Company",
+}

@@ -123,3 +123,33 @@ async def debug_users() -> dict[str, Any]:
         "count": len(users),
         "users": [{"email": u.email, "active": u.active} for u in users],
     }
+
+
+@router.get("/databases")
+async def debug_databases() -> dict[str, Any]:
+    """List every Notion database the integration can see — paste the right IDs into .env."""
+    try:
+        dbs = await notion_client.search_databases()
+    except Exception as err:
+        raise HTTPException(502, f"Notion call failed: {err}") from err
+    return {
+        "count": len(dbs),
+        "databases": [
+            {
+                "id": db.get("id"),
+                "title": notion_client.extract_database_title(db),
+                "url": db.get("url"),
+            }
+            for db in dbs
+        ],
+    }
+
+
+@router.get("/projects")
+async def debug_projects() -> dict[str, Any]:
+    """Project name → page ID mapping. Used by Stage 4 (Notion → Gmail label flow)."""
+    try:
+        projects = await notion_client.get_project_pages()
+    except Exception as err:
+        raise HTTPException(502, f"Notion call failed: {err}") from err
+    return {"count": len(projects), "projects": projects}
