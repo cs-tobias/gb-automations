@@ -165,15 +165,14 @@ def start_watch(user_email: str, topic_name: str) -> dict[str, Any]:
     Watch tokens expire after ~7 days — must be renewed before then.
     """
     service = gmail_for(user_email)
+    # INBOX covers incoming mail; SENT covers replies the user sends out from
+    # this mailbox. Both can land on a labeled project thread, both need to
+    # surface in Notion. The actual project-label filtering happens in
+    # sync_thread() server-side, so this filter is intentionally coarse.
     body = {
         "topicName": topic_name,
-        # We're interested in label changes (admin tagging threads) AND new messages
-        # arriving on already-labeled threads. Both surface through the same watch.
         "labelFilterBehavior": "INCLUDE",
-        # Subscribe to INBOX is broad but we filter on our side by checking which
-        # labels the changed thread carries. Narrower filters miss edge cases
-        # (e.g. a thread gets the project label *after* arriving in INBOX).
-        "labelIds": ["INBOX"],
+        "labelIds": ["INBOX", "SENT"],
     }
     return service.users().watch(userId="me", body=body).execute()
 
