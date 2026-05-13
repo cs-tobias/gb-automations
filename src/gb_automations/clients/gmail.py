@@ -62,6 +62,7 @@ class GmailMessage:
     cc_field: str
     plain_body: str
     attachments: list[GmailAttachment]
+    label_ids: list[str]  # Gmail label IDs applied to this message
 
 
 @dataclass
@@ -173,6 +174,7 @@ def _parse_message(raw: dict[str, Any]) -> GmailMessage:
         cc_field=headers.get("Cc", ""),
         plain_body=body,
         attachments=attachments,
+        label_ids=raw.get("labelIds", []) or [],
     )
 
 

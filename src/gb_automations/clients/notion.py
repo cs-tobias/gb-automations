@@ -14,6 +14,26 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 _HTTP_TIMEOUT = 15.0
 
 
+class NotionAPIError(RuntimeError):
+    """Wraps a Notion HTTP error with the response body so the actual cause is visible."""
+
+    def __init__(self, response: httpx.Response):
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        message = f"Notion {response.status_code} {response.request.method} {response.url}: {body}"
+        super().__init__(message)
+        self.status_code = response.status_code
+        self.body = body
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    raise NotionAPIError(response)
+
+
 def _headers() -> dict[str, str]:
     if not settings.notion_token:
         raise RuntimeError("NOTION_TOKEN is not configured")
@@ -40,7 +60,7 @@ async def search_pages(page_size: int = 100) -> list[dict[str, Any]]:
             "/search",
             json={"filter": {"value": "page", "property": "object"}, "page_size": page_size},
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json().get("results", [])
 
 
@@ -51,7 +71,7 @@ async def search_databases(page_size: int = 100) -> list[dict[str, Any]]:
             "/search",
             json={"filter": {"value": "database", "property": "object"}, "page_size": page_size},
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json().get("results", [])
 
 
@@ -102,6 +122,34 @@ async def get_project_pages() -> dict[str, str]:
 # ============================================================
 
 
+_emails_db_property_names_cache: set[str] | None = None
+
+
+async def get_emails_db_property_names() -> set[str]:
+    """Names of every property on the Emails DB, cached after first call.
+
+    Lets sync code skip setting properties that don't exist in the user's schema —
+    so the same code adapts to different Notion workspaces (tobiaseek vs Goldbox)
+    without config changes.
+    """
+    global _emails_db_property_names_cache
+    if _emails_db_property_names_cache is not None:
+        return _emails_db_property_names_cache
+    if not settings.emails_db_id:
+        raise RuntimeError("EMAILS_DB_ID is not configured")
+    async with _client() as client:
+        response = await client.get(f"/databases/{settings.emails_db_id}")
+        _raise_for_status(response)
+    _emails_db_property_names_cache = set(response.json().get("properties", {}).keys())
+    return _emails_db_property_names_cache
+
+
+def reset_schema_cache() -> None:
+    """Drop the cached schema. Useful for tests or after manually editing the DB in Notion."""
+    global _emails_db_property_names_cache
+    _emails_db_property_names_cache = None
+
+
 async def find_email_row_by_message_id(message_id: str) -> dict[str, Any] | None:
     """Query the Emails DB for a non-archived row with this Gmail message ID."""
     if not settings.emails_db_id:
@@ -117,7 +165,7 @@ async def find_email_row_by_message_id(message_id: str) -> dict[str, Any] | None
                 "page_size": 5,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         results = response.json().get("results", [])
         live = [p for p in results if not p.get("archived") and not p.get("in_trash")]
         return live[0] if live else None
@@ -138,7 +186,7 @@ async def has_any_row_for_thread(thread_id: str) -> bool:
                 "page_size": 1,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         results = response.json().get("results", [])
         return any(not p.get("archived") and not p.get("in_trash") for p in results)
 
@@ -155,7 +203,7 @@ async def create_email_row(properties: dict[str, Any]) -> dict[str, Any]:
                 "properties": properties,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json()
 
 
@@ -176,7 +224,7 @@ async def find_contact_by_email(email: str) -> dict[str, Any] | None:
                 "page_size": 1,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         results = response.json().get("results", [])
         return results[0] if results else None
 
@@ -203,7 +251,7 @@ async def create_contact(
                 "properties": properties,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json()
 
 
@@ -211,7 +259,7 @@ async def patch_contact(page_id: str, properties: dict[str, Any]) -> dict[str, A
     """Patch any subset of a contact's properties."""
     async with _client() as client:
         response = await client.patch(f"/pages/{page_id}", json={"properties": properties})
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json()
 
 
@@ -232,7 +280,7 @@ async def append_blocks_to_page(page_id: str, blocks: list[dict[str, Any]]) -> N
         for i in range(0, len(blocks), 100):
             batch = blocks[i : i + 100]
             response = await client.patch(f"/blocks/{page_id}/children", json={"children": batch})
-            response.raise_for_status()
+            _raise_for_status(response)
 
 
 def paragraph_block(text: str) -> dict[str, Any]:
