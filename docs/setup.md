@@ -17,6 +17,7 @@ Step-by-step to stand up gb-automations from scratch on a new Workspace + Notion
 1. https://console.cloud.google.com → top bar → **New Project** → name `gb-automations-prod` (or whatever). Note the project ID.
 2. Sidebar → **APIs & Services → Library** → enable each:
    - **Gmail API**
+   - **Google Drive API** (for uploading email attachments to a per-user shared folder)
    - **Cloud Pub/Sub API**
 
 ## 2. Override two "Secure by Default" org policies *(2 min in Cloud Shell)*
@@ -57,10 +58,10 @@ gcloud org-policies set-policy /tmp/allow-domains.yaml
 3. **Keys** tab → **Add Key → JSON** → download. Move to `secrets/gcp-service-account.json` in the cloned repo (gitignored by default).
 4. Open https://admin.google.com → **Security → Access and data control → API controls → Manage Domain-Wide Delegation → Add new**:
    - Client ID: paste the Unique ID from step 2
-   - OAuth scopes: `https://mail.google.com/`
+   - OAuth scopes (comma-separated): `https://mail.google.com/, https://www.googleapis.com/auth/drive`
    - **Authorize**
 
-> The single broad Gmail scope avoids juggling. For prod hardening later, narrow to `gmail.modify, gmail.metadata, gmail.labels` — must match `SCOPES` in `clients/gmail.py`.
+> The Gmail scope is broad on purpose — narrow later if needed (`gmail.modify, gmail.metadata, gmail.labels`). The Drive scope lets the service account upload email attachments to a per-user shared Drive folder so they're linked from each Notion row's Files property. The two scopes must match `SCOPES` in `clients/gmail.py` and `clients/drive.py` respectively.
 
 ## 4. Notion integration *(5 min)*
 
@@ -167,7 +168,7 @@ docker compose up -d --force-recreate api
 
 1. https://www.notion.so/profile/integrations → `gb-automations` → **Webhooks** → Add subscription:
    - Endpoint: `https://hub.goldbox.no/webhooks/notion`
-   - Events: **`page.created`**
+   - Events: **`page.created`** AND **`page.properties_updated`** (the second is what propagates project renames into Gmail label renames)
 2. Notion sends a verification POST to your endpoint → log shows the token:
    ```bash
    docker compose logs api | grep "Notion webhook verification"
@@ -192,6 +193,47 @@ docker compose exec api python -m gb_automations.scripts.start_watches
 ```
 
 Should print one `historyId` + `expiration` per user. APScheduler will keep watches renewed automatically.
+
+Backfill the project ↔ Gmail-label mapping (lets future Notion project renames propagate into Gmail):
+
+```bash
+docker compose exec api python -m gb_automations.scripts.backfill_project_labels
+```
+
+This walks every project × every seeded user, finds the matching Gmail label by name, and stores the link by ID. Running it once after first deploy is enough — new projects created in Notion afterwards register themselves automatically when their `page.created` webhook fires.
+
+## 11b. Pull the local LLM model *(5–10 min, one-time)*
+
+The api uses a local Ollama instance to auto-tag synced emails. The Ollama container starts empty — pull the model into the named volume once:
+
+```bash
+docker compose exec api python -m gb_automations.scripts.pull_llm_model
+```
+
+Streams progress (~5GB by default — `llama3.1:8b-instruct-q4_K_M`). Stored in the `ollama_data` docker volume so it survives rebuilds. Re-run if you change `OLLAMA_MODEL` in `.env`.
+
+> ⚠️ **GPU on Windows prod (RTX 4080)**: layer the GPU override file on top of the base compose so Ollama uses the GPU:
+> ```bash
+> docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+> ```
+> Verify the GPU is in use:
+> ```bash
+> docker compose exec ollama nvidia-smi
+> ```
+> On Mac dev, just `docker compose up -d --build` — Ollama runs CPU-only (slower, but functional).
+
+Also: add two columns to Notion's Emails database (one-time):
+
+- **Tags** (type: **Multi-select**) — leave options blank; the LLM auto-fills.
+- **Files** (type: **Files & media**) — gets populated with Drive links for any non-signature email attachments.
+
+Then smoke-test:
+
+```bash
+curl 'https://hub.goldbox.no/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20tilbud%20for%20leiligheten?'
+```
+
+Expect a JSON response with `tags` containing something like `["tilbud", "spørsmål"]`.
 
 ## 12. Verify end-to-end *(3 min)*
 
@@ -225,6 +267,12 @@ Both api + cloudflared are managed by compose with `restart: unless-stopped`, so
 |---|---|
 | Gmail watches expired (>7 days outage) | `docker compose exec api python -m gb_automations.scripts.start_watches` |
 | Need to backfill a missed thread | `docker compose exec api python -m gb_automations.sync.sync_one --email USER --thread THREAD_ID` |
+| Want to re-sync from scratch (iterating on extraction / tagging / files) | Delete the relevant Notion rows yourself, then `docker compose exec api python -m gb_automations.scripts.reset_thread` (no args = wipe all threads + signature fingerprints; pass `--thread ID` for a single thread). Reapply the Gmail label to trigger a fresh sync. |
+| Project rename in Notion didn't update Gmail label | Run `docker compose exec api python -m gb_automations.scripts.backfill_project_labels`, then rename again — most likely the project was created before the rename feature shipped (no mapping row) |
+| Email tagging stopped working | `curl https://hub.goldbox.no/debug/llm?prompt=test` — if it errors, `docker compose restart ollama`. If the response is `{"tags": []}` for everything, re-pull the model: `docker compose exec api python -m gb_automations.scripts.pull_llm_model` |
+| Attachments not uploading to Drive (`accessNotConfigured` / `Drive API has not been used in project`) | Enable the Drive API for the SA's GCP project: open the link in the error message (or https://console.cloud.google.com/apis/library/drive.googleapis.com → select the right project → Enable). Wait ~30s, retry. This is separate from DWD authorization — DWD lets the SA impersonate users for the scope; API enablement lets the project call the API at all. |
+| Attachments not uploading to Drive (other auth errors) | Check logs for `drive ←` lines. If absent or erroring on auth, the Drive scope is missing from DWD — go to admin.google.com → Domain-Wide Delegation → edit the client → ensure `https://www.googleapis.com/auth/drive` is in the scope list (comma-separated with Gmail), save, wait ~5 min for propagation, then re-sync. |
+| Want to forget a learned signature image (re-allow it as a real attachment) | `docker compose exec db psql -U gb -d gb -c "DELETE FROM attachment_fingerprints WHERE sender_email='user@example.com';"` — wipes that sender's repetition counts so the next attachment from them uploads fresh |
 | Container won't pick up new `.env` | `docker compose up -d --force-recreate api` (not `restart`) |
 | Service account key compromised | Rotate: generate new JSON in GCP → swap `secrets/gcp-service-account.json` → restart api |
 

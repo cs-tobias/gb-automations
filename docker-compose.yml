@@ -44,5 +44,32 @@ services:
       - api
     restart: unless-stopped
 
+  # Local LLM (Ollama).
+  #
+  # Behind the `ollama` profile so it does NOT start on `docker compose up`
+  # by default. On Mac dev we run Ollama natively (brew install ollama) for
+  # Metal acceleration and point the api at http://host.docker.internal:11434.
+  # That setup is faster than CPU-in-docker and is the permanent dev shape.
+  #
+  # On Windows prod with an NVIDIA GPU, enable the profile + layer the GPU
+  # override:
+  #   docker compose --profile ollama -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+  # And set OLLAMA_BASE_URL=http://ollama:11434 in .env so the api container
+  # talks to the in-stack ollama service instead of the (non-existent on
+  # Windows) host install.
+  #
+  # Models are pulled into the named volume so they survive rebuilds — run
+  # `docker compose exec api python -m gb_automations.scripts.pull_llm_model`
+  # once after first start.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
 volumes:
   db_data:
+  ollama_data:

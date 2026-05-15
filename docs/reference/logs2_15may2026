@@ -1,0 +1,196 @@
+   gb_automations.routes.webhooks | [gmail:58ac] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=189658
+api-1  | 09:47:33 INFO    gb_automations.routes.webhooks | [gmail:58ac] ↳ found 1 changed thread(s) between historyId 189648 → 189658. Queuing background sync…
+api-1  | 09:47:33 INFO    gb_automations.sync.sync_thread | [gmail:58ac] 🧵 sync_thread start: thread=19e166c93fdbc5c6 user=post@tobiaseek.com
+api-1  | 09:47:34 INFO    gb_automations.sync.sync_thread | [gmail:58ac]   • fetched 7 message(s) from Gmail
+api-1  | 09:47:34 INFO    gb_automations.sync.sync_thread | [gmail:58ac]   • matched project '001_GB_Project_1_B' (page=3601cc4e-c1c6-8067-8061-c6f16cd88403)
+api-1  | 09:47:34 INFO    gb_automations.sync.sync_thread | [gmail:58ac]   • extracted 18 prior email(s) from history (regex)
+api-1  | 09:47:35 INFO    gb_automations.sync.sync_thread | [gmail:58ac]   • upserted 7 contact(s)
+api-1  | 09:47:35 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⊘ skipping msg 19e166c93fdbc5c6: no body content and no real attachments (signature-only forward; see extracted history)
+api-1  | 09:47:35 INFO    gb_automations.sync.sync_thread | [gmail:58ac]   → msg 19e166c93fdbc5c6: reconstructing 18 prior email(s)
+api-1  | 09:47:36 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-1b382b5fff: from='Heidi T Bekkevold <htb@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=308 chars: 'Hei, sender over en wetransfer med dokumenter for tre perspektiver av inngangspa…'
+api-1  | 09:47:36 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=308 chars)…
+api-1  | 09:47:47 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 11.2s (output=39 chars)
+api-1  | 09:47:47 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: underlag, inngangsparti
+api-1  | 09:47:49 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-67eb675f65: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=19 chars: 'Tusen takk Heidi ☺️'
+api-1  | 09:47:49 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=19 chars)…
+api-1  | 09:47:50 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:47:51 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-e96914d61d: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=127 chars: 'Hei ☺️ Legger ved test av inngangspartiet etter samtale med Hedda. *Klokken 08:0…'
+api-1  | 09:47:51 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=127 chars)…
+api-1  | 09:47:52 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 1.0s (output=18 chars)
+api-1  | 09:47:52 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: møte
+api-1  | 09:47:59 INFO    gb_automations.clients.drive | [gmail:58ac] drive ← uploaded 'test kl 0800 på sommeren.jpg' (1624.6 KB) → https://drive.google.com/file/d/1Rr0ytKwGPKJVWyKNtEIOs2ywWrXaS5k1/view?usp=drivesdk
+api-1  | 09:47:59 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📎 uploaded 'test kl 0800 på sommeren.jpg' (1624.6 KB) from silje@goldbox.no
+api-1  | 09:48:05 INFO    gb_automations.clients.drive | [gmail:58ac] drive ← uploaded 'image.png' (3862.1 KB) → https://drive.google.com/file/d/1Wic4L1y-bnr-s5-2AGQpM-xy3M7R60P8/view?usp=drivesdk
+api-1  | 09:48:05 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📎 uploaded 'image.png' (3862.1 KB) from silje@goldbox.no
+api-1  | 09:48:08 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-365087da63: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=56 chars: 'Hei, Takk! Vi går for bilde fra kl. 08.00 sommerstid :)'
+api-1  | 09:48:08 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=56 chars)…
+api-1  | 09:48:08 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.7s (output=12 chars)
+api-1  | 09:48:10 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-a945515669: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=65 chars: 'Supert ☺️ Fasade bildet er lagt opp med ny vinkel på Frame også.'
+api-1  | 09:48:10 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=65 chars)…
+api-1  | 09:48:11 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:48:13 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-3b614f969d: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=161 chars: 'Hei, Da har vi lagt inn alle kommentarer på leilighet 11004☺️ Har lagt ved et sk…'
+api-1  | 09:48:13 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=161 chars)…
+api-1  | 09:48:15 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 1.3s (output=34 chars)
+api-1  | 09:48:15 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: korreksjon, fasade
+api-1  | 09:48:17 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-ddfead4f65: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=15 chars: 'Supert, takk ☺️'
+api-1  | 09:48:17 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=15 chars)…
+api-1  | 09:48:17 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:48:19 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-5045edf410: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=86 chars: 'Hei igjen, Da har jeg fått lagt opp første utkast av bilde 28 - inngangsparti og…'
+api-1  | 09:48:19 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=86 chars)…
+api-1  | 09:48:20 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 1.4s (output=39 chars)
+api-1  | 09:48:20 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: underlag, inngangsparti
+api-1  | 09:48:25 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-240b440f51: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=439 chars: 'Hei Silje, Da har vi lagt inn våre kommentarer til inngangsparti og korridor; bi…'
+api-1  | 09:48:25 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=439 chars)…
+api-1  | 09:48:27 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 2.0s (output=41 chars)
+api-1  | 09:48:27 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 09:48:32 INFO    gb_automations.clients.drive | [gmail:58ac] drive ← uploaded '1 - skilt ved leiligheter.png' (250.5 KB) → https://drive.google.com/file/d/1kprnXnzaQpK8diK3cDV7yaqXV8duEMLr/view?usp=drivesdk
+api-1  | 09:48:32 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📎 uploaded '1 - skilt ved leiligheter.png' (250.5 KB) from ht@metropolis.no
+api-1  | 09:48:34 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-1a43f80072: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=44 chars: 'Helt supert ☺️ Har du tid nå klokken 14:00?'
+api-1  | 09:48:34 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=44 chars)…
+api-1  | 09:48:35 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:48:42 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-b901016253: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=47 chars: 'Ja, det passer fint! Kaller deg inn på Teams :)'
+api-1  | 09:48:42 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=47 chars)…
+api-1  | 09:48:43 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.8s (output=18 chars)
+api-1  | 09:48:43 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: møte
+api-1  | 09:48:49 INFO    gb_automations.routes.webhooks | [notion:c170] 📓 Notion webhook received
+api-1  | 09:48:49 INFO    gb_automations.routes.webhooks | [notion:c170] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8139-a970-c9754eb91fef parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:48:49 INFO    gb_automations.routes.webhooks | [notion:c170] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:48:50 INFO    gb_automations.routes.webhooks | [notion:5ef4] 📓 Notion webhook received
+api-1  | 09:48:50 INFO    gb_automations.routes.webhooks | [notion:5ef4] 📓 Notion event: type=page.properties_updated entity=3601cc4e-c1c6-8067-8061-c6f16cd88403 parent_type=database parent_id=35d1cc4e-c1c6-8048-89fb-ea459550035b
+api-1  | 09:48:50 INFO    gb_automations.routes.webhooks | [notion:5ef4] ↳ accepted; fetching page title from Notion…
+api-1  | 09:48:50 INFO    gb_automations.routes.webhooks | [notion:5ef4] ↳ properties updated; checking if label rename is needed…
+api-1  | 09:48:51 INFO    gb_automations.routes.webhooks | [notion:5ef4] ↳ no rename needed (title unchanged: '001_GB_Project_1_B')
+api-1  | 09:48:53 INFO    gb_automations.routes.webhooks | [notion:2d6e] 📓 Notion webhook received
+api-1  | 09:48:53 INFO    gb_automations.routes.webhooks | [notion:2d6e] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8169-ac23-f740d29c7468 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:48:53 INFO    gb_automations.routes.webhooks | [notion:2d6e] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:48:55 INFO    gb_automations.routes.webhooks | [notion:98c7] 📓 Notion webhook received
+api-1  | 09:48:55 INFO    gb_automations.routes.webhooks | [notion:98c7] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-815d-b9fb-c52e222945a2 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:48:55 INFO    gb_automations.routes.webhooks | [notion:98c7] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:11 INFO    gb_automations.routes.webhooks | [notion:457a] 📓 Notion webhook received
+api-1  | 09:49:11 INFO    gb_automations.routes.webhooks | [notion:457a] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8106-bad9-d072ac4e5e78 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:11 INFO    gb_automations.routes.webhooks | [notion:457a] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:12 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-85bf5baac7: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=22 chars: 'Tak, snakkes straks ☺️'
+api-1  | 09:49:12 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=22 chars)…
+api-1  | 09:49:12 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:13 INFO    gb_automations.routes.webhooks | [notion:bb92] 📓 Notion webhook received
+api-1  | 09:49:13 INFO    gb_automations.routes.webhooks | [notion:bb92] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-811e-b5fa-f708bc9d8442 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:13 INFO    gb_automations.routes.webhooks | [notion:bb92] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:14 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-1ba11c0717: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=527 chars: 'Hei, Etter praten med Hedda i går har jeg prøvd ut en ny vinkel på bilde 28 – in…'
+api-1  | 09:49:14 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=527 chars)…
+api-1  | 09:49:17 INFO    gb_automations.routes.webhooks | [notion:eade] 📓 Notion webhook received
+api-1  | 09:49:17 INFO    gb_automations.routes.webhooks | [notion:eade] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8127-a8a9-e70b9a11ab05 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:17 INFO    gb_automations.routes.webhooks | [notion:eade] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:17 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 2.1s (output=41 chars)
+api-1  | 09:49:17 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 09:49:19 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-6e4a2a1d7e: from='Charlotte Hagemoen <cha@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=153 chars: 'Umiddelbart synes jeg dette ble mye bedre. Hadda tar dialogen videre på detaljen…'
+api-1  | 09:49:19 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=153 chars)…
+api-1  | 09:49:20 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 1.1s (output=22 chars)
+api-1  | 09:49:20 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: spørsmål
+api-1  | 09:49:21 INFO    gb_automations.routes.webhooks | [notion:155c] 📓 Notion webhook received
+api-1  | 09:49:21 INFO    gb_automations.routes.webhooks | [notion:155c] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-816a-a26c-d3ccfa6efd00 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:21 INFO    gb_automations.routes.webhooks | [notion:155c] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:22 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-b6d37768ad: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=245 chars: 'Hei, Enig, dette ble bra! Silje, jeg kan godt legge inn korreksjonene i Frame - …'
+api-1  | 09:49:22 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=245 chars)…
+api-1  | 09:49:24 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 1.6s (output=41 chars)
+api-1  | 09:49:24 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 09:49:25 INFO    gb_automations.routes.webhooks | [notion:5fed] 📓 Notion webhook received
+api-1  | 09:49:25 INFO    gb_automations.routes.webhooks | [notion:5fed] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-819a-91fe-df4d8dc5eed2 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:25 INFO    gb_automations.routes.webhooks | [notion:5fed] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:26 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-c44a60f4f2: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=48 chars: 'Så bra! Kommenter gjerne på den nye vinkelen ☺️'
+api-1  | 09:49:26 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=48 chars)…
+api-1  | 09:49:26 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:28 INFO    gb_automations.routes.webhooks | [notion:55d1] 📓 Notion webhook received
+api-1  | 09:49:28 INFO    gb_automations.routes.webhooks | [notion:55d1] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8181-b3a3-f597ec775e07 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:28 INFO    gb_automations.routes.webhooks | [notion:55d1] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:28 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-6e28e94c1c: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=108 chars: 'Hei, Da er kommentarene på bilde 28 - inngangsparti utendørs lagt inn :) Ønsker …'
+api-1  | 09:49:28 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=108 chars)…
+api-1  | 09:49:30 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 1.4s (output=41 chars)
+api-1  | 09:49:30 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 09:49:33 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (history) 19e166c93fdbc5c6#fwd-c452cc639a: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=41 chars: 'Så bra, takk! Ha en fin helg dere også 🌞'
+api-1  | 09:49:33 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=41 chars)…
+api-1  | 09:49:33 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:35 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (gmail message) 19e169ef76950ed4: from='Tobias Eek <tobias@cinesuit.com>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=17 chars: 'check this out :)'
+api-1  | 09:49:35 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=17 chars)…
+api-1  | 09:49:36 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:37 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'test kl 0800 på sommeren.jpg': duplicate-in-thread (already uploaded)
+api-1  | 09:49:37 INFO    gb_automations.routes.webhooks | [notion:ee15] 📓 Notion webhook received
+api-1  | 09:49:37 INFO    gb_automations.routes.webhooks | [notion:ee15] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-811d-abc9-d26a1c327f04 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:37 INFO    gb_automations.routes.webhooks | [notion:ee15] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:38 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'image.png': duplicate-in-thread (already uploaded)
+api-1  | 09:49:39 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment '1 - skilt ved leiligheter.png': duplicate-in-thread (already uploaded)
+api-1  | 09:49:40 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (gmail message) 19e16b0db2527807: from='Tobias Eek <tobias@cinesuit.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=32 chars: 'Oh, it works! this is a new mail'
+api-1  | 09:49:40 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=32 chars)…
+api-1  | 09:49:41 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:42 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'test kl 0800 på sommeren.jpg': duplicate-in-thread (already uploaded)
+api-1  | 09:49:43 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'image.png': duplicate-in-thread (already uploaded)
+api-1  | 09:49:43 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment '1 - skilt ved leiligheter.png': duplicate-in-thread (already uploaded)
+api-1  | 09:49:45 INFO    gb_automations.routes.webhooks | [notion:541d] 📓 Notion webhook received
+api-1  | 09:49:45 INFO    gb_automations.routes.webhooks | [notion:541d] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81b9-9125-f0e38c0c90c2 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:49:45 INFO    gb_automations.routes.webhooks | [notion:541d] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:49:45 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (gmail message) 19e176c3a053efae: from='Tobias Eek <post@tobiaseek.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=39 chars: 'Does this mail get added? Best, Tobias'
+api-1  | 09:49:45 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=39 chars)…
+api-1  | 09:49:46 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:47 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'test kl 0800 på sommeren.jpg': duplicate-in-thread (already uploaded)
+api-1  | 09:49:48 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'image.png': duplicate-in-thread (already uploaded)
+api-1  | 09:49:48 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment '1 - skilt ved leiligheter.png': duplicate-in-thread (already uploaded)
+api-1  | 09:49:57 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (gmail message) 19e2ac293e5922fd: from='Tobias Eek <post@tobiaseek.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=30 chars: 'Ny mail, hvordan ligger vi an?'
+api-1  | 09:49:57 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=30 chars)…
+api-1  | 09:49:57 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:49:59 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'test kl 0800 på sommeren.jpg': duplicate-in-thread (already uploaded)
+api-1  | 09:50:00 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'image.png': duplicate-in-thread (already uploaded)
+api-1  | 09:50:00 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment '1 - skilt ved leiligheter.png': duplicate-in-thread (already uploaded)
+api-1  | 09:50:02 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (gmail message) 19e2ad962427a6d8: from='Motion Index <hello@motionindex.io>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=51 chars: 'Ligger godt an, ser for oss å levere mandag 18. mai'
+api-1  | 09:50:02 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=51 chars)…
+api-1  | 09:50:02 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:50:04 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     📝 row (gmail message) 19e2b038e3433e90: from='Tobias Eek <post@tobiaseek.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=52 chars: 'Supert. Ser frem til 18 mai! Når på dagen tenker du?'
+api-1  | 09:50:04 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify starting (input=52 chars)…
+api-1  | 09:50:04 INFO    gb_automations.clients.llm | [gmail:58ac] LLM classify done in 0.6s (output=12 chars)
+api-1  | 09:50:05 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'test kl 0800 på sommeren.jpg': duplicate-in-thread (already uploaded)
+api-1  | 09:50:06 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment 'image.png': duplicate-in-thread (already uploaded)
+api-1  | 09:50:07 INFO    gb_automations.sync.sync_thread | [gmail:58ac]     ⏏  skip attachment '1 - skilt ved leiligheter.png': duplicate-in-thread (already uploaded)
+api-1  | 09:50:07 INFO    gb_automations.sync.sync_thread | [gmail:58ac] 🧵 sync_thread done in 154.5s: +24 rows, 0 already present, 7 contact(s)
+api-1  | 09:50:07 INFO    gb_automations.routes.webhooks | [gmail:58ac]   ✓ thread 19e166c93fdbc5c6 [001_GB_Project_1_B]: +24 rows, 0 already present
+api-1  | 09:50:14 INFO    gb_automations.routes.webhooks | [notion:0320] 📓 Notion webhook received
+api-1  | 09:50:14 INFO    gb_automations.routes.webhooks | [notion:0320] 📓 Notion event: type=page.properties_updated entity=3601cc4e-c1c6-8067-8061-c6f16cd88403 parent_type=database parent_id=35d1cc4e-c1c6-8048-89fb-ea459550035b
+api-1  | 09:50:14 INFO    gb_automations.routes.webhooks | [notion:0320] ↳ accepted; fetching page title from Notion…
+api-1  | 09:50:14 INFO    gb_automations.routes.webhooks | [notion:7363] 📓 Notion webhook received
+api-1  | 09:50:14 INFO    gb_automations.routes.webhooks | [notion:7363] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81d4-9603-c984add0e002 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:14 INFO    gb_automations.routes.webhooks | [notion:7363] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:15 INFO    gb_automations.routes.webhooks | [notion:0320] ↳ properties updated; checking if label rename is needed…
+api-1  | 09:50:15 INFO    gb_automations.routes.webhooks | [notion:0320] ↳ no rename needed (title unchanged: '001_GB_Project_1_B')
+api-1  | 09:50:19 INFO    gb_automations.routes.webhooks | [notion:eafd] 📓 Notion webhook received
+api-1  | 09:50:19 INFO    gb_automations.routes.webhooks | [notion:eafd] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8120-90ab-c0887f2ae788 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:19 INFO    gb_automations.routes.webhooks | [notion:eafd] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:22 INFO    gb_automations.routes.webhooks | [notion:fb64] 📓 Notion webhook received
+api-1  | 09:50:22 INFO    gb_automations.routes.webhooks | [notion:fb64] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81f5-9d6a-dfd2be0243f4 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:22 INFO    gb_automations.routes.webhooks | [notion:fb64] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:26 INFO    gb_automations.routes.webhooks | [notion:bc9f] 📓 Notion webhook received
+api-1  | 09:50:26 INFO    gb_automations.routes.webhooks | [notion:bc9f] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8174-aeaf-c734f3981963 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:26 INFO    gb_automations.routes.webhooks | [notion:bc9f] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:28 INFO    gb_automations.routes.webhooks | [notion:ceba] 📓 Notion webhook received
+api-1  | 09:50:28 INFO    gb_automations.routes.webhooks | [notion:ceba] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8137-a86c-ee7f3f9b7e75 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:28 INFO    gb_automations.routes.webhooks | [notion:ceba] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:32 INFO    gb_automations.routes.webhooks | [notion:150a] 📓 Notion webhook received
+api-1  | 09:50:32 INFO    gb_automations.routes.webhooks | [notion:150a] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8112-87d0-ee53502c174e parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:32 INFO    gb_automations.routes.webhooks | [notion:150a] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:35 INFO    gb_automations.routes.webhooks | [notion:cb52] 📓 Notion webhook received
+api-1  | 09:50:35 INFO    gb_automations.routes.webhooks | [notion:cb52] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81f3-b2b1-f3e7ea758979 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:35 INFO    gb_automations.routes.webhooks | [notion:cb52] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:38 INFO    gb_automations.routes.webhooks | [notion:3a43] 📓 Notion webhook received
+api-1  | 09:50:38 INFO    gb_automations.routes.webhooks | [notion:3a43] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8106-8563-ee4cd9d0f040 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:38 INFO    gb_automations.routes.webhooks | [notion:3a43] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:43 INFO    gb_automations.routes.webhooks | [notion:095e] 📓 Notion webhook received
+api-1  | 09:50:43 INFO    gb_automations.routes.webhooks | [notion:095e] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81d7-886b-edb4472891c2 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:43 INFO    gb_automations.routes.webhooks | [notion:095e] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:50:48 INFO    gb_automations.routes.webhooks | [notion:f8b2] 📓 Notion webhook received
+api-1  | 09:50:48 INFO    gb_automations.routes.webhooks | [notion:f8b2] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81f1-bfb8-c4e215b23119 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:50:48 INFO    gb_automations.routes.webhooks | [notion:f8b2] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:51:00 INFO    gb_automations.routes.webhooks | [notion:b064] 📓 Notion webhook received
+api-1  | 09:51:00 INFO    gb_automations.routes.webhooks | [notion:b064] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8111-8356-f58f3ee0c219 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:51:00 INFO    gb_automations.routes.webhooks | [notion:b064] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:51:06 INFO    gb_automations.routes.webhooks | [notion:2ec2] 📓 Notion webhook received
+api-1  | 09:51:06 INFO    gb_automations.routes.webhooks | [notion:2ec2] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81c8-a08a-f2ce7d471f37 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:51:06 INFO    gb_automations.routes.webhooks | [notion:2ec2] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 09:51:07 INFO    gb_automations.routes.webhooks | [notion:8845] 📓 Notion webhook received
+api-1  | 09:51:07 INFO    gb_automations.routes.webhooks | [notion:8845] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81f9-a4ea-ccb87f2e1952 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 09:51:07 INFO    gb_automations.routes.webhooks | [notion:8845] ↳ ignored: our own Emails-DB row write (feedback loop, fine)

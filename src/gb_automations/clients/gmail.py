@@ -8,6 +8,7 @@ MIME parts, headers list) into plain Python dataclasses the sync engine can cons
 """
 
 import base64
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -17,6 +18,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import Resource, build
 
 from gb_automations.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Full-Gmail scope matches what's authorized in Workspace admin (step D in setup).
 SCOPES = ["https://mail.google.com/"]
@@ -78,6 +81,7 @@ class GmailThread:
 
 def get_thread(user_email: str, thread_id: str) -> GmailThread:
     """Fetch a full thread with all messages decoded into GmailMessage dataclasses."""
+    logger.debug("gmail → threads.get(user=%s, id=%s)", user_email, thread_id)
     service = gmail_for(user_email)
     raw = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
     messages = [_parse_message(m) for m in raw.get("messages", [])]
@@ -86,9 +90,34 @@ def get_thread(user_email: str, thread_id: str) -> GmailThread:
 
 def get_message(user_email: str, message_id: str) -> GmailMessage:
     """Fetch one message by ID, fully decoded."""
+    logger.debug("gmail → messages.get(user=%s, id=%s)", user_email, message_id)
     service = gmail_for(user_email)
     raw = service.users().messages().get(userId="me", id=message_id, format="full").execute()
     return _parse_message(raw)
+
+
+def get_attachment_bytes(user_email: str, message_id: str, attachment_id: str) -> bytes:
+    """Download an attachment's binary content via messages.attachments.get.
+
+    Returns raw bytes. The Gmail API returns base64url-encoded data; we decode
+    it here so callers get clean binary they can hand to Drive or hash directly.
+    """
+    logger.debug(
+        "gmail → messages.attachments.get(user=%s, msg=%s, att=%s)",
+        user_email,
+        message_id,
+        attachment_id,
+    )
+    service = gmail_for(user_email)
+    response = (
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
+    data = response.get("data", "")
+    return base64.urlsafe_b64decode(data) if data else b""
 
 
 # ============================================================
@@ -97,6 +126,7 @@ def get_message(user_email: str, message_id: str) -> GmailMessage:
 
 
 def list_labels(user_email: str) -> list[dict[str, str]]:
+    logger.debug("gmail → labels.list(user=%s)", user_email)
     service = gmail_for(user_email)
     labels = service.users().labels().list(userId="me").execute().get("labels", [])
     return [{"id": label["id"], "name": label["name"], "type": label["type"]} for label in labels]
@@ -111,6 +141,7 @@ def find_label_by_name(user_email: str, name: str) -> dict[str, str] | None:
 
 def create_label(user_email: str, name: str) -> dict[str, Any]:
     """Create a user label. Idempotent: returns the existing label if one with this name exists."""
+    logger.debug("gmail → labels.create(user=%s, name=%r)", user_email, name)
     existing = find_label_by_name(user_email, name)
     if existing:
         return existing
@@ -126,6 +157,24 @@ def create_label(user_email: str, name: str) -> dict[str, Any]:
                 "messageListVisibility": "show",
             },
         )
+        .execute()
+    )
+
+
+def update_label_name(user_email: str, label_id: str, new_name: str) -> dict[str, Any]:
+    """Rename a Gmail label (by ID) in this user's mailbox. Returns the updated resource.
+
+    Used when a Notion project is renamed — we patch the label rather than
+    create-new + delete-old so existing threads keep their label without churn.
+    """
+    logger.debug(
+        "gmail → labels.patch(user=%s, id=%s, name=%r)", user_email, label_id, new_name
+    )
+    service = gmail_for(user_email)
+    return (
+        service.users()
+        .labels()
+        .patch(userId="me", id=label_id, body={"name": new_name})
         .execute()
     )
 
@@ -189,6 +238,9 @@ def list_history(user_email: str, start_history_id: str, max_results: int = 100)
     Returns the raw response; caller iterates `history` entries to find affected
     messages/threads. `historyId` on the response is the new cursor to save.
     """
+    logger.debug(
+        "gmail → history.list(user=%s, since=%s)", user_email, start_history_id
+    )
     service = gmail_for(user_email)
     return (
         service.users()

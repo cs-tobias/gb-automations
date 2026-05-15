@@ -10,6 +10,7 @@ from gb_automations.utils.participants import (
     find_sender_email,
     is_internal,
     parse_participant,
+    strict_email_or_empty,
 )
 
 # ============================================================
@@ -165,3 +166,31 @@ def test_find_sender_email_pulls_from_brackets_and_lowercases():
 
 def test_find_sender_email_handles_bare_email():
     assert find_sender_email("  Bare@X.COM  ") == "bare@x.com"
+
+
+# ============================================================
+# strict_email_or_empty — does NOT fall back to lowercased bare string
+# ============================================================
+
+
+def test_strict_email_or_empty_returns_email_when_present():
+    assert strict_email_or_empty("Tobias <Tobias@Example.COM>") == "tobias@example.com"
+
+
+def test_strict_email_or_empty_handles_bare_email():
+    assert strict_email_or_empty("bare@x.com") == "bare@x.com"
+
+
+def test_strict_email_or_empty_returns_empty_for_bare_name():
+    # The whole reason this helper exists: LLM can return just a display name
+    # like 'Petter Burhol' with no email. Don't write that into a Notion
+    # `email`-typed property.
+    assert strict_email_or_empty("Petter Burhol") == ""
+
+
+def test_strict_email_or_empty_returns_empty_for_empty_string():
+    assert strict_email_or_empty("") == ""
+
+
+def test_strict_email_or_empty_returns_empty_for_no_at_sign():
+    assert strict_email_or_empty("not an email") == ""

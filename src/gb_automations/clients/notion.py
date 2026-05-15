@@ -4,14 +4,89 @@ Surface area needed by the sync engine: Emails DB CRUD, Contacts DB upsert,
 project page lookup, and generic block append for chat-style row bodies.
 """
 
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
 from gb_automations.config import CONTACTS_PROPS, EMAILS_PROPS, settings
 
+logger = logging.getLogger(__name__)
+
 NOTION_API_BASE = "https://api.notion.com/v1"
-_HTTP_TIMEOUT = 15.0
+# Notion's write endpoints (PATCH /pages/.../children, PATCH /pages/...) can be
+# slow when pages are just-created or the workspace is busy — we've observed
+# real-world response times in the 15-25s range. Set the per-call budget to 30
+# to cover those without timing out; retry-with-backoff on top catches the rest.
+_HTTP_TIMEOUT = 30.0
+
+
+async def _with_retries(
+    operation: Callable[[], Awaitable[httpx.Response]],
+    *,
+    op_name: str,
+    max_attempts: int = 3,
+) -> httpx.Response:
+    """Run `operation` with exponential backoff on transient httpx errors.
+
+    Backoff: 1s, then 4s. Retries on ReadTimeout / ConnectTimeout / RemoteProtocolError
+    / 5xx responses. Other errors propagate immediately (4xx is a real bug, not
+    a transient).
+
+    Notion's API docs explicitly recommend retrying on these failure modes;
+    we've also observed real-world slow PATCH /blocks/.../children calls that
+    timed out at 15s but would have succeeded at 30s.
+    """
+    last_err: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = await operation()
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as err:
+            last_err = err
+            if attempt + 1 >= max_attempts:
+                break
+            backoff = 1.0 if attempt == 0 else 4.0
+            logger.warning(
+                "notion %s attempt %d failed (%s); retrying in %.1fs",
+                op_name,
+                attempt + 1,
+                type(err).__name__,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            continue
+        # 5xx is also worth retrying (transient Notion-side issues).
+        if 500 <= response.status_code < 600 and attempt + 1 < max_attempts:
+            backoff = 1.0 if attempt == 0 else 4.0
+            logger.warning(
+                "notion %s attempt %d got %d; retrying in %.1fs",
+                op_name,
+                attempt + 1,
+                response.status_code,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            continue
+        return response
+    assert last_err is not None
+    raise last_err
+
+
+async def _log_request(request: httpx.Request) -> None:
+    """httpx event hook — logs every outgoing Notion API call at DEBUG."""
+    logger.debug("notion → %s %s", request.method, request.url.path)
+
+
+async def _log_response(response: httpx.Response) -> None:
+    """httpx event hook — logs the status of every Notion API call at DEBUG."""
+    logger.debug(
+        "notion ← %d %s %s",
+        response.status_code,
+        response.request.method,
+        response.request.url.path,
+    )
 
 
 class NotionAPIError(RuntimeError):
@@ -45,7 +120,12 @@ def _headers() -> dict[str, str]:
 
 
 def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=NOTION_API_BASE, timeout=_HTTP_TIMEOUT, headers=_headers())
+    return httpx.AsyncClient(
+        base_url=NOTION_API_BASE,
+        timeout=_HTTP_TIMEOUT,
+        headers=_headers(),
+        event_hooks={"request": [_log_request], "response": [_log_response]},
+    )
 
 
 # ============================================================
@@ -215,6 +295,37 @@ async def create_email_row(properties: dict[str, Any]) -> dict[str, Any]:
         return response.json()
 
 
+async def patch_email_row_files(page_id: str, files: list[dict[str, str]]) -> None:
+    """Set the Files property on an existing email row.
+
+    `files` is a list of `{name, url}` dicts. Each entry becomes an external
+    file in Notion's `files` property type. Capped at 100 entries per Notion's
+    limit; filenames clipped to 100 chars.
+
+    Called after the row is created (so a Drive failure doesn't block the
+    row's existence). Uses the standard retry helper for transient timeouts.
+    """
+    if not files:
+        return
+    props = {
+        EMAILS_PROPS["files"]: {
+            "files": [
+                {
+                    "name": (f.get("name") or "attachment")[:100],
+                    "external": {"url": f["url"]},
+                }
+                for f in files[:100]
+            ]
+        }
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(f"/pages/{page_id}", json={"properties": props}),
+            op_name=f"PATCH /pages/{page_id} files",
+        )
+        _raise_for_status(response)
+
+
 # ============================================================
 # Contacts DB
 # ============================================================
@@ -282,12 +393,22 @@ async def update_contact_phone(page_id: str, phone: str) -> None:
 
 
 async def append_blocks_to_page(page_id: str, blocks: list[dict[str, Any]]) -> None:
-    """Append a list of Notion blocks to a page. Notion caps each call at 100 children."""
+    """Append a list of Notion blocks to a page. Notion caps each call at 100 children.
+
+    PATCH /blocks/.../children is the slowest Notion endpoint we hit in practice
+    — sometimes 15-25s for a small block. We retry-with-backoff on transient
+    timeouts; permanent failures (4xx) propagate immediately.
+    """
     async with _client() as client:
         # Chunk into batches of 100 to respect Notion's limit.
         for i in range(0, len(blocks), 100):
             batch = blocks[i : i + 100]
-            response = await client.patch(f"/blocks/{page_id}/children", json={"children": batch})
+            response = await _with_retries(
+                lambda batch=batch: client.patch(
+                    f"/blocks/{page_id}/children", json={"children": batch}
+                ),
+                op_name=f"PATCH /blocks/{page_id}/children",
+            )
             _raise_for_status(response)
 
 

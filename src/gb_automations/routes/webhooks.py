@@ -24,14 +24,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from google.auth.transport import requests as g_requests
 from google.oauth2 import id_token
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import SyncCursor, User
+from gb_automations.models import ProjectLabel, SyncCursor, User
+from gb_automations.obs import request_scope
 from gb_automations.sync.sync_thread import sync_thread
 from gb_automations.sync.watches import cursor_source_for
 
@@ -90,13 +91,20 @@ def _verify_notion_signature(body: bytes, signature_header: str | None) -> bool:
     return hmac.compare_digest(provided, expected)
 
 
+_PROJECT_EVENT_TYPES = ("page.created", "page.properties_updated")
+
+
 def _is_project_page(event: dict[str, Any]) -> bool:
-    """True if this event refers to a page that should trigger label creation.
+    """True if this event refers to a page in the configured Projects DB.
+
+    Accepts both `page.created` (new project → create label) and
+    `page.properties_updated` (project renamed → rename label). The dispatcher
+    branches on event type after this filter.
 
     When PROJECTS_DB_ID is set, only pages parented to that database qualify.
-    Otherwise, accept any `page.created` event.
+    Otherwise, accept any matching event regardless of parent.
     """
-    if event.get("type") != "page.created":
+    if event.get("type") not in _PROJECT_EVENT_TYPES:
         return False
     if not settings.projects_db_id:
         return True
@@ -113,24 +121,113 @@ def _is_project_page(event: dict[str, Any]) -> bool:
     return parent_id == target_id
 
 
-async def _create_label_for_all_users(label_name: str) -> dict[str, list[str]]:
-    """Create the label in every active user's mailbox. Returns success/failure breakdown."""
+async def _create_label_for_all_users(
+    notion_page_id: str, label_name: str
+) -> dict[str, list[str]]:
+    """Create the label in every active user's mailbox AND record the (project, user) → label_id
+    mapping so a future rename can target each label by ID.
+    """
     async with SessionLocal() as session:
         users = (await session.execute(select(User).where(User.active.is_(True)))).scalars().all()
 
     succeeded: list[str] = []
     failed: list[str] = []
+    label_ids_by_user: dict[str, str] = {}
     loop = asyncio.get_running_loop()
     for user in users:
         try:
-            await loop.run_in_executor(
+            label = await loop.run_in_executor(
                 _executor, partial(gmail_client.create_label, user.email, label_name)
             )
             succeeded.append(user.email)
+            label_ids_by_user[user.email] = label["id"]
         except Exception:
             logger.exception("Failed to create label %r for %s", label_name, user.email)
             failed.append(user.email)
+
+    if label_ids_by_user:
+        async with SessionLocal() as session:
+            for email, label_id in label_ids_by_user.items():
+                stmt = (
+                    pg_insert(ProjectLabel)
+                    .values(
+                        notion_page_id=notion_page_id,
+                        user_email=email,
+                        gmail_label_id=label_id,
+                        current_name=label_name,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["notion_page_id", "user_email"],
+                        set_={"gmail_label_id": label_id, "current_name": label_name},
+                    )
+                )
+                await session.execute(stmt)
+            await session.commit()
+
     return {"succeeded": succeeded, "failed": failed}
+
+
+async def _rename_label_for_all_users(
+    notion_page_id: str, new_name: str
+) -> dict[str, Any]:
+    """Rename the Gmail label across every user that has a stored mapping for this project.
+
+    Returns a dict with keys: renamed (list[str]), failed (list[str]), and one of
+    {unchanged: True, no_mapping: True} when the call was a no-op.
+    """
+    async with SessionLocal() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ProjectLabel).where(ProjectLabel.notion_page_id == notion_page_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    if not rows:
+        # Either the project predates this feature (run the backfill) or it's
+        # genuinely a non-project event (page in another DB) we somehow accepted.
+        return {"renamed": [], "failed": [], "no_mapping": True}
+
+    if all(r.current_name == new_name for r in rows):
+        return {"renamed": [], "failed": [], "unchanged": True}
+
+    succeeded: list[str] = []
+    failed: list[str] = []
+    loop = asyncio.get_running_loop()
+    for row in rows:
+        if row.current_name == new_name:
+            continue  # already up-to-date for this user
+        try:
+            await loop.run_in_executor(
+                _executor,
+                partial(
+                    gmail_client.update_label_name, row.user_email, row.gmail_label_id, new_name
+                ),
+            )
+            succeeded.append(row.user_email)
+        except Exception:
+            logger.exception(
+                "Failed to rename label %s for %s (page=%s)",
+                row.gmail_label_id,
+                row.user_email,
+                notion_page_id,
+            )
+            failed.append(row.user_email)
+
+    if succeeded:
+        async with SessionLocal() as session:
+            await session.execute(
+                update(ProjectLabel)
+                .where(ProjectLabel.notion_page_id == notion_page_id)
+                .where(ProjectLabel.user_email.in_(succeeded))
+                .values(current_name=new_name)
+            )
+            await session.commit()
+
+    return {"renamed": succeeded, "failed": failed}
 
 
 @router.post("/notion")
@@ -142,6 +239,13 @@ async def notion_webhook(request: Request) -> Response:
     confirms the URL belongs to us. After that, every event is signed with HMAC-SHA256
     using that token as the key.
     """
+    with request_scope("notion"):
+        return await _notion_webhook_impl(request)
+
+
+async def _notion_webhook_impl(request: Request) -> Response:
+    logger.info("📓 Notion webhook received")
+
     raw_body = await request.body()
     try:
         payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
@@ -194,8 +298,8 @@ async def notion_webhook(request: Request) -> Response:
             reason = "our own Emails-DB row write (feedback loop, fine)"
         elif parent_id_clean == settings.contacts_db_id.replace("-", ""):
             reason = "our own Contacts-DB row write (feedback loop, fine)"
-        elif event_type != "page.created":
-            reason = f"event type {event_type!r} is not page.created"
+        elif event_type not in _PROJECT_EVENT_TYPES:
+            reason = f"event type {event_type!r} is not a project create/rename"
         else:
             reason = "parent is not the configured Projects DB"
         logger.info("↳ ignored: %s", reason)
@@ -227,16 +331,39 @@ async def notion_webhook(request: Request) -> Response:
             media_type="application/json",
         )
 
-    logger.info("↳ creating Gmail label %r in all active mailboxes…", title)
-    result = await _create_label_for_all_users(title)
-    logger.info(
-        "↳ done. label=%r succeeded=%d failed=%d",
-        title,
-        len(result["succeeded"]),
-        len(result["failed"]),
-    )
+    if event_type == "page.created":
+        logger.info("↳ creating Gmail label %r in all active mailboxes…", title)
+        result = await _create_label_for_all_users(page_id, title)
+        logger.info(
+            "↳ done. label=%r succeeded=%d failed=%d",
+            title,
+            len(result["succeeded"]),
+            len(result["failed"]),
+        )
+        return Response(
+            content=json.dumps({"label": title, **result}),
+            media_type="application/json",
+        )
+
+    # page.properties_updated — title may or may not have changed.
+    logger.info("↳ properties updated; checking if label rename is needed…")
+    rename_result = await _rename_label_for_all_users(page_id, title)
+    if rename_result.get("unchanged"):
+        logger.info("↳ no rename needed (title unchanged: %r)", title)
+    elif rename_result.get("no_mapping"):
+        logger.warning(
+            "↳ no project_labels mapping for page %s — run backfill_project_labels script",
+            page_id,
+        )
+    else:
+        logger.info(
+            "↳ done. new_label=%r renamed=%d failed=%d",
+            title,
+            len(rename_result["renamed"]),
+            len(rename_result["failed"]),
+        )
     return Response(
-        content=json.dumps({"label": title, **result}),
+        content=json.dumps({"label": title, **rename_result}),
         media_type="application/json",
     )
 
@@ -322,6 +449,11 @@ async def gmail_webhook(request: Request) -> Response:
     The data, once base64-decoded, is:
       { "emailAddress": "...", "historyId": "..." }
     """
+    with request_scope("gmail"):
+        return await _gmail_webhook_impl(request)
+
+
+async def _gmail_webhook_impl(request: Request) -> Response:
     claims = _verify_pubsub_jwt(request.headers.get("Authorization"))
     if claims is None:
         logger.warning("Pub/Sub push rejected: missing/invalid JWT")
@@ -385,20 +517,42 @@ async def gmail_webhook(request: Request) -> Response:
         )
 
     logger.info(
-        "↳ found %d changed thread(s) between historyId %s → %s. Syncing each…",
+        "↳ found %d changed thread(s) between historyId %s → %s. Queuing background sync…",
         len(thread_ids),
         last_history_id,
         new_history_id,
     )
 
-    # Dispatch sync_thread for each affected thread. Each call is independent so
-    # one bad thread doesn't kill the rest.
-    synced = []
-    errored = []
+    # Hand off the actual sync work to a background task and ack Pub/Sub now.
+    # Splitting a forwarded chain via the local LLM routinely takes 60–90s on
+    # the M4 dev host; Pub/Sub's default ack deadline is 10s. Without this
+    # fire-and-forget, Pub/Sub would redeliver while sync is still running,
+    # causing duplicate work and stressing Ollama.
+    asyncio.create_task(
+        _run_thread_syncs_background(email, sorted(thread_ids), new_history_id)
+    )
+
+    return Response(
+        content=json.dumps(
+            {"email": email, "queued": len(thread_ids), "history_id": new_history_id}
+        ),
+        media_type="application/json",
+    )
+
+
+async def _run_thread_syncs_background(
+    email: str, thread_ids: list[str], new_history_id: str
+) -> None:
+    """Background body of /webhooks/gmail — runs after we've ack'd Pub/Sub.
+
+    Mirrors what the inline loop used to do: sync each thread, then save the
+    cursor at the end so a partial run doesn't advance past unprocessed work.
+    Errors are logged here rather than propagated — there's no HTTP request
+    waiting for the result.
+    """
     for tid in thread_ids:
         try:
             result = await sync_thread(email, tid)
-            synced.append({"thread_id": tid, "rows_created": result.rows_created})
             if result.project_page_id:
                 logger.info(
                     "  ✓ thread %s [%s]: +%d rows, %d already present",
@@ -409,17 +563,14 @@ async def gmail_webhook(request: Request) -> Response:
                 )
             else:
                 logger.info(
-                    "  ⊘ thread %s skipped: %s", tid, result.skipped_reason or "no project match"
+                    "  ⊘ thread %s skipped: %s",
+                    tid,
+                    result.skipped_reason or "no project match",
                 )
-        except Exception as err:
+        except Exception:
             logger.exception("sync_thread failed for %s / %s", email, tid)
-            errored.append({"thread_id": tid, "error": str(err)})
 
-    # Save the new cursor only after we attempted everything — that way we don't
-    # advance past unprocessed history if Gmail returns a paginated response.
-    await _save_history_cursor(email, new_history_id)
-
-    return Response(
-        content=json.dumps({"email": email, "synced": synced, "errored": errored}),
-        media_type="application/json",
-    )
+    try:
+        await _save_history_cursor(email, new_history_id)
+    except Exception:
+        logger.exception("Failed to save history cursor for %s", email)

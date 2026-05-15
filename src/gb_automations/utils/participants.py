@@ -108,3 +108,16 @@ def find_sender_email(from_field: str) -> str:
     """Lowercase email address from a "Name <email>" or bare-email header value."""
     m = _EMAIL_IN_BRACKETS_RE.search(from_field)
     return (m.group(1) if m else from_field).strip().lower()
+
+
+def strict_email_or_empty(field: str) -> str:
+    """Return the email from a 'Name <email>' or bare-email field, or '' if there isn't one.
+
+    Unlike find_sender_email(), this does NOT fall back to returning the bare
+    string when no email pattern is detected. Used when the field comes from
+    an LLM that may have returned just a display name ("Petter Burhol") — in
+    that case we want to leave the Notion `email`-typed property unset rather
+    than write the name into it.
+    """
+    m = _EMAIL_RE.search(field)
+    return m.group(0).lower() if m else ""

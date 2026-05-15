@@ -39,6 +39,24 @@ class Settings(BaseSettings):
     pubsub_audience: str = "https://hub.tobiaseek.com/webhooks/gmail"
     pubsub_service_account_email: str = ""
 
+    # Local LLM (Ollama). Used only for tagging today — see clients/llm.py.
+    # Splitting/extraction is now regex-based (utils/history_extraction.py)
+    # so we don't need the heavyweight long-output budgets the LLM splitter had.
+    ollama_base_url: str = "http://ollama:11434"
+    ollama_model: str = "llama3.1:8b-instruct-q4_K_M"
+    # Tagging is ~10 output tokens — short. 30s covers cold model load.
+    ollama_timeout_s: float = 30.0
+
+    # Tagging via LLM classify(). ON by default — adds ~1-2s per Notion row
+    # (one classify call against Ollama). Set TAGGING_ENABLED=false in .env to
+    # disable. See EMAIL_TAGS below for the taxonomy.
+    tagging_enabled: bool = True
+
+    # Google Drive folder name used for storing email attachments. Created on
+    # first upload, one folder per user mailbox. Files inside get
+    # "anyone with link can view" permission so Notion-rendered links work.
+    attachments_folder_name: str = "Notion Email Attachments"
+
 
 settings = Settings()
 
@@ -49,27 +67,25 @@ settings = Settings()
 #   thread_id  (rich_text)
 #   message_id (rich_text)        ← dedup key
 #   project    (relation → Projects)
-#   contacts   (relation → Contacts DB)
 #   from_name  (rich_text)
 #   from_email (email)
 #   direction  (select: Incoming | Outgoing)
 #   date       (date)
 #   tags       (multi_select)
-#   preview    (rich_text)
-#   attachments (rich_text)       ← "had N attachments: [name1, name2]" text for now
+#   body       (rich_text)        ← full cleaned message body, chunked
+#   files      (files)            ← attachments uploaded to Drive, linked here
 EMAILS_PROPS = {
     "subject": "Subject",
     "thread_id": "Thread ID",
     "message_id": "Message ID",
     "project": "Project",
-    "contacts": "Contacts",
     "from_name": "From",
     "from_email": "From Email",
     "direction": "Direction",
     "date": "Date",
     "tags": "Tags",
-    "preview": "Preview",
-    "attachments": "Attachments",
+    "body": "Body",
+    "files": "Files",
 }
 
 CONTACTS_PROPS = {
@@ -78,3 +94,38 @@ CONTACTS_PROPS = {
     "phone": "Phone",
     "company": "Company",
 }
+
+# Multi-select tag taxonomy applied to each synced email by the local LLM.
+# Two axes mixed in one flat list (one Notion `Tags` multi-select property):
+#   1. Communication-type — what KIND of email is this? (workflow stage)
+#   2. Topic/aspect       — what is the email ABOUT? (render subject matter)
+# The LLM picks 1–3 tags total, typically one from each axis when both apply.
+# Notion's multi-select auto-creates new option entries when we write them, so
+# editing this list is the only step needed to add/remove tags.
+EMAIL_TAGS = [
+    # Communication-type (workflow / intent)
+    "tilbud",         # offer / quote
+    "bestilling",     # confirmed order
+    "korreksjon",     # correction round
+    "leveranse",      # delivery / final files
+    "spørsmål",       # question / inquiry
+    "underlag",       # briefing material / specs
+    "møte",           # meeting
+    "faktura",        # invoice
+    "intern",         # internal Goldbox communication
+    # Topic / aspect (architecture-render subject matter)
+    "kjøkken",
+    "bad",
+    "stue",
+    "soverom",
+    "inngangsparti",
+    "fasade",
+    "korridor",
+    "balkong",
+    "utomhus",
+    "plantegning",
+    "detalj",
+    "farger",
+    # Fallback (LLM uses this only when nothing else fits)
+    "annet",
+]

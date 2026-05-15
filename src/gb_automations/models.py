@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, func
+from sqlalchemy import Boolean, DateTime, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from gb_automations.db import Base
@@ -72,5 +72,56 @@ class ContactCache(Base):
     email: Mapped[str] = mapped_column(String(254), primary_key=True)
     notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AttachmentFingerprint(Base):
+    """Tracks (sender, content-hash) repetition counts for signature detection.
+
+    The signal: an image bytes-hash that has appeared 2+ times from the same
+    sender is almost certainly a signature decoration (company logo, etc.).
+    Real attachments are unique-per-email; signatures repeat.
+
+    On each attachment we compute sha1(content), look up the row, and skip
+    upload to Drive if `seen_count >= 2`. First sighting always uploads.
+
+    Content hash makes this robust to Gmail's per-email auto-numbering of
+    inline image filenames (`image001.png` in one email might be a totally
+    different image than `image001.png` in the next).
+    """
+
+    __tablename__ = "attachment_fingerprints"
+
+    sender_email: Mapped[str] = mapped_column(String(254), primary_key=True)
+    content_sha1: Mapped[str] = mapped_column(String(40), primary_key=True)
+    seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # First filename we saw this image under — purely for debugging when
+    # browsing the table. Names may vary across emails ("image001.png" vs
+    # "image004.png") even when the bytes are identical, so this is hint-only.
+    first_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class ProjectLabel(Base):
+    """Notion project page ↔ Gmail label, one row per (project, user).
+
+    Lets us rename a Gmail label by ID after the user renames the project in
+    Notion. Without this mapping the link between the two sides is name-only,
+    which silently breaks the moment someone renames a project.
+    """
+
+    __tablename__ = "project_labels"
+
+    notion_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_email: Mapped[str] = mapped_column(String(254), primary_key=True)
+    gmail_label_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    current_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

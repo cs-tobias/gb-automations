@@ -1,0 +1,131 @@
+assume transactional DDL.
+api-1  | 17:01:50 INFO    uvicorn.error | Started server process [10]
+api-1  | 17:01:50 INFO    uvicorn.error | Waiting for application startup.
+api-1  | 17:01:50 INFO    gb_automations.jobs.scheduler | APScheduler started with jobs: ['renew_gmail_watches']
+api-1  | 17:01:50 INFO    uvicorn.error | Application startup complete.
+api-1  | 17:01:50 INFO    uvicorn.error | Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+api-1  | 17:02:11 INFO    gb_automations.routes.webhooks | [gmail:e91d] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=188584
+api-1  | 17:02:12 INFO    gb_automations.routes.webhooks | [gmail:e91d] ↳ found 1 changed thread(s) between historyId 188575 → 188584. Queuing background sync…
+api-1  | 17:02:12 INFO    gb_automations.sync.sync_thread | [gmail:e91d] 🧵 sync_thread start: thread=19e166c93fdbc5c6 user=post@tobiaseek.com
+api-1  | 17:02:13 INFO    gb_automations.sync.sync_thread | [gmail:e91d]   • fetched 4 message(s) from Gmail
+api-1  | 17:02:13 INFO    gb_automations.sync.sync_thread | [gmail:e91d]   • matched project '001_GB_Project_1' (page=3601cc4e-c1c6-8067-8061-c6f16cd88403)
+api-1  | 17:02:14 INFO    gb_automations.sync.sync_thread | [gmail:e91d]   • extracted 18 prior email(s) from history (regex)
+api-1  | 17:02:14 INFO    gb_automations.sync.sync_thread | [gmail:e91d]   • upserted 6 contact(s)
+api-1  | 17:02:15 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (gmail message) 19e166c93fdbc5c6: from='Petter Burhol <petter@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=0 chars: ''
+api-1  | 17:02:22 INFO    gb_automations.sync.sync_thread | [gmail:e91d]   → msg 19e166c93fdbc5c6: reconstructing 18 prior email(s)
+api-1  | 17:02:22 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-1b382b5fff: from='Heidi T Bekkevold <htb@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=308 chars: 'Hei, sender over en wetransfer med dokumenter for tre perspektiver av inngangspa…'
+api-1  | 17:02:22 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=363 chars)…
+api-1  | 17:02:24 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 2.2s (output=53 chars)
+api-1  | 17:02:24 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:02:31 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-67eb675f65: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=19 chars: 'Tusen takk Heidi ☺️'
+api-1  | 17:02:31 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=74 chars)…
+api-1  | 17:02:32 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.6s (output=12 chars)
+api-1  | 17:02:34 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-e96914d61d: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=127 chars: 'Hei ☺️ Legger ved test av inngangspartiet etter samtale med Hedda. *Klokken 08:0…'
+api-1  | 17:02:34 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=182 chars)…
+api-1  | 17:02:35 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.7s (output=53 chars)
+api-1  | 17:02:35 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:02:37 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-365087da63: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=56 chars: 'Hei, Takk! Vi går for bilde fra kl. 08.00 sommerstid :)'
+api-1  | 17:02:37 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=111 chars)…
+api-1  | 17:02:38 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.6s (output=12 chars)
+api-1  | 17:02:40 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-a945515669: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=65 chars: 'Supert ☺️ Fasade bildet er lagt opp med ny vinkel på Frame også.'
+api-1  | 17:02:40 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=120 chars)…
+api-1  | 17:02:41 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.8s (output=20 chars)
+api-1  | 17:02:41 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: fasade
+api-1  | 17:02:43 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-3b614f969d: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=161 chars: 'Hei, Da har vi lagt inn alle kommentarer på leilighet 11004☺️ Har lagt ved et sk…'
+api-1  | 17:02:43 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=216 chars)…
+api-1  | 17:02:45 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.7s (output=53 chars)
+api-1  | 17:02:45 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:02:58 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-ddfead4f65: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=15 chars: 'Supert, takk ☺️'
+api-1  | 17:02:58 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=70 chars)…
+api-1  | 17:02:59 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.6s (output=12 chars)
+api-1  | 17:03:01 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-5045edf410: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=86 chars: 'Hei igjen, Da har jeg fått lagt opp første utkast av bilde 28 - inngangsparti og…'
+api-1  | 17:03:01 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=141 chars)…
+api-1  | 17:03:02 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.4s (output=41 chars)
+api-1  | 17:03:02 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 17:03:05 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-240b440f51: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=439 chars: 'Hei Silje, Da har vi lagt inn våre kommentarer til inngangsparti og korridor; bi…'
+api-1  | 17:03:05 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=494 chars)…
+api-1  | 17:03:08 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 2.5s (output=61 chars)
+api-1  | 17:03:08 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor, møte
+api-1  | 17:03:09 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-1a43f80072: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=44 chars: 'Helt supert ☺️ Har du tid nå klokken 14:00?'
+api-1  | 17:03:09 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=99 chars)…
+api-1  | 17:03:10 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.8s (output=18 chars)
+api-1  | 17:03:10 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: møte
+api-1  | 17:03:12 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-b901016253: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=47 chars: 'Ja, det passer fint! Kaller deg inn på Teams :)'
+api-1  | 17:03:12 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=102 chars)…
+api-1  | 17:03:13 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.8s (output=18 chars)
+api-1  | 17:03:13 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: møte
+api-1  | 17:03:17 INFO    gb_automations.routes.webhooks | [notion:2acb] 📓 Notion webhook received
+api-1  | 17:03:17 INFO    gb_automations.routes.webhooks | [notion:2acb] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-81c3-ac12-e470deb95f08 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:17 INFO    gb_automations.routes.webhooks | [notion:2acb] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:19 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-85bf5baac7: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=22 chars: 'Tak, snakkes straks ☺️'
+api-1  | 17:03:19 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=77 chars)…
+api-1  | 17:03:19 INFO    gb_automations.routes.webhooks | [notion:3905] 📓 Notion webhook received
+api-1  | 17:03:19 INFO    gb_automations.routes.webhooks | [notion:3905] 📓 Notion event: type=page.properties_updated entity=3601cc4e-c1c6-8067-8061-c6f16cd88403 parent_type=database parent_id=35d1cc4e-c1c6-8048-89fb-ea459550035b
+api-1  | 17:03:19 INFO    gb_automations.routes.webhooks | [notion:3905] ↳ accepted; fetching page title from Notion…
+api-1  | 17:03:20 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.8s (output=18 chars)
+api-1  | 17:03:20 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: møte
+api-1  | 17:03:20 INFO    gb_automations.routes.webhooks | [notion:3905] ↳ properties updated; checking if label rename is needed…
+api-1  | 17:03:20 INFO    gb_automations.routes.webhooks | [notion:3905] ↳ no rename needed (title unchanged: '001_GB_Project_1')
+api-1  | 17:03:21 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-1ba11c0717: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=527 chars: 'Hei, Etter praten med Hedda i går har jeg prøvd ut en ny vinkel på bilde 28 – in…'
+api-1  | 17:03:21 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=582 chars)…
+api-1  | 17:03:23 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 2.1s (output=41 chars)
+api-1  | 17:03:23 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 17:03:25 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-6e4a2a1d7e: from='Charlotte Hagemoen <cha@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=153 chars: 'Umiddelbart synes jeg dette ble mye bedre. Hadda tar dialogen videre på detaljen…'
+api-1  | 17:03:25 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=208 chars)…
+api-1  | 17:03:27 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.7s (output=53 chars)
+api-1  | 17:03:27 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:03:28 INFO    gb_automations.routes.webhooks | [notion:f3d2] 📓 Notion webhook received
+api-1  | 17:03:28 INFO    gb_automations.routes.webhooks | [notion:f3d2] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-81f2-97c9-ee9e1c26b990 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:28 INFO    gb_automations.routes.webhooks | [notion:f3d2] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:29 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-b6d37768ad: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=245 chars: 'Hei, Enig, dette ble bra! Silje, jeg kan godt legge inn korreksjonene i Frame - …'
+api-1  | 17:03:29 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=300 chars)…
+api-1  | 17:03:30 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.8s (output=53 chars)
+api-1  | 17:03:30 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:03:32 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-c44a60f4f2: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=48 chars: 'Så bra! Kommenter gjerne på den nye vinkelen ☺️'
+api-1  | 17:03:32 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=103 chars)…
+api-1  | 17:03:34 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.5s (output=53 chars)
+api-1  | 17:03:34 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:03:34 INFO    gb_automations.routes.webhooks | [notion:6150] 📓 Notion webhook received
+api-1  | 17:03:34 INFO    gb_automations.routes.webhooks | [notion:6150] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-8179-9fb9-cbffec03ef18 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:34 INFO    gb_automations.routes.webhooks | [notion:6150] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:38 INFO    gb_automations.routes.webhooks | [notion:5818] 📓 Notion webhook received
+api-1  | 17:03:38 INFO    gb_automations.routes.webhooks | [notion:5818] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-81cd-b036-de0475c0b72c parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:38 INFO    gb_automations.routes.webhooks | [notion:5818] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:40 INFO    gb_automations.routes.webhooks | [notion:2338] 📓 Notion webhook received
+api-1  | 17:03:40 INFO    gb_automations.routes.webhooks | [notion:2338] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-8163-acd4-ef29648079c0 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:40 INFO    gb_automations.routes.webhooks | [notion:2338] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:43 INFO    gb_automations.routes.webhooks | [notion:5a8c] 📓 Notion webhook received
+api-1  | 17:03:43 INFO    gb_automations.routes.webhooks | [notion:5a8c] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-818f-b066-ef1b84233c30 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:43 INFO    gb_automations.routes.webhooks | [notion:5a8c] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:46 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-6e28e94c1c: from='Hedda Torgersen <ht@metropolis.no>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=108 chars: 'Hei, Da er kommentarene på bilde 28 - inngangsparti utendørs lagt inn :) Ønsker …'
+api-1  | 17:03:46 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=163 chars)…
+api-1  | 17:03:47 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.5s (output=41 chars)
+api-1  | 17:03:47 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti
+api-1  | 17:03:50 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (history) 19e166c93fdbc5c6#fwd-c452cc639a: from='Silje Anett Bjørge <silje@goldbox.no>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=41 chars: 'Så bra, takk! Ha en fin helg dere også 🌞'
+api-1  | 17:03:50 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=95 chars)…
+api-1  | 17:03:51 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.7s (output=12 chars)
+api-1  | 17:03:54 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (gmail message) 19e169ef76950ed4: from='Tobias Eek <tobias@cinesuit.com>' subject='Fwd: OBOS-Versalen Inngangsparti og korridor' body=17 chars: 'check this out :)'
+api-1  | 17:03:54 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=72 chars)…
+api-1  | 17:03:55 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 1.5s (output=53 chars)
+api-1  | 17:03:55 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     🏷  tagged: korreksjon, inngangsparti, korridor
+api-1  | 17:03:58 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (gmail message) 19e16b0db2527807: from='Tobias Eek <tobias@cinesuit.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=32 chars: 'Oh, it works! this is a new mail'
+api-1  | 17:03:58 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=86 chars)…
+api-1  | 17:03:58 INFO    gb_automations.routes.webhooks | [notion:b95f] 📓 Notion webhook received
+api-1  | 17:03:58 INFO    gb_automations.routes.webhooks | [notion:b95f] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-81ed-9515-cdf0f0c92e07 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:03:58 INFO    gb_automations.routes.webhooks | [notion:b95f] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:03:58 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.6s (output=12 chars)
+api-1  | 17:04:00 INFO    gb_automations.routes.webhooks | [notion:0dd3] 📓 Notion webhook received
+api-1  | 17:04:00 INFO    gb_automations.routes.webhooks | [notion:0dd3] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-8151-b8a2-f3f03ff901e8 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:04:00 INFO    gb_automations.routes.webhooks | [notion:0dd3] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:04:01 INFO    gb_automations.sync.sync_thread | [gmail:e91d]     📝 row (gmail message) 19e176c3a053efae: from='Tobias Eek <post@tobiaseek.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=39 chars: 'Does this mail get added? Best, Tobias'
+api-1  | 17:04:01 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify starting (input=93 chars)…
+api-1  | 17:04:01 INFO    gb_automations.clients.llm | [gmail:e91d] LLM classify done in 0.6s (output=12 chars)
+api-1  | 17:04:03 INFO    gb_automations.sync.sync_thread | [gmail:e91d] 🧵 sync_thread done in 110.7s: +22 rows, 0 already present, 6 contact(s)
+api-1  | 17:04:03 INFO    gb_automations.routes.webhooks | [gmail:e91d]   ✓ thread 19e166c93fdbc5c6 [001_GB_Project_1]: +22 rows, 0 already present
+api-1  | 17:04:06 INFO    gb_automations.routes.webhooks | [notion:fe74] 📓 Notion webhook received
+api-1  | 17:04:06 INFO    gb_automations.routes.webhooks | [notion:fe74] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-81ad-98a5-f22c0fd09541 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:04:06 INFO    gb_automations.routes.webhooks | [notion:fe74] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:04:10 INFO    gb_automations.routes.webhooks | [notion:d8b8] 📓 Notion webhook received
+api-1  | 17:04:10 INFO    gb_automations.routes.webhooks | [notion:d8b8] 📓 Notion event: type=page.created entity=3601cc4e-c1c6-8164-94a8-ec5a0ffce15d parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 17:04:10 INFO    gb_automations.routes.webhooks | [notion:d8b8] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 17:04:13 INFO    gb_automations.routes.webhooks | [notion:a683] 📓 Notion webhook received

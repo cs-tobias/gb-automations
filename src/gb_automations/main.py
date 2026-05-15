@@ -1,5 +1,6 @@
 import logging
 import logging.config
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -11,24 +12,43 @@ from gb_automations.jobs.scheduler import shutdown_scheduler, start_scheduler
 from gb_automations.routes import debug as debug_routes
 from gb_automations.routes import webhooks as webhook_routes
 
+# Log level is env-driven so ops can flip to DEBUG (shows outbound Notion/Gmail
+# API call lines) without rebuilding the image. Defaults to INFO.
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
 # Make application INFO logs visible in `docker compose logs`. uvicorn's default
 # config swallows logger.info() from application code; this explicit dictConfig
 # wires our package's loggers + uvicorn's together with a single formatter.
+#
+# The `request_id` filter stamps every record with a `[prefix:abcd]` tag while
+# a webhook is in flight (see obs.py). The tag lets you grep one request's
+# entire call tree out of interleaved logs.
 logging.config.dictConfig(
     {
         "version": 1,
         "disable_existing_loggers": False,
+        "filters": {
+            "request_id": {"()": "gb_automations.obs.RequestIdFilter"},
+        },
         "formatters": {
             "default": {
-                "format": "%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+                "format": "%(asctime)s %(levelname)-7s %(name)s | %(request_id)s%(message)s",
                 "datefmt": "%H:%M:%S",
             },
         },
         "handlers": {
-            "console": {"class": "logging.StreamHandler", "formatter": "default"},
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "default",
+                "filters": ["request_id"],
+            },
         },
         "loggers": {
-            "gb_automations": {"level": "INFO", "handlers": ["console"], "propagate": False},
+            "gb_automations": {
+                "level": _LOG_LEVEL,
+                "handlers": ["console"],
+                "propagate": False,
+            },
             "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
             "uvicorn.error": {"level": "INFO", "handlers": ["console"], "propagate": False},
             # Quiet uvicorn access logs (POST /webhooks/X HTTP/1.1 200 OK) — our

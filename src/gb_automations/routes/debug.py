@@ -8,7 +8,9 @@ from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
 from gb_automations.clients import gmail as gmail_client
+from gb_automations.clients import llm as llm_client
 from gb_automations.clients import notion as notion_client
+from gb_automations.config import EMAIL_TAGS
 from gb_automations.db import SessionLocal
 from gb_automations.models import User
 
@@ -143,6 +145,30 @@ async def debug_databases() -> dict[str, Any]:
             for db in dbs
         ],
     }
+
+
+@router.get("/llm")
+async def debug_llm(prompt: str = Query(..., description="Text to classify")) -> dict[str, Any]:
+    """Smoke-test the local LLM: classify `prompt` against the EMAIL_TAGS taxonomy.
+
+    Returns the tags chosen (subset of EMAIL_TAGS) plus the prompt + allowed
+    values used. If the call fails, the tags list will be empty and the api
+    logs will show why (network, timeout, model not pulled, etc.).
+    """
+    tags = await llm_client.classify(prompt=prompt, allowed_values=EMAIL_TAGS)
+    return {"prompt": prompt, "allowed_tags": EMAIL_TAGS, "tags": tags}
+
+
+@router.get("/emails-schema")
+async def debug_emails_schema() -> dict[str, Any]:
+    """Property names + types on the Emails DB, fresh from Notion (bypasses the cache).
+
+    Use this after renaming a column in Notion to confirm the api sees the new name —
+    if it doesn't appear here, the row builder will silently skip writing to it.
+    """
+    notion_client.reset_schema_cache()
+    names = sorted(await notion_client.get_emails_db_property_names())
+    return {"count": len(names), "property_names": names}
 
 
 @router.get("/projects")
