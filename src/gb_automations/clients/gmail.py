@@ -9,6 +9,7 @@ MIME parts, headers list) into plain Python dataclasses the sync engine can cons
 
 import base64
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -52,6 +53,14 @@ class GmailAttachment:
     mime_type: str
     size: int
     attachment_id: str | None  # None for inline/binary-included parts
+    content_id: str | None = None  # MIME Content-ID without `<>`, lowercased.
+    # Used to resolve `<img src="cid:...">` references back to the attachment
+    # when an HTML-only message is processed (Outlook forwards, mostly).
+    inline_ref_count: int = 0  # How many `<img src="cid:...">` references
+    # to this attachment exist in the message's HTML alternative. >=2 within
+    # a SINGLE Gmail message means a signature decoration repeated per
+    # quoted block (Outlook keeps the inline logo in every reply level).
+    # Real photo attachments are referenced exactly once.
 
 
 @dataclass
@@ -304,12 +313,15 @@ def _extract_body_and_attachments(
         body = part.get("body", {})
 
         if filename:
+            part_headers = _headers_dict(part.get("headers", []))
+            raw_cid = part_headers.get("Content-ID") or part_headers.get("Content-Id") or ""
             attachments.append(
                 GmailAttachment(
                     filename=filename,
                     mime_type=mime,
                     size=body.get("size", 0),
                     attachment_id=body.get("attachmentId"),
+                    content_id=_normalize_content_id(raw_cid),
                 )
             )
 
@@ -326,14 +338,139 @@ def _extract_body_and_attachments(
 
     walk(payload)
 
-    if plain_parts:
+    # Count inline cid references against the joined HTML. The COUNT is the
+    # signature signal (>=2 within a single Gmail message means signature
+    # decoration carried per quoted reply block); the body-rendering path is
+    # separate.
+    if html_parts:
+        _count_inline_image_refs("\n".join(html_parts), attachments)
+
+    if html_parts:
+        # Prefer HTML when present (even if text/plain is also there).
+        # Reason: Outlook's auto-generated text/plain drops inline image
+        # references entirely, so building the body from HTML is the only
+        # way to preserve `[image: filename]` anchors at the positions
+        # where the original sender embedded each image. We replace each
+        # `<img src="cid:...">` with `[image: filename]` BEFORE stripping
+        # tags so document order is preserved, then strip the rest.
+        prepared = _inject_inline_image_markers("\n".join(html_parts), attachments)
+        body_text = _strip_html(prepared).strip()
+    elif plain_parts:
+        # No HTML available — fall back to text/plain. Older clients and
+        # some automated senders skip text/html entirely.
         body_text = "\n".join(plain_parts).strip()
-    elif html_parts:
-        body_text = _strip_html("\n".join(html_parts)).strip()
     else:
         body_text = ""
 
     return body_text, attachments
+
+
+def _count_inline_image_refs(
+    html: str, attachments: list[GmailAttachment]
+) -> None:
+    """Populate `inline_ref_count` on each attachment by scanning the HTML.
+
+    Mutates `attachments` in place. Resolution mirrors
+    `_inject_inline_image_markers`: cid → content_id, then Outlook-style
+    cid → filename-prefix fallback. Unresolvable srcs are ignored.
+
+    Idempotent — counts are reset before counting so callers can re-run
+    without doubling up.
+    """
+    for att in attachments:
+        att.inline_ref_count = 0
+    if not html or not attachments:
+        return
+
+    by_cid = {att.content_id: att for att in attachments if att.content_id}
+    by_name = sorted(
+        (att for att in attachments if att.filename),
+        key=lambda a: len(a.filename),
+        reverse=True,
+    )
+
+    for match in _IMG_SRC_RE.finditer(html):
+        src = match.group(1)
+        if not src.lower().startswith("cid:"):
+            continue
+        token = src[4:].strip().lower()
+        target = by_cid.get(token)
+        if target is None:
+            for att in by_name:
+                if token.startswith(att.filename.lower()):
+                    target = att
+                    break
+        if target is not None:
+            target.inline_ref_count += 1
+
+
+def _normalize_content_id(raw: str) -> str | None:
+    """Strip the `<...>` wrapper Gmail sometimes returns on Content-ID headers.
+
+    RFC 2392 cid: URLs reference the bare token; the MIME header conventionally
+    wraps it in angle brackets. Lowercased for case-insensitive matching.
+    """
+    if not raw:
+        return None
+    return raw.strip().lstrip("<").rstrip(">").lower() or None
+
+
+# Document-order pattern for inline images in HTML. Captures whatever's inside
+# the src="..." attribute on an <img> tag — Outlook/Word emit `cid:NAME@host`,
+# while some clients emit a bare filename or `data:` URL we just leave alone.
+_IMG_SRC_RE = re.compile(
+    r"<img\b[^>]*?\bsrc=\"([^\"]+)\"[^>]*>",
+    flags=re.IGNORECASE,
+)
+
+
+def _inject_inline_image_markers(
+    html: str, attachments: list[GmailAttachment]
+) -> str:
+    """Replace each `<img src="cid:...">` with `[image: filename]` in place.
+
+    Resolution order for each tag:
+      1. `cid:TOKEN` → match by attachment.content_id (case-insensitive).
+      2. `cid:TOKEN` whose token starts with a known attachment filename
+         (Outlook style: `cid:image001.png@01D...` where the filename prefixes
+         the cid token).
+
+    Unresolvable srcs (data: URLs, http: URLs, broken cids) are left untouched
+    so `_strip_html` discards them as before. This keeps the behavior identical
+    for non-attachment image references.
+    """
+    if not html or not attachments:
+        return html
+
+    by_cid = {att.content_id: att for att in attachments if att.content_id}
+    # Sorted by filename length desc so longer names match before shorter
+    # prefixes — e.g. `image10.png` is checked before `image1.png`.
+    by_name = sorted(
+        (att for att in attachments if att.filename),
+        key=lambda a: len(a.filename),
+        reverse=True,
+    )
+
+    def resolve(src: str) -> GmailAttachment | None:
+        if not src.lower().startswith("cid:"):
+            return None
+        token = src[4:].strip().lower()
+        if token in by_cid:
+            return by_cid[token]
+        for att in by_name:
+            if token.startswith(att.filename.lower()):
+                return att
+        return None
+
+    def replace(match: re.Match[str]) -> str:
+        att = resolve(match.group(1))
+        if att is None:
+            return match.group(0)
+        # Surround with newlines so the marker survives Gmail-style flattening
+        # and lands on its own line for downstream regex scanning.
+        return f"\n[image: {att.filename}]\n"
+
+    return _IMG_SRC_RE.sub(replace, html)
 
 
 def _decode_base64url(data: str) -> str:
@@ -344,8 +481,6 @@ def _decode_base64url(data: str) -> str:
 
 def _strip_html(html: str) -> str:
     """Crude HTML → text fallback for the rare message with no text/plain part."""
-    import re
-
     # Drop scripts/styles entirely
     cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
     # Convert <br>, <p>, <li> to newlines BEFORE stripping all tags

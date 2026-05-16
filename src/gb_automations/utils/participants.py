@@ -74,11 +74,19 @@ def parse_participant(raw: str) -> Participant | None:
 def is_internal(email: str) -> bool:
     """Check if an email is in the internal domain/address list.
 
-    Reads INTERNAL_EMAILS_OR_DOMAINS env var: comma-separated list of either full
-    addresses (exact match) or bare domains (suffix match on `@domain`).
-    Example: "tobias@goldbox.no, post@goldbox.no, goldbox.no"
+    Reads `INTERNAL_EMAILS_OR_DOMAINS` env var: comma-separated list of either
+    full addresses (exact match) or bare domains (suffix match on `@domain`).
+    Example: `tobias@goldbox.no, post@goldbox.no, goldbox.no`
+
+    Falls back to `WORKSPACE_DOMAIN` (the Google Workspace domain already
+    configured for Gmail DWD) when `INTERNAL_EMAILS_OR_DOMAINS` is empty. So
+    a fresh deployment that just sets `WORKSPACE_DOMAIN=goldbox.no` gets
+    "internal = anyone at goldbox.no" for free, without setting two env vars
+    that mean the same thing.
     """
-    raw = os.environ.get("INTERNAL_EMAILS_OR_DOMAINS", "")
+    raw = os.environ.get("INTERNAL_EMAILS_OR_DOMAINS", "").strip()
+    if not raw:
+        raw = os.environ.get("WORKSPACE_DOMAIN", "").strip()
     entries = [s.strip().lower() for s in raw.split(",") if s.strip()]
     e = email.lower()
     for entry in entries:

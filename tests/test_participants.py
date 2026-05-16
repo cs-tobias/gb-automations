@@ -3,6 +3,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 from gb_automations.utils.participants import (
     company_from_domain,
     extract_email,
@@ -131,6 +133,23 @@ def test_is_internal_handles_unset_env_var():
     with patch.dict(os.environ, {}, clear=True):
         # default is empty → nothing is internal
         assert is_internal("anyone@anywhere.com") is False
+
+
+def test_is_internal_falls_back_to_workspace_domain(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("INTERNAL_EMAILS_OR_DOMAINS", raising=False)
+    monkeypatch.setenv("WORKSPACE_DOMAIN", "goldbox.no")
+    assert is_internal("petter@goldbox.no") is True
+    assert is_internal("client@example.com") is False
+
+
+def test_is_internal_explicit_var_takes_precedence(monkeypatch: pytest.MonkeyPatch):
+    """If both env vars are set, the explicit one wins — lets ops override
+    the workspace-domain default (e.g. 'team@otherdomain.com is also us')."""
+    monkeypatch.setenv("INTERNAL_EMAILS_OR_DOMAINS", "team@cinesuit.com")
+    monkeypatch.setenv("WORKSPACE_DOMAIN", "goldbox.no")
+    assert is_internal("team@cinesuit.com") is True
+    # WORKSPACE_DOMAIN should NOT be consulted when the explicit list is set.
+    assert is_internal("petter@goldbox.no") is False
 
 
 # ============================================================

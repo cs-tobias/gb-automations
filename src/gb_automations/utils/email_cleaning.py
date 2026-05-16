@@ -38,51 +38,134 @@ _REPLY_MARKERS = [
     re.compile(r"^-{3,}\s*Videresendt melding\s*-{3,}", re.IGNORECASE),
     # Outlook-style header blocks: From:/Fra: opens, the rest extends via
     # _FORWARD_HEADER_LINE in find_reply_boundary_ranges.
-    re.compile(r"^Fra:\s+.+", re.IGNORECASE),
-    re.compile(r"^From:\s+.+", re.IGNORECASE),
-    re.compile(r"^Sendt:\s+", re.IGNORECASE),
-    re.compile(r"^Sent:\s+", re.IGNORECASE),
+    # `\*?` on both sides covers Gmail's HTML→plain conversion of Outlook's
+    # bolded labels (`<b>Fra:</b>` → `*Fra:*`).
+    re.compile(r"^\*?Fra:\*?\s+.+", re.IGNORECASE),
+    re.compile(r"^\*?From:\*?\s+.+", re.IGNORECASE),
+    re.compile(r"^\*?Sendt:\*?\s+", re.IGNORECASE),
+    re.compile(r"^\*?Sent:\*?\s+", re.IGNORECASE),
     # Apple Mail / older clients sometimes use a row of underscores as a separator.
     re.compile(r"^_{5,}\s*$"),
 ]
 
-# Signature markers: cut everything from here.
+# Signature sign-off phrases. Each can stand alone OR be joined with another
+# via `/` or `|` to support bilingual sign-offs ("Med vennlig hilsen / Best
+# Regards" is the standard form for Norwegian senders writing to international
+# recipients). The trailing-anchor preserved by `_signature_pattern` keeps
+# false positives down — prose can't accidentally match a full line.
+_SIGNATURE_PHRASES_FULL = (
+    r"Med\s+vennlig\s+hilsen",
+    r"Mvh\.?",
+    r"Vennlig\s+hilsen",
+    r"Vh",
+    r"Best\s+regards",
+    r"Kind\s+regards",
+    r"Regards",
+    r"Sincerely",
+    r"Cheers",
+    r"Thanks",
+    r"Thx",
+    r"Hilsen",
+)
+
+
+def _signature_pattern(phrases: tuple[str, ...]) -> re.Pattern[str]:
+    """Build a sign-off regex from `phrases` that also matches bilingual forms.
+
+    Result accepts `<phrase>` or `<phrase> / <phrase>` or `<phrase> | <phrase>`
+    on its own line (trailing comma + whitespace tolerated). Phrases are joined
+    by alternation; case-insensitive.
+    """
+    phrase_group = "|".join(phrases)
+    return re.compile(
+        rf"^(?:{phrase_group})(?:\s*[/|]\s*(?:{phrase_group}))?,?\s*$",
+        re.IGNORECASE,
+    )
+
+
+# Signature markers: cut everything from here. The two non-phrase markers
+# (bare `--` and "Sent from my ..." mobile-client tag) are kept separate
+# because they don't combine with bilingual partners.
 _SIGNATURE_MARKERS = [
-    re.compile(r"^Med\s+vennlig\s+hilsen,?\s*$", re.IGNORECASE),
-    re.compile(r"^Mvh\.?,?\s*$", re.IGNORECASE),
-    re.compile(r"^Vennlig\s+hilsen,?\s*$", re.IGNORECASE),
-    re.compile(r"^Vh,?\s*$", re.IGNORECASE),
-    re.compile(r"^Best\s+regards,?\s*$", re.IGNORECASE),
-    re.compile(r"^Kind\s+regards,?\s*$", re.IGNORECASE),
-    re.compile(r"^Regards,?\s*$", re.IGNORECASE),
-    re.compile(r"^Sincerely,?\s*$", re.IGNORECASE),
-    re.compile(r"^Cheers,?\s*$", re.IGNORECASE),
-    re.compile(r"^Thanks,?\s*$", re.IGNORECASE),
-    re.compile(r"^Thx,?\s*$", re.IGNORECASE),
+    _signature_pattern(_SIGNATURE_PHRASES_FULL),
     re.compile(r"^--\s*$"),
     re.compile(r"^Sent from my (iPhone|iPad|Android|mobile)", re.IGNORECASE),
-    re.compile(r"^Hilsen,?\s*$", re.IGNORECASE),
 ]
 
-# Detect-only marker for findSignatureStartLine (a slightly broader set).
-_SIGNATURE_START_REGEX = re.compile(
-    r"^(Med\s+vennlig\s+hilsen|Mvh\.?|Vennlig\s+hilsen|Vh|Best\s+regards|"
-    r"Kind\s+regards|Regards|Sincerely|Cheers|Hilsen),?\s*$",
-    re.IGNORECASE,
-)
+# Detect-only marker for findSignatureStartLine — same phrase set as the
+# cutter, just without the `--` / mobile-client variants (those are too
+# easy to confuse with signature decorations sitting AFTER the real sign-off).
+_SIGNATURE_START_REGEX = _signature_pattern(_SIGNATURE_PHRASES_FULL)
 
-# Stricter markers used when extracting a signature block (won't include "Cheers"/"Hilsen").
-_SIGNATURE_BLOCK_START_REGEX = re.compile(
-    r"^(Med\s+vennlig\s+hilsen|Mvh\.?|Vennlig\s+hilsen|"
-    r"Best\s+regards|Kind\s+regards|Regards|Sincerely),?\s*$",
-    re.IGNORECASE,
+# Stricter set used when extracting a signature block. Drops "Cheers", "Thanks",
+# "Thx", "Hilsen" — phrases ambiguous enough that body content sometimes ends
+# with them ("Cheers!" mid-message). The strict set is for situations where
+# we want to be SURE we found a real sign-off.
+_SIGNATURE_PHRASES_STRICT = (
+    r"Med\s+vennlig\s+hilsen",
+    r"Mvh\.?",
+    r"Vennlig\s+hilsen",
+    r"Best\s+regards",
+    r"Kind\s+regards",
+    r"Regards",
+    r"Sincerely",
 )
+_SIGNATURE_BLOCK_START_REGEX = _signature_pattern(_SIGNATURE_PHRASES_STRICT)
 
 _QUOTE_PREFIX = re.compile(r"^>+\s?")
+
+# Pattern for `[image: NAME]` markers Gmail emits in plain-text bodies for
+# inline images. We strip these by default but callers can opt in to keep
+# specific filenames so Goldbox can see WHERE in the body an attached image
+# was referenced. Captures the filename so we can match against an allow-list.
+_IMAGE_MARKER_RE = re.compile(r"\[image:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+
+# Non-image inline noise stripped unconditionally.
 _INLINE_NOISE = [
-    re.compile(r"\[image:\s*[^\]]+\]", re.IGNORECASE),
     re.compile(r"<http[^>]+>"),
 ]
+
+
+# Corporate "external sender" banners that mail servers inject into incoming
+# email. They show up *inside* the message body when employees later reply or
+# forward, polluting the extracted content AND sometimes hiding real reply
+# boundaries that sit nearby. Stripping them before any other processing keeps
+# both the Notion-displayed body and the splitter clean.
+#
+# Each pattern matches the WHOLE banner block (multi-line) so we can remove it
+# in one substitution. Anchoring on distinctive phrases like "originated from
+# outside" or "MailRisk" minimizes false positives on regular prose.
+_EXTERNAL_BANNER_PATTERNS = [
+    # MailRisk (Thon Eiendom and other Norwegian corporates). 4-line block,
+    # always opens with `*Caution:*` (sometimes `Caution:` without asterisks)
+    # and ends within a few lines that mention "MailRisk".
+    re.compile(
+        r"^\*?Caution:\*?[^\n]*\n"
+        r"(?:[^\n]*\n){0,5}?"
+        r"[^\n]*MailRisk[^\n]*\n?",
+        flags=re.IGNORECASE | re.MULTILINE,
+    ),
+    # Microsoft Defender "first-time sender" banner. Often single-line but can
+    # wrap to two. Distinctive opener `You don't often get email from`.
+    re.compile(
+        r"^You don'?t often get email from[^\n]*\n"
+        r"(?:[^\n]*Learn why this is important[^\n]*\n?)?",
+        flags=re.IGNORECASE | re.MULTILINE,
+    ),
+]
+
+
+def strip_external_sender_banners(text: str) -> str:
+    """Remove corporate 'this email is from outside' banners from a body.
+
+    Called by clean_body but also exposed so find_reply_boundary_ranges can
+    work against a pre-stripped copy when locating boundaries.
+    """
+    if not text:
+        return text
+    for pattern in _EXTERNAL_BANNER_PATTERNS:
+        text = pattern.sub("", text)
+    return text
 
 
 def _normalize(text: str) -> list[str]:
@@ -144,8 +227,11 @@ _DEFINITIVE_FORWARD_MARKERS = [
 # Header-style lines that cluster inside a forward block. A single one of these
 # can appear in a normal reply (Gmail's quoted-text rendering), so we require
 # two *consecutive* non-blank lines to confirm a forward block.
+# Optional `*` around the label handles Gmail's HTML→plain conversion of
+# Outlook's bolded headers (`*Fra:*`, `*Sendt:*`, etc.). `Kopi` is Norwegian
+# Outlook's Cc label — same role as Cc in the extension set.
 _FORWARD_HEADER_LINE = re.compile(
-    r"^(From|Fra|Sent|Sendt|To|Til|Cc|Subject|Emne|Date|Dato):\s+.+",
+    r"^\*?(From|Fra|Sent|Sendt|To|Til|Cc|Kopi|Subject|Emne|Date|Dato):\*?\s+.+",
     re.IGNORECASE,
 )
 
@@ -174,6 +260,22 @@ class ReplyBoundary:
         return first_line[:120]
 
 
+def _next_nonblank_stripped(lines: list[str], start: int) -> str:
+    """Look ahead from `start` for the next non-blank, quote-stripped line.
+
+    Returns the stripped text, or empty string if end-of-list. Used by the
+    boundary scanner to peek across a blank gap and decide whether the next
+    non-blank line continues a forward-header block (HTML→text conversions
+    of Outlook's `<p>Fra:</p><p>Sendt:</p>` paragraphs insert blank lines
+    between every label).
+    """
+    for j in range(start, len(lines)):
+        s = _QUOTE_PREFIX.sub("", lines[j]).strip()
+        if s:
+            return s
+    return ""
+
+
 def find_reply_boundary_ranges(text: str) -> list[ReplyBoundary]:
     """Locate every reply/forward boundary in `text` as line ranges.
 
@@ -187,8 +289,12 @@ def find_reply_boundary_ranges(text: str) -> list[ReplyBoundary]:
     `Cc:`, `Emne:`, `Dato:`, `Til:` — which never OPEN a boundary (too common
     as plain prose) but absolutely belong to a boundary that's already underway.
 
-    Boundary closing: a blank line OR any line that's neither a marker nor a
-    forward-header-extension line.
+    Boundary closing: a blank line followed by anything that isn't another
+    forward-header-extension line, OR any non-extension line directly.
+    The blank-gap tolerance is needed because Outlook's HTML wraps each
+    header label in a `<p>` paragraph; converting that to text inserts a
+    blank line between every label, breaking the old "blank line closes"
+    rule.
 
     The caller slices the original text between boundaries to get block bodies.
     """
@@ -203,6 +309,13 @@ def find_reply_boundary_ranges(text: str) -> list[ReplyBoundary]:
         stripped = _QUOTE_PREFIX.sub("", raw).strip()
         if not stripped:
             if in_boundary:
+                # Peek: only close if the next non-blank line ISN'T a
+                # forward-header-extension. Lets us span the blank gaps
+                # Outlook's HTML→text rendering inserts between `<p>Fra:</p>`
+                # paragraphs.
+                next_line = _next_nonblank_stripped(lines, i + 1)
+                if next_line and _FORWARD_HEADER_LINE.match(next_line):
+                    continue
                 out.append(_close_boundary(start_line, i - 1, header_lines))
                 in_boundary = False
                 header_lines = []
@@ -320,13 +433,25 @@ def looks_like_forward_block(text: str) -> bool:
     return False
 
 
-def clean_body(text: str) -> str:
+def clean_body(text: str, *, keep_image_markers: set[str] | None = None) -> str:
     """Aggressively strip a Gmail body down to the sender's new content.
+
+    `keep_image_markers`: filenames whose `[image: NAME]` markers should
+    survive the strip — used to preserve in-body anchors for attachments
+    that ARE being uploaded to this row. Filenames in this set are kept
+    verbatim; any `[image: NAME]` marker not in the set is removed. Default
+    None strips ALL markers (legacy behavior for callers that don't yet pass
+    the attribution info).
 
     Returns empty string if the message has no original content (pure forward/quote).
     """
     if not text:
         return ""
+
+    # Strip corporate "external sender" banners (MailRisk, Defender, …) before
+    # line-by-line work so their inner punctuation (e.g. `Do *not* click`)
+    # can't be confused with content markers.
+    text = strip_external_sender_banners(text)
 
     lines = _normalize(text)
 
@@ -339,9 +464,17 @@ def clean_body(text: str) -> str:
     lines = lines[:cut_idx]
 
     # Step 3: strip residual quote markers and inline noise.
+    keep_lower = {f.lower() for f in keep_image_markers} if keep_image_markers else set()
+
+    def _filter_image_marker(match: re.Match[str]) -> str:
+        # Filename group is captured by _IMAGE_MARKER_RE; keep the whole marker
+        # iff the filename is allow-listed. Strip otherwise.
+        return match.group(0) if match.group(1).strip().lower() in keep_lower else ""
+
     cleaned = []
     for line in lines:
         line = _QUOTE_PREFIX.sub("", line)
+        line = _IMAGE_MARKER_RE.sub(_filter_image_marker, line)
         for pattern in _INLINE_NOISE:
             line = pattern.sub("", line)
         cleaned.append(line.rstrip())

@@ -32,6 +32,7 @@ from gb_automations.clients import drive as drive_client
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import llm as llm_client
 from gb_automations.clients import notion as notion_client
+from gb_automations.clients import notion_emails_db
 from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import AttachmentFingerprint, ContactCache, EmailRow
@@ -42,7 +43,12 @@ from gb_automations.utils.email_cleaning import (
     find_signature_start_line,
     has_quoted_history_hint,
 )
-from gb_automations.utils.email_splitting import ExtractedMessage, synthetic_message_id
+from gb_automations.utils.email_splitting import (
+    ExtractedMessage,
+    find_under_split_blocks,
+    infer_missing_to_fields,
+    synthetic_message_id,
+)
 from gb_automations.utils.history_extraction import extract_history_blocks
 from gb_automations.utils.participants import (
     company_from_domain,
@@ -127,19 +133,17 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
         return result
     logger.info("  • matched project %r (page=%s)", project_name, project_page_id)
 
-    # Fetch the Emails DB schema once so we only set properties that exist
-    # in the user's actual Notion (schemas vary between workspaces).
-    emails_db_props = await notion_client.get_emails_db_property_names()
-
     # 3 + 4 + 5. Use one DB session for the whole thread so cache writes are
     # atomic. The history-reconstruction LLM call needs the session for the
     # first-encounter check, so we open the session before §3.
     async with SessionLocal() as session:
         # 3. Extract pre-thread email history from the first message's quoted
-        # content. Deterministic regex parsing — no LLM in this hot path. Runs
-        # every sync (content-hashed synthetic IDs make re-runs idempotent;
-        # duplicates dedup-hit silently). See utils/history_extraction.py.
-        splits = _extract_history_for_thread(thread)
+        # content. Regex first; if any extracted block still contains an
+        # un-split inner forward (e.g. an Outlook variant the regex layer
+        # doesn't recognize) the LLM fallback re-splits that block. Content-
+        # hashed synthetic IDs make re-runs idempotent regardless of which
+        # layer produced a given message.
+        splits = await _extract_history_for_thread(thread)
         try:
             # Serialize concurrent syncs of the same thread. Without this, two
             # Gmail pushes that fire ~seconds apart (e.g. self-emails fire one
@@ -163,7 +167,7 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
                         project_page_id=project_page_id,
                         user_email=user_email,
                         session=session,
-                        emails_db_props=emails_db_props,
+                        contact_ids=contact_ids,
                         thread_tracker=thread_tracker,
                     )
                     result.rows_created += created_count
@@ -193,7 +197,7 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
 # ============================================================
 
 
-def _extract_history_for_thread(
+async def _extract_history_for_thread(
     thread: gmail_client.GmailThread,
 ) -> dict[str, list[ExtractedMessage]]:
     """Pull pre-thread email history out of the first message's quoted content.
@@ -226,7 +230,71 @@ def _extract_history_for_thread(
         return {}
 
     logger.info("  • extracted %d prior email(s) from history (regex)", len(extracted))
+
+    # Two-layer splitter: regex first, LLM only on the blocks that still
+    # contain un-split inner headers. Each new mail client formats forwards
+    # differently (Outlook bolds labels with `*Fra:*`, mobile clients use
+    # idiosyncratic separators, …) — the regex layer handles the common
+    # cases; this fallback rescues the long tail without paying LLM cost
+    # on every thread.
+    extracted = await _resplit_under_split_blocks(
+        extracted,
+        parent_subject=first_msg.subject,
+        parent_date=first_msg.date,
+    )
+
+    # Fill missing To from the immediately-prior block's From. Inline reply
+    # boundaries ("X skrev Y:") only carry the sender; in a chronological
+    # reply chain msg N's recipient is almost always msg N-1's sender.
+    infer_missing_to_fields(extracted)
+
     return {first_msg.message_id: extracted}
+
+
+async def _resplit_under_split_blocks(
+    extracted: list[ExtractedMessage],
+    *,
+    parent_subject: str,
+    parent_date: datetime,
+) -> list[ExtractedMessage]:
+    """Run the LLM splitter on any block whose `raw_body` still has inner headers.
+
+    Non-flagged blocks pass through unchanged. Flagged blocks are replaced by
+    whatever the LLM returns; if the LLM returns [], the original regex block
+    is kept (graceful degradation — bad LLM is no worse than today's regex).
+
+    Final result is sorted chronologically so caller ordering invariants hold.
+    """
+    flagged = find_under_split_blocks(extracted)
+    if not flagged:
+        return extracted
+
+    logger.info(
+        "  • %d block(s) appear under-split; invoking LLM fallback splitter…",
+        len(flagged),
+    )
+    flagged_set = set(flagged)
+    rebuilt: list[ExtractedMessage] = []
+    for i, block in enumerate(extracted):
+        if i not in flagged_set:
+            rebuilt.append(block)
+            continue
+        llm_parts = await llm_client.split_history(
+            block.raw_body or block.body,
+            parent_subject=parent_subject,
+            parent_date=parent_date,
+        )
+        if not llm_parts:
+            # Keep the regex block as-is when the LLM gave us nothing usable.
+            rebuilt.append(block)
+            continue
+        logger.info(
+            "    ↳ LLM re-split block %d into %d message(s)", i, len(llm_parts)
+        )
+        rebuilt.extend(llm_parts)
+
+    rebuilt.sort(key=lambda m: m.date)
+    return rebuilt
 
 
 # ============================================================
@@ -286,8 +354,13 @@ async def _upsert_thread_contacts(
     seen: dict[str, dict[str, Any]] = {}  # email → {name, email, phone, company}
 
     def add_participant(raw: str) -> None:
+        # Upsert EVERY participant (internal + external) so the From/To/Cc
+        # relations on email rows can resolve to a Contact page regardless of
+        # who the participant is. Internal contacts (Goldbox team) are
+        # distinguished from external at row-build time via is_internal() on
+        # their email — no separate flag needed on the Contact itself.
         parsed = parse_participant(raw)
-        if not parsed or is_internal(parsed.email):
+        if not parsed or not parsed.email:
             return
         if parsed.email not in seen:
             seen[parsed.email] = {
@@ -300,15 +373,22 @@ async def _upsert_thread_contacts(
             seen[parsed.email]["name"] = parsed.name
 
     for msg in thread.messages:
-        # 1. Collect every distinct external participant from this message's headers.
+        # 1. Collect every participant from this message's headers.
         for raw in _split_addresses(msg.from_field, msg.to_field, msg.cc_field):
             add_participant(raw)
 
-        # 1b. If this message was a forwarded chain, also walk the extracted
-        # inner senders so the original participants land in Contacts.
+        # 1b. If this message was a forwarded chain, also walk every participant
+        # of each extracted inner message (sender + recipients) so historical
+        # participants land in Contacts.
         for inner in splits.get(msg.message_id, []):
             if inner.from_field:
                 add_participant(inner.from_field)
+            if inner.to_field:
+                for raw in _split_addresses(inner.to_field):
+                    add_participant(raw)
+            if inner.cc_field:
+                for raw in _split_addresses(inner.cc_field):
+                    add_participant(raw)
 
         # 2. If this message's signature has a phone, attach it to the sender's contact.
         sig = extract_signature_block(msg.plain_body)
@@ -390,6 +470,23 @@ async def _cache_contact(session: AsyncSession, *, email: str, page_id: str) -> 
 # ============================================================
 
 
+async def _resolve_db_for_date(date: datetime) -> tuple[str, set[str]]:
+    """Year-route helper: (db_id, property_names) for a message's date.
+
+    Centralizes the two API calls every sync path needs:
+      1. `get_emails_db_for_year(year)` — resolves (and creates if missing)
+         the year-partitioned Emails database.
+      2. `get_emails_db_property_names(db_id)` — fetches the schema once per
+         DB so property-builders only set fields that exist (lets the same
+         code work against workspaces with slightly different schemas).
+    Both layers cache internally so per-message overhead is just a dict hit
+    after the first call of the day.
+    """
+    db_id = await notion_emails_db.get_emails_db_for_year(date.year)
+    props = await notion_client.get_emails_db_property_names(db_id)
+    return db_id, props
+
+
 async def _sync_message(
     *,
     msg: gmail_client.GmailMessage,
@@ -397,7 +494,7 @@ async def _sync_message(
     project_page_id: str,
     user_email: str,
     session: AsyncSession,
-    emails_db_props: set[str],
+    contact_ids: dict[str, str],
     thread_tracker: ThreadAttachmentTracker | None = None,
 ) -> tuple[int, int]:
     """Create Notion rows for one Gmail message.
@@ -406,6 +503,10 @@ async def _sync_message(
     canonical 1:1 mapping). When `extracted` is non-empty (history was
     reconstructed for this message — only happens for the first message of a
     thread on first encounter), ALSO creates one row per extracted prior email.
+
+    Each row routes to its own year DB (resolved from the row's own date —
+    matters for threads spanning years and for extracted history blocks dated
+    from earlier years).
 
     Returns `(rows_created, rows_already_present)`.
     """
@@ -425,7 +526,7 @@ async def _sync_message(
         project_page_id=project_page_id,
         user_email=user_email,
         session=session,
-        emails_db_props=emails_db_props,
+        contact_ids=contact_ids,
         attachment_decisions=forwarder_decisions,
         thread_tracker=thread_tracker,
     )
@@ -446,7 +547,7 @@ async def _sync_message(
             project_page_id=project_page_id,
             user_email=user_email,
             session=session,
-            emails_db_props=emails_db_props,
+            contact_ids=contact_ids,
             attachments_by_synth=by_synth,
             thread_tracker=thread_tracker,
         )
@@ -462,7 +563,7 @@ async def _sync_single_message(
     project_page_id: str,
     user_email: str,
     session: AsyncSession,
-    emails_db_props: set[str],
+    contact_ids: dict[str, str] | None = None,
     attachment_decisions: list[AttachmentDecision] | None = None,
     thread_tracker: ThreadAttachmentTracker | None = None,
 ) -> tuple[int, int]:
@@ -474,6 +575,9 @@ async def _sync_single_message(
     the standalone `sync_message` path that doesn't go through history
     extraction.
 
+    The target Emails DB is resolved from `msg.date.year` — year-partitioned
+    DBs each carry the same schema, populated on demand.
+
     Returns `(1, 0)` if a new row was created, `(0, 1)` if it was already there.
     """
     # 1. Local cache hit?
@@ -482,8 +586,10 @@ async def _sync_single_message(
         logger.debug("    dedup hit (local cache) for msg %s", msg.message_id)
         return (0, 1)
 
+    db_id, emails_db_props = await _resolve_db_for_date(msg.date)
+
     # 2. Notion already has a row for this message ID (different user synced it)?
-    existing = await notion_client.find_email_row_by_message_id(msg.message_id)
+    existing = await notion_client.find_email_row_by_message_id(msg.message_id, db_id)
     if existing:
         logger.debug("    dedup hit (Notion query) for msg %s", msg.message_id)
         await _cache_email_row(
@@ -501,10 +607,18 @@ async def _sync_single_message(
     # divider (both stripped by clean_body), and the only "attachments" are
     # inline signature logos. The valuable content is the extracted prior
     # messages (history reconstruction handles those).
-    cleaned_body = clean_body(msg.plain_body)
     if attachment_decisions is None:
         attachment_decisions = _partition_attachments(msg.plain_body, msg.attachments)
     has_potential_attachments = any(d.upload for d in attachment_decisions)
+    # Keep `[image: NAME]` markers in the body for attachments we're actually
+    # uploading — preserves the in-body anchor so Goldbox can see "the image
+    # the sender referenced sits HERE in the paragraph." Skipped images
+    # (signatures, tiny, inline-repeated) have their markers stripped so the
+    # body doesn't reference files that aren't in the row.
+    cleaned_body = clean_body(
+        msg.plain_body,
+        keep_image_markers=_owning_filenames(attachment_decisions),
+    )
     if not cleaned_body and not has_potential_attachments:
         logger.info(
             "    ⊘ skipping msg %s: no body content and no real attachments "
@@ -524,8 +638,10 @@ async def _sync_single_message(
         project_page_id=project_page_id,
         user_email=user_email,
         emails_db_props=emails_db_props,
+        body=cleaned_body,
+        contact_ids=contact_ids or {},
     )
-    created = await notion_client.create_email_row(properties)
+    created = await notion_client.create_email_row(properties, db_id)
     row_id = created["id"]
 
     # Upload attachments to Drive and set the row's Files property. Per-
@@ -550,7 +666,7 @@ async def _sync_single_message(
                 )
 
     # Append the chat-style callout for this message to the row's page body.
-    blocks = _build_chat_blocks(msg, user_email)
+    blocks = _build_chat_blocks(msg, user_email, body=cleaned_body)
     if blocks:
         try:
             await notion_client.append_blocks_to_page(row_id, blocks)
@@ -574,7 +690,7 @@ async def _sync_forwarded_chain(
     project_page_id: str,
     user_email: str,
     session: AsyncSession,
-    emails_db_props: set[str],
+    contact_ids: dict[str, str],
     attachments_by_synth: dict[str, list[AttachmentDecision]] | None = None,
     thread_tracker: ThreadAttachmentTracker | None = None,
 ) -> tuple[int, int]:
@@ -601,7 +717,7 @@ async def _sync_forwarded_chain(
             project_page_id=project_page_id,
             user_email=user_email,
             session=session,
-            emails_db_props=emails_db_props,
+            contact_ids=contact_ids,
             attachment_decisions=attachments_by_synth.get(synth_id, []),
             thread_tracker=thread_tracker,
         )
@@ -619,7 +735,7 @@ async def _sync_extracted_message(
     project_page_id: str,
     user_email: str,
     session: AsyncSession,
-    emails_db_props: set[str],
+    contact_ids: dict[str, str],
     attachment_decisions: list[AttachmentDecision] | None = None,
     thread_tracker: ThreadAttachmentTracker | None = None,
 ) -> tuple[int, int]:
@@ -629,6 +745,10 @@ async def _sync_extracted_message(
     historical email (by filename mention in `inner.body`). Bytes still come
     from `parent_msg` — that's the message that physically carries them.
 
+    The row lands in the year DB matching `inner.date.year` — so a 2023
+    email forwarded in 2026 still ends up in `Emails 2023`, preserving
+    chronological partitioning even when discovery is years later.
+
     Returns `(1, 0)` if created, `(0, 1)` if already present (dedup by synthetic_id).
     """
     cached = await session.get(EmailRow, synthetic_id)
@@ -636,7 +756,9 @@ async def _sync_extracted_message(
         logger.debug("    dedup hit (local cache) for extracted %s", synthetic_id)
         return (0, 1)
 
-    existing = await notion_client.find_email_row_by_message_id(synthetic_id)
+    db_id, emails_db_props = await _resolve_db_for_date(inner.date)
+
+    existing = await notion_client.find_email_row_by_message_id(synthetic_id, db_id)
     if existing:
         logger.debug("    dedup hit (Notion query) for extracted %s", synthetic_id)
         await _cache_email_row(
@@ -648,10 +770,20 @@ async def _sync_extracted_message(
         )
         return (0, 1)
 
+    # Compute the row's display body once. Re-clean from raw_body so we
+    # control which `[image: NAME]` markers survive (the ones for attachments
+    # actually attributed to this row). Fall back to inner.body for callers
+    # that didn't populate raw_body (older tests, future producers).
+    keep_filenames = _owning_filenames(attachment_decisions or [])
+    if inner.raw_body:
+        display_body = clean_body(inner.raw_body, keep_image_markers=keep_filenames)
+    else:
+        display_body = inner.body
+
     logger.info(
         "    📝 row (history) %s: %s",
         synthetic_id,
-        _format_extraction_preview(inner.from_field, inner.subject, inner.body),
+        _format_extraction_preview(inner.from_field, inner.subject, display_body),
     )
     properties = await _build_extracted_row_properties(
         parent_msg=parent_msg,
@@ -660,8 +792,10 @@ async def _sync_extracted_message(
         project_page_id=project_page_id,
         user_email=user_email,
         emails_db_props=emails_db_props,
+        body=display_body,
+        contact_ids=contact_ids,
     )
-    notion_page = await notion_client.create_email_row(properties)
+    notion_page = await notion_client.create_email_row(properties, db_id)
     row_id = notion_page["id"]
 
     # Upload any attachments attributed to THIS historical email. Bytes live
@@ -689,7 +823,7 @@ async def _sync_extracted_message(
                     "Failed to set Files property on extracted row %s", row_id
                 )
 
-    blocks = _build_extracted_chat_blocks(inner, user_email)
+    blocks = _build_extracted_chat_blocks(inner, user_email, body=display_body)
     if blocks:
         try:
             await notion_client.append_blocks_to_page(row_id, blocks)
@@ -735,22 +869,50 @@ async def _cache_email_row(
 # ============================================================
 
 
+def _emails_from(raw_field: str) -> list[str]:
+    """Parse a raw `To`/`Cc` header value into a list of lowercased emails.
+
+    Empty strings, names without emails, and duplicates are dropped. Order
+    is preserved (Notion renders relations in insertion order).
+    """
+    if not raw_field:
+        return []
+    seen: list[str] = []
+    for raw in _split_addresses(raw_field):
+        parsed = parse_participant(raw)
+        if not parsed or not parsed.email:
+            continue
+        if parsed.email not in seen:
+            seen.append(parsed.email)
+    return seen
+
+
 async def _build_email_row_properties(
     *,
     msg: gmail_client.GmailMessage,
     project_page_id: str,
     user_email: str,
     emails_db_props: set[str],
+    body: str,
+    contact_ids: dict[str, str],
 ) -> dict[str, Any]:
     """Build the Notion properties dict for a single-message Emails-DB row.
+
+    `body` is the already-cleaned text the row should display — callers are
+    responsible for running `clean_body` with the right `keep_image_markers`
+    set, since which attachments end up on this row determines which markers
+    should be preserved.
+
+    `contact_ids` maps every participant email seen during this thread to
+    the Notion Contact page ID, populated upstream by `_upsert_thread_contacts`.
+    Used to resolve the From/To/Cc relation properties.
 
     Only sets properties that exist in `emails_db_props` (the actual DB schema),
     so the same code works against workspaces with different schemas.
     """
     from_email = _addr_to_email(msg.from_field)
-    from_name = extract_name(msg.from_field) or from_email
-    is_outgoing = from_email == user_email.lower()
-    body = clean_body(msg.plain_body)
+    to_emails = _emails_from(msg.to_field)
+    cc_emails = _emails_from(msg.cc_field)
 
     return await _assemble_row_props(
         emails_db_props=emails_db_props,
@@ -758,9 +920,10 @@ async def _build_email_row_properties(
         thread_id=msg.thread_id,
         message_id=msg.message_id,
         project_page_id=project_page_id,
-        from_name=from_name,
         from_email=from_email,
-        is_outgoing=is_outgoing,
+        to_emails=to_emails,
+        cc_emails=cc_emails,
+        contact_ids=contact_ids,
         date_iso=msg.date.isoformat(),
         body=body,
     )
@@ -774,19 +937,30 @@ async def _build_extracted_row_properties(
     project_page_id: str,
     user_email: str,
     emails_db_props: set[str],
+    body: str,
+    contact_ids: dict[str, str],
 ) -> dict[str, Any]:
     """Build Notion properties for an LLM-extracted sub-message.
 
+    `body` is the display body the row should carry — caller computes it
+    from `inner.raw_body` with the keep-list set to whichever attachment
+    filenames this row owns, so in-body `[image: NAME]` anchors survive
+    only for attachments the row actually carries.
+
+    `contact_ids` is the same shared map used by the regular path. Extracted
+    messages may have empty `to_field`/`cc_field` (inline-reply boundaries
+    don't carry recipient info) — in that case To/Cc relations are simply
+    omitted from this row.
+
     Same property shape as a regular row — synthetic_id goes into the
-    message_id property so dedup queries work unchanged. No attachments
-    (extracted segments don't have Gmail attachment metadata).
+    message_id property so dedup queries work unchanged.
     """
     # LLM-extracted messages may return just a display name ("Petter Burhol")
     # with no email address. Use strict parsing here — better to leave the
-    # Notion email field unset than to write a name into an email-typed prop.
+    # relation unset than to invent one.
     from_email = strict_email_or_empty(inner.from_field)
-    from_name = extract_name(inner.from_field) or from_email or "(unknown)"
-    is_outgoing = bool(from_email) and from_email == user_email.lower()
+    to_emails = _emails_from(inner.to_field)
+    cc_emails = _emails_from(inner.cc_field)
 
     return await _assemble_row_props(
         emails_db_props=emails_db_props,
@@ -794,11 +968,12 @@ async def _build_extracted_row_properties(
         thread_id=parent_msg.thread_id,
         message_id=synthetic_id,
         project_page_id=project_page_id,
-        from_name=from_name,
         from_email=from_email,
-        is_outgoing=is_outgoing,
+        to_emails=to_emails,
+        cc_emails=cc_emails,
+        contact_ids=contact_ids,
         date_iso=inner.date.isoformat(),
-        body=inner.body,
+        body=body,
     )
 
 
@@ -809,9 +984,10 @@ async def _assemble_row_props(
     thread_id: str,
     message_id: str,
     project_page_id: str,
-    from_name: str,
     from_email: str,
-    is_outgoing: bool,
+    to_emails: list[str],
+    cc_emails: list[str],
+    contact_ids: dict[str, str],
     date_iso: str,
     body: str,
 ) -> dict[str, Any]:
@@ -849,6 +1025,10 @@ async def _assemble_row_props(
         if tags:
             logger.info("    🏷  tagged: %s", ", ".join(tags))
 
+    from_contact_id = contact_ids.get(from_email) if from_email else None
+    to_contact_ids = [contact_ids[e] for e in to_emails if e in contact_ids]
+    cc_contact_ids = [contact_ids[e] for e in cc_emails if e in contact_ids]
+
     props: dict[str, Any] = {}
 
     def maybe_set(key: str, value: dict[str, Any]) -> None:
@@ -860,11 +1040,12 @@ async def _assemble_row_props(
     maybe_set("thread_id", {"rich_text": [{"text": {"content": thread_id}}]})
     maybe_set("message_id", {"rich_text": [{"text": {"content": message_id}}]})
     maybe_set("project", {"relation": [{"id": project_page_id}]})
-    if from_name:
-        maybe_set("from_name", {"rich_text": [{"text": {"content": from_name[:1900]}}]})
-    if from_email:
-        maybe_set("from_email", {"email": from_email})
-    maybe_set("direction", {"select": {"name": "Outgoing" if is_outgoing else "Incoming"}})
+    if from_contact_id:
+        maybe_set("from_contact", {"relation": [{"id": from_contact_id}]})
+    if to_contact_ids:
+        maybe_set("to_contacts", {"relation": [{"id": cid} for cid in to_contact_ids]})
+    if cc_contact_ids:
+        maybe_set("cc_contacts", {"relation": [{"id": cid} for cid in cc_contact_ids]})
     maybe_set("date", {"date": {"start": date_iso}})
     if body:
         maybe_set(
@@ -881,13 +1062,25 @@ async def _assemble_row_props(
     return props
 
 
-def _build_chat_blocks(msg: gmail_client.GmailMessage, user_email: str) -> list[dict[str, Any]]:
-    """Render one Gmail message as a chat-style block group for a Notion page body."""
+def _build_chat_blocks(
+    msg: gmail_client.GmailMessage,
+    user_email: str,
+    *,
+    body: str | None = None,
+) -> list[dict[str, Any]]:
+    """Render one Gmail message as a chat-style block group for a Notion page body.
+
+    `body` overrides the default cleaned body so the page-content text stays
+    in sync with the row-property text when the caller used a keep-list to
+    preserve image markers for owned attachments.
+    """
     from_email = _addr_to_email(msg.from_field)
     from_name = extract_name(msg.from_field) or from_email
     is_outgoing = from_email == user_email.lower()
 
-    body = clean_body(msg.plain_body) or "_(no message body — forwarded or empty)_"
+    if body is None:
+        body = clean_body(msg.plain_body)
+    body = body or "_(no message body — forwarded or empty)_"
     timestamp = msg.date.strftime("%b %d, %Y · %H:%M UTC")
     return _assemble_chat_blocks(
         from_name=from_name,
@@ -898,13 +1091,19 @@ def _build_chat_blocks(msg: gmail_client.GmailMessage, user_email: str) -> list[
 
 
 def _build_extracted_chat_blocks(
-    inner: ExtractedMessage, user_email: str
+    inner: ExtractedMessage, user_email: str, *, body: str | None = None
 ) -> list[dict[str, Any]]:
-    """Render an LLM-extracted sub-message as a chat-style block group."""
+    """Render an LLM-extracted sub-message as a chat-style block group.
+
+    `body` overrides `inner.body` for the rendered text — used so the
+    page-content body and the row-property body stay in sync when the
+    caller computed a custom display body (e.g. with `[image: NAME]`
+    markers preserved for owned attachments).
+    """
     from_email = strict_email_or_empty(inner.from_field)
     from_name = extract_name(inner.from_field) or from_email or "(unknown)"
     is_outgoing = bool(from_email) and from_email == user_email.lower()
-    body = inner.body or "_(no message body)_"
+    body = (body if body is not None else inner.body) or "_(no message body)_"
     timestamp = inner.date.strftime("%b %d, %Y · %H:%M UTC")
     return _assemble_chat_blocks(
         from_name=from_name,
@@ -1000,6 +1199,18 @@ class AttachmentDecision:
     skip_reason: str = ""
 
 
+def _owning_filenames(decisions: list[AttachmentDecision]) -> set[str]:
+    """Filenames whose `[image: NAME]` markers should be kept in this row's body.
+
+    Only attachments that will actually be uploaded (`upload=True`) qualify —
+    keeping a marker for a skipped signature image would leave a dangling
+    reference to a file that isn't in the row. Tiny / inline-repeated /
+    signature-region decisions all have `upload=False` and so don't appear
+    in the keep set.
+    """
+    return {d.attachment.filename for d in decisions if d.upload and d.attachment.filename}
+
+
 def _body_mentions_filename(body: str, filename: str) -> bool:
     """True if `filename` appears in `body` — as `[image: name]` OR a bare mention.
 
@@ -1012,19 +1223,35 @@ def _body_mentions_filename(body: str, filename: str) -> bool:
     return filename.lower() in body.lower()
 
 
+_TINY_IMAGE_BYTES = 1024  # 1 KB — Word's `~WRDxxxx.jpg` thumbnails and other
+# Office-generated signature artifacts always fall below this. Real photos,
+# logos sent as project assets, and even small JPEGs sit comfortably above
+# 1 KB. Keeps the false-positive risk on legitimate small client logos low.
+
+
 def _partition_attachments(
     body: str, attachments: list[gmail_client.GmailAttachment]
 ) -> list[AttachmentDecision]:
     """Decide which attachments are worth downloading + uploading.
 
-    Position-based skip: if an attachment's `[image: name]` reference in the
-    plain-text body sits at or below the signature-start line, it's a
-    signature-region decoration → mark `upload=False`. This rule fires
-    without needing bytes, so we can skip the Gmail download entirely.
+    Skip rules (all fire without needing bytes, so the Gmail download is
+    avoided entirely):
+      1. Position-based: if an attachment's `[image: name]` reference in the
+         plain-text body sits at or below the signature-start line, it's a
+         signature-region decoration.
+      2. Tiny-image: image/* attachments under 1 KB are Office-generated
+         signature thumbnails (e.g. `~WRD0002.jpg`), never real content.
+      3. Inline-repeated: image/* attachments with `inline_ref_count >= 2`
+         are referenced multiple times in the SAME message's HTML — that
+         only happens for signature logos carried in every quoted reply
+         block of an Outlook thread. Real photo attachments are referenced
+         exactly once. Distinct from cross-message re-carry (which is just
+         Gmail keeping the bytes alive across replies and is handled by
+         `ThreadAttachmentTracker`).
 
-    Repetition-based detection (signature images that repeat across emails)
-    is NOT done here — it requires the bytes for content hashing and runs
-    inside the upload loop via `_is_repeating_signature_image`.
+    Repetition across messages from the same sender (e.g. the same logo in
+    many separate threads) is NOT detected here — it requires the bytes and
+    runs in the upload loop via `_is_repeating_signature_image`.
 
     Returns one `AttachmentDecision` per input attachment, preserving order.
     """
@@ -1033,6 +1260,18 @@ def _partition_attachments(
     signature_line = find_signature_start_line(body)
     out: list[AttachmentDecision] = []
     for att in attachments:
+        if (
+            att.mime_type.startswith("image/")
+            and att.size > 0
+            and att.size < _TINY_IMAGE_BYTES
+        ):
+            out.append(AttachmentDecision(att, upload=False, skip_reason="tiny-image"))
+            continue
+        if att.mime_type.startswith("image/") and att.inline_ref_count >= 2:
+            out.append(
+                AttachmentDecision(att, upload=False, skip_reason="inline-repeated")
+            )
+            continue
         if signature_line >= 0:
             ref_line = find_attachment_reference_line(body, att.filename)
             if ref_line >= 0 and ref_line >= signature_line:
@@ -1076,6 +1315,25 @@ def _attribute_attachments(
     # Walk extracted oldest-first. history_extraction emits oldest first, but
     # be defensive in case ordering ever changes.
     ordered = sorted(extracted, key=lambda e: e.date)
+
+    # Fallback owner when no extracted block mentions the filename. Used for
+    # forwards where the outer body is empty (forwarder added no commentary)
+    # AND no `[image: NAME]` markers survive in any block — typical for
+    # Outlook-originated HTML-only forwards. Picking the oldest non-forwarder
+    # block is a better default than dumping everything on the empty
+    # forwarder row.
+    forwarder_email = (_addr_to_email(parent_msg.from_field) or "").lower()
+    forwarder_body_is_empty = not clean_body(parent_msg.plain_body)
+    fallback_synth: str | None = None
+    if forwarder_body_is_empty:
+        for inner in ordered:
+            inner_email = (_addr_to_email(inner.from_field) or "").lower()
+            if inner_email and inner_email != forwarder_email:
+                fallback_synth = synthetic_message_id(
+                    parent_msg.message_id, inner.from_field, inner.body
+                )
+                break
+
     by_synth: dict[str, list[AttachmentDecision]] = {}
     forwarder: list[AttachmentDecision] = []
     for decision in all_decisions:
@@ -1095,6 +1353,8 @@ def _attribute_attachments(
                     parent_msg.message_id, inner.from_field, inner.body
                 )
                 break
+        if owner_synth is None:
+            owner_synth = fallback_synth
         if owner_synth is None:
             forwarder.append(decision)
         else:
@@ -1117,6 +1377,12 @@ async def _is_repeating_signature_image(
 
     Content hash is sha1 of the bytes. Stable across emails even when Gmail
     renumbers inline image filenames (`image001.png` → `image004.png`).
+
+    Sender-scoped (not global) on purpose: forwards naturally cause the same
+    bytes to be re-attributed across senders (forwarder + original sender),
+    so a global sha1 rule would false-positive every forwarded real
+    attachment. Repeated bytes from the SAME sender are the actual signature
+    signal — that pattern doesn't occur for legitimate one-off attachments.
     """
     sha1 = hashlib.sha1(content).hexdigest()
     sender_key = sender_email.lower()

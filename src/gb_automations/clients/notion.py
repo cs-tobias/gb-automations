@@ -178,18 +178,22 @@ def extract_database_title(db: dict[str, Any]) -> str:
 async def get_project_pages() -> dict[str, str]:
     """Project name → Notion page ID, for every top-level page the integration can see.
 
-    Excludes pages that are rows in the Emails or Contacts database.
+    Excludes pages that are rows in the Contacts database OR in any year-
+    partitioned Emails database. The Emails DB set is fetched from the local
+    cache table populated by `notion_emails_db.get_emails_db_for_year`.
     """
-    emails_id = settings.emails_db_id.replace("-", "")
+    from gb_automations.clients import notion_emails_db
+
     contacts_id = settings.contacts_db_id.replace("-", "")
+    emails_db_ids = await notion_emails_db.all_known_db_ids()
     out: dict[str, str] = {}
 
     pages = await search_pages()
     for page in pages:
         parent = page.get("parent") or {}
         if parent.get("type") == "database_id":
-            parent_db = (parent.get("database_id") or "").replace("-", "")
-            if parent_db in (emails_id, contacts_id):
+            parent_db = (parent.get("database_id") or "").replace("-", "").lower()
+            if parent_db == contacts_id.lower() or parent_db in emails_db_ids:
                 continue
         title = extract_page_title(page)
         if title:
@@ -202,32 +206,34 @@ async def get_project_pages() -> dict[str, str]:
 # ============================================================
 
 
-_emails_db_property_names_cache: set[str] | None = None
+_emails_db_property_names_cache: dict[str, set[str]] = {}
 
 
-async def get_emails_db_property_names() -> set[str]:
-    """Names of every property on the Emails DB, cached after first call.
+async def get_emails_db_property_names(db_id: str) -> set[str]:
+    """Names of every property on the given Emails DB, cached per-DB.
 
-    Lets sync code skip setting properties that don't exist in the user's schema —
-    so the same code adapts to different Notion workspaces (tobiaseek vs Goldbox)
-    without config changes.
+    With year-partitioned Emails DBs, callers pass the DB ID returned by
+    `notion_emails_db.get_emails_db_for_year`. Each year DB caches separately
+    (schemas are identical in practice but the API key is db_id, not year).
+    Lets sync code skip setting properties that don't exist in the user's
+    schema — so the same code adapts to different Notion workspaces without
+    config changes.
     """
-    global _emails_db_property_names_cache
-    if _emails_db_property_names_cache is not None:
-        return _emails_db_property_names_cache
-    if not settings.emails_db_id:
-        raise RuntimeError("EMAILS_DB_ID is not configured")
+    if db_id in _emails_db_property_names_cache:
+        return _emails_db_property_names_cache[db_id]
+    if not db_id:
+        raise RuntimeError("db_id is required (resolve via notion_emails_db first)")
     async with _client() as client:
-        response = await client.get(f"/databases/{settings.emails_db_id}")
+        response = await client.get(f"/databases/{db_id}")
         _raise_for_status(response)
-    _emails_db_property_names_cache = set(response.json().get("properties", {}).keys())
-    return _emails_db_property_names_cache
+    names = set(response.json().get("properties", {}).keys())
+    _emails_db_property_names_cache[db_id] = names
+    return names
 
 
 def reset_schema_cache() -> None:
-    """Drop the cached schema. Useful for tests or after manually editing the DB in Notion."""
-    global _emails_db_property_names_cache
-    _emails_db_property_names_cache = None
+    """Drop the cached schemas. Useful for tests or after manually editing a DB."""
+    _emails_db_property_names_cache.clear()
 
 
 async def get_page(page_id: str) -> dict[str, Any]:
@@ -238,13 +244,19 @@ async def get_page(page_id: str) -> dict[str, Any]:
         return response.json()
 
 
-async def find_email_row_by_message_id(message_id: str) -> dict[str, Any] | None:
-    """Query the Emails DB for a non-archived row with this Gmail message ID."""
-    if not settings.emails_db_id:
-        raise RuntimeError("EMAILS_DB_ID is not configured")
+async def find_email_row_by_message_id(message_id: str, db_id: str) -> dict[str, Any] | None:
+    """Query the given Emails DB for a non-archived row with this Gmail message ID.
+
+    Caller passes `db_id` resolved via `notion_emails_db.get_emails_db_for_year`
+    based on the message's year. Lookups only hit the year DB matching the
+    message — wrong-year searches would always miss, so routing is correct
+    by construction at the call sites.
+    """
+    if not db_id:
+        raise RuntimeError("db_id is required (resolve via notion_emails_db first)")
     async with _client() as client:
         response = await client.post(
-            f"/databases/{settings.emails_db_id}/query",
+            f"/databases/{db_id}/query",
             json={
                 "filter": {
                     "property": EMAILS_PROPS["message_id"],
@@ -259,13 +271,15 @@ async def find_email_row_by_message_id(message_id: str) -> dict[str, Any] | None
         return live[0] if live else None
 
 
-async def has_any_row_for_thread(thread_id: str) -> bool:
-    """Quick existence check: any non-archived row with this Gmail thread ID."""
-    if not settings.emails_db_id:
-        raise RuntimeError("EMAILS_DB_ID is not configured")
+async def has_any_row_for_thread(thread_id: str, db_id: str) -> bool:
+    """Quick existence check: any non-archived row with this Gmail thread ID
+    in the given year DB. Threads spanning years need callers to query each
+    year DB the thread might live in (or accept "only matters per-year")."""
+    if not db_id:
+        raise RuntimeError("db_id is required (resolve via notion_emails_db first)")
     async with _client() as client:
         response = await client.post(
-            f"/databases/{settings.emails_db_id}/query",
+            f"/databases/{db_id}/query",
             json={
                 "filter": {
                     "property": EMAILS_PROPS["thread_id"],
@@ -279,15 +293,15 @@ async def has_any_row_for_thread(thread_id: str) -> bool:
         return any(not p.get("archived") and not p.get("in_trash") for p in results)
 
 
-async def create_email_row(properties: dict[str, Any]) -> dict[str, Any]:
-    """Create a new row in the Emails DB. Returns the created page object."""
-    if not settings.emails_db_id:
-        raise RuntimeError("EMAILS_DB_ID is not configured")
+async def create_email_row(properties: dict[str, Any], db_id: str) -> dict[str, Any]:
+    """Create a new row in the given Emails DB. Returns the created page object."""
+    if not db_id:
+        raise RuntimeError("db_id is required (resolve via notion_emails_db first)")
     async with _client() as client:
         response = await client.post(
             "/pages",
             json={
-                "parent": {"database_id": settings.emails_db_id},
+                "parent": {"database_id": db_id},
                 "properties": properties,
             },
         )

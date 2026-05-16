@@ -161,14 +161,24 @@ async def debug_llm(prompt: str = Query(..., description="Text to classify")) ->
 
 @router.get("/emails-schema")
 async def debug_emails_schema() -> dict[str, Any]:
-    """Property names + types on the Emails DB, fresh from Notion (bypasses the cache).
+    """Property names on the CURRENT year's Emails DB, fresh from Notion.
 
-    Use this after renaming a column in Notion to confirm the api sees the new name —
-    if it doesn't appear here, the row builder will silently skip writing to it.
+    With year-partitioned DBs all schemas should be identical (we create them
+    from the same code constant), so reporting the current year's is the most
+    useful single answer. Bypasses the cache to surface manual Notion edits.
+
+    Use after renaming a column in Notion to confirm the api sees the new
+    name — if it doesn't appear, the row builder will silently skip it.
     """
+    from datetime import UTC, datetime
+
+    from gb_automations.clients import notion_emails_db
+
     notion_client.reset_schema_cache()
-    names = sorted(await notion_client.get_emails_db_property_names())
-    return {"count": len(names), "property_names": names}
+    year = datetime.now(UTC).year
+    db_id = await notion_emails_db.get_emails_db_for_year(year)
+    names = sorted(await notion_client.get_emails_db_property_names(db_id))
+    return {"year": year, "db_id": db_id, "count": len(names), "property_names": names}
 
 
 @router.get("/projects")

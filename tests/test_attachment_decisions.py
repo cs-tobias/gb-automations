@@ -65,6 +65,88 @@ def test_partition_image_in_body_uploads():
     assert decisions[0].upload is True
 
 
+def test_partition_tiny_image_under_1kb_is_skipped():
+    # Word's `~WRDxxxx.jpg` and other Office-generated signature thumbnails
+    # consistently sit below 1 KB. Skip without needing to download bytes.
+    body = "Hei,\nVidereført innhold.\n\nMvh\nAnne"
+    decisions = _partition_attachments(
+        body, [_att("~WRD0002.jpg", "image/jpeg", 800)]
+    )
+    assert len(decisions) == 1
+    assert decisions[0].upload is False
+    assert decisions[0].skip_reason == "tiny-image"
+
+
+def test_partition_small_but_real_image_still_uploads():
+    # 4.6 KB is small enough to be a logo but well above the 1 KB threshold —
+    # clients can legitimately send small brand assets as real attachments.
+    body = "Hei,\nSe vedlagte logo."
+    decisions = _partition_attachments(
+        body, [_att("brand-logo.png", "image/png", 4_600)]
+    )
+    assert len(decisions) == 1
+    assert decisions[0].upload is True
+
+
+def test_partition_inline_repeated_image_is_skipped():
+    """An image referenced 2+ times in the same Gmail message's HTML is
+    almost always a signature logo carried in every quoted reply block
+    of an Outlook thread. Skip without needing the bytes."""
+    att = GmailAttachment(
+        filename="image001.png",
+        mime_type="image/png",
+        size=4_761,
+        attachment_id="abc",
+        content_id="ii_x@host",
+        inline_ref_count=3,
+    )
+    decisions = _partition_attachments("Some body without markers.", [att])
+    assert len(decisions) == 1
+    assert decisions[0].upload is False
+    assert decisions[0].skip_reason == "inline-repeated"
+
+
+def test_partition_single_inline_ref_uploads():
+    """One reference = real attachment, not a signature."""
+    att = GmailAttachment(
+        filename="moodboard.jpg",
+        mime_type="image/jpeg",
+        size=500_000,
+        attachment_id="abc",
+        content_id="ii_y@host",
+        inline_ref_count=1,
+    )
+    decisions = _partition_attachments("Body.", [att])
+    assert len(decisions) == 1
+    assert decisions[0].upload is True
+
+
+def test_partition_inline_repeated_only_applies_to_images():
+    """inline_ref_count is computed from `<img>` tags only, so non-image
+    types should never have it elevated. Sanity-check the guard explicitly
+    requires image/* so a hypothetical bug elsewhere can't skip a PDF."""
+    att = GmailAttachment(
+        filename="contract.pdf",
+        mime_type="application/pdf",
+        size=100_000,
+        attachment_id="abc",
+        inline_ref_count=5,  # would never happen, but guard against it
+    )
+    decisions = _partition_attachments("Body.", [att])
+    assert decisions[0].upload is True
+
+
+def test_partition_tiny_non_image_is_not_skipped():
+    # Only image/* gets the tiny-size skip. A tiny PDF or vCard is rare but
+    # legitimate; don't skip those.
+    body = "Hei."
+    decisions = _partition_attachments(
+        body, [_att("contact.vcf", "text/vcard", 500)]
+    )
+    assert len(decisions) == 1
+    assert decisions[0].upload is True
+
+
 def test_partition_image_without_signature_marker_uploads():
     # No signature marker at all → can't apply the position rule.
     # The repetition check (run later, with bytes) decides; here we accept.
@@ -207,6 +289,79 @@ def test_attribute_oldest_mention_wins():
     _, by_synth = _attribute_attachments(parent, [anne, bob])
     anne_synth = synthetic_message_id(parent.message_id, anne.from_field, anne.body)
     assert list(by_synth.keys()) == [anne_synth]
+
+
+def test_attribute_empty_forwarder_body_falls_back_to_oldest_non_forwarder():
+    # Outlook-style forward: outer body is empty (no commentary), no filename
+    # markers survived in any extracted block. The fallback should put the
+    # attachment on the oldest non-forwarder extracted message instead of
+    # leaving it on the empty forwarder row.
+    parent = _msg(
+        from_field="Petter <petter@example.com>",
+        body="",
+        attachments=[_att("image002.png", "image/png", 443_000)],
+    )
+    ingeborg_old = _extracted(
+        from_field="Ingeborg <ingeborg@example.com>",
+        body="Tilbud-tråd, ingen filnavn nevnt her.",
+        day=10,
+    )
+    ingeborg_new = _extracted(
+        from_field="Ingeborg <ingeborg@example.com>",
+        body="Senere svar.",
+        day=20,
+    )
+    forwarder, by_synth = _attribute_attachments(parent, [ingeborg_old, ingeborg_new])
+    oldest_synth = synthetic_message_id(
+        parent.message_id, ingeborg_old.from_field, ingeborg_old.body
+    )
+    assert forwarder == []
+    assert list(by_synth.keys()) == [oldest_synth]
+    assert [d.attachment.filename for d in by_synth[oldest_synth]] == ["image002.png"]
+
+
+def test_attribute_empty_forwarder_body_with_only_self_blocks_stays_on_forwarder():
+    # Forwarder's own prior reply got extracted (e.g. they wrote, then
+    # forwarded the chain). With no non-forwarder block to claim the file,
+    # the fallback doesn't fire — file stays on the forwarder row.
+    parent = _msg(
+        from_field="Petter <petter@example.com>",
+        body="",
+        attachments=[_att("mystery.pdf")],
+    )
+    self_block = _extracted(
+        from_field="Petter <petter@example.com>",
+        body="Mitt tidligere svar.",
+        day=10,
+    )
+    forwarder, by_synth = _attribute_attachments(parent, [self_block])
+    assert by_synth == {}
+    assert [d.attachment.filename for d in forwarder] == ["mystery.pdf"]
+
+
+def test_attribute_real_marker_match_wins_over_fallback():
+    # Even when forwarder body is empty, a real `[image: NAME]` match on a
+    # non-oldest block beats the fallback (which picks the oldest non-forwarder).
+    parent = _msg(
+        from_field="Petter <petter@example.com>",
+        body="",
+        attachments=[_att("image002.png", "image/png", 443_000)],
+    )
+    older = _extracted(
+        from_field="Ingeborg <ingeborg@example.com>",
+        body="Eldre svar uten filnavn.",
+        day=10,
+    )
+    newer = ExtractedMessage(
+        from_field="Ingeborg <ingeborg@example.com>",
+        date=datetime(2026, 4, 20, tzinfo=UTC),
+        subject="Tilbud",
+        body="Cleaned body uten filnavn.",
+        raw_body="Her er [image: image002.png] som referert.",
+    )
+    _, by_synth = _attribute_attachments(parent, [older, newer])
+    newer_synth = synthetic_message_id(parent.message_id, newer.from_field, newer.body)
+    assert list(by_synth.keys()) == [newer_synth]
 
 
 def test_attribute_signature_region_stays_on_forwarder():

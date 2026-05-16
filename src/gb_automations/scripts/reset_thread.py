@@ -17,11 +17,14 @@ Usage (inside the container):
     docker compose exec api python -m gb_automations.scripts.reset_thread \\
         --thread 19e166c93fdbc5c6
 
-The default also clears the `attachment_fingerprints` table so the next sync
-gets fresh signature-detection state — every image gets re-evaluated. Pass
-`--keep-fingerprints` to preserve learned signatures across the reset (rare;
-useful if you specifically want to test that previously-learned signatures
-stay classified).
+The default also clears `attachment_fingerprints` (signature-detection state)
+and `emails_db_cache` (the year-partitioned Emails DB router's persistent
+lookup) so the next sync starts from a clean slate. Pass `--keep-fingerprints`
+or `--keep-db-cache` to preserve either across the reset.
+
+Restart the api container after a full reset that includes the DB cache —
+the year-DB router also holds an in-process dict cache that survives the
+Postgres wipe until the process restarts.
 
 What this does NOT do:
   - Touch Notion. Delete or archive the Notion rows yourself before running.
@@ -42,14 +45,18 @@ import logging
 from sqlalchemy import delete
 
 from gb_automations.db import SessionLocal
-from gb_automations.models import AttachmentFingerprint, EmailRow
+from gb_automations.models import AttachmentFingerprint, EmailRow, EmailsDbCache
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
 logger = logging.getLogger("reset_thread")
 
 
-async def _reset(thread_id: str | None, keep_fingerprints: bool) -> tuple[int, int]:
-    """Delete cached rows. Returns (email_rows_deleted, fingerprints_deleted)."""
+async def _reset(
+    thread_id: str | None,
+    keep_fingerprints: bool,
+    keep_db_cache: bool,
+) -> tuple[int, int, int]:
+    """Delete cached rows. Returns (email_rows, fingerprints, db_cache_rows)."""
     async with SessionLocal() as session:
         if thread_id:
             email_stmt = delete(EmailRow).where(EmailRow.gmail_thread_id == thread_id)
@@ -59,16 +66,21 @@ async def _reset(thread_id: str | None, keep_fingerprints: bool) -> tuple[int, i
         email_count = email_result.rowcount or 0
 
         fp_count = 0
-        # Only the no-thread (full reset) path clears fingerprints by default.
-        # Per-thread resets always keep them because signatures are sender-
-        # scoped, not thread-scoped — clearing them on a single-thread reset
-        # would affect unrelated other threads from the same senders.
-        if thread_id is None and not keep_fingerprints:
-            fp_result = await session.execute(delete(AttachmentFingerprint))
-            fp_count = fp_result.rowcount or 0
+        db_cache_count = 0
+        # Per-thread resets always keep the fingerprint + DB-router caches.
+        # Signatures are sender-scoped (not thread-scoped) and the year-DB
+        # router state is workspace-wide — clearing either on a single-thread
+        # reset would affect unrelated threads.
+        if thread_id is None:
+            if not keep_fingerprints:
+                fp_result = await session.execute(delete(AttachmentFingerprint))
+                fp_count = fp_result.rowcount or 0
+            if not keep_db_cache:
+                db_result = await session.execute(delete(EmailsDbCache))
+                db_cache_count = db_result.rowcount or 0
 
         await session.commit()
-        return email_count, fp_count
+        return email_count, fp_count, db_cache_count
 
 
 def _parse_args() -> argparse.Namespace:
@@ -95,12 +107,23 @@ def _parse_args() -> argparse.Namespace:
             "sync starts with fresh signature-detection state."
         ),
     )
+    parser.add_argument(
+        "--keep-db-cache",
+        action="store_true",
+        help=(
+            "On a full reset, preserve the emails_db_cache table (the "
+            "year-partitioned Emails DB router's persistent lookup). Default "
+            "is to wipe it so the next sync re-resolves year DBs from Notion."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    email_count, fp_count = asyncio.run(_reset(args.thread, args.keep_fingerprints))
+    email_count, fp_count, db_cache_count = asyncio.run(
+        _reset(args.thread, args.keep_fingerprints, args.keep_db_cache)
+    )
 
     if args.thread:
         if email_count:
@@ -118,7 +141,7 @@ def main() -> None:
         return
 
     # Full reset
-    if email_count == 0 and fp_count == 0:
+    if email_count == 0 and fp_count == 0 and db_cache_count == 0:
         logger.warning("Nothing to clear — cache is already empty.")
         return
     parts = [f"{email_count} email_row(s)"]
@@ -126,10 +149,21 @@ def main() -> None:
         parts.append(f"{fp_count} attachment_fingerprint(s)")
     elif args.keep_fingerprints:
         parts.append("(fingerprints kept)")
+    if db_cache_count:
+        parts.append(f"{db_cache_count} emails_db_cache row(s)")
+    elif args.keep_db_cache:
+        parts.append("(db cache kept)")
     logger.info(
         "Full reset complete: cleared %s. Reapply Gmail labels to re-sync.",
         ", ".join(parts),
     )
+    # The year-DB router holds an in-process dict cache that survives the
+    # Postgres wipe. Restart is required for the API process to forget it.
+    if db_cache_count:
+        logger.info(
+            "Restart the api container so the in-process DB-router cache "
+            "drops too: docker compose restart api"
+        )
 
 
 if __name__ == "__main__":

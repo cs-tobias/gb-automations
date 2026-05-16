@@ -61,6 +61,18 @@ logging.config.dictConfig(
 )
 
 
+def _validate_required_settings() -> None:
+    if settings.pubsub_topic and not settings.pubsub_audience:
+        raise RuntimeError(
+            "PUBSUB_AUDIENCE is required when PUBSUB_TOPIC is set. "
+            "Set it to the audience configured on the GCP push subscription, "
+            "typically https://hub.{your-domain}/webhooks/gmail."
+        )
+
+
+_validate_required_settings()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()

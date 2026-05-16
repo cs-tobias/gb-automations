@@ -29,6 +29,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
+from gb_automations.clients import notion_emails_db
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import ProjectLabel, SyncCursor, User
@@ -293,10 +294,14 @@ async def _notion_webhook_impl(request: Request) -> Response:
         # Classify the ignore reason so the log is informative. The most common
         # source of "ignored" events is our own writes echoing back from Notion:
         # creating email rows and contacts fires page.created webhooks too.
-        parent_id_clean = (parent.get("id") or "").replace("-", "")
-        if parent_id_clean == settings.emails_db_id.replace("-", ""):
+        # With year-partitioned Emails DBs we check membership in the local
+        # cache of known year DB IDs (populated by the year router as each
+        # year's DB gets resolved/created).
+        parent_id_clean = (parent.get("id") or "").replace("-", "").lower()
+        known_emails_dbs = await notion_emails_db.all_known_db_ids()
+        if parent_id_clean in known_emails_dbs:
             reason = "our own Emails-DB row write (feedback loop, fine)"
-        elif parent_id_clean == settings.contacts_db_id.replace("-", ""):
+        elif parent_id_clean == settings.contacts_db_id.replace("-", "").lower():
             reason = "our own Contacts-DB row write (feedback loop, fine)"
         elif event_type not in _PROJECT_EVENT_TYPES:
             reason = f"event type {event_type!r} is not a project create/rename"

@@ -125,3 +125,23 @@ class ProjectLabel(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class EmailsDbCache(Base):
+    """Year → Notion DB ID for the year-partitioned Emails databases.
+
+    The year router (`clients/notion_emails_db.py`) auto-creates `Emails YYYY`
+    databases on first sync of each year. This table caches the resolved IDs
+    so we don't search Notion on every webhook. On startup the router does a
+    one-time refresh from Notion to catch DBs created by other instances or
+    by hand. The webhook feedback-loop filter reads this table to recognize
+    "our own writes" across all year DBs without per-DB env config.
+    """
+
+    __tablename__ = "emails_db_cache"
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notion_db_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

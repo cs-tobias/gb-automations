@@ -31,6 +31,7 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app src/ ./src/
 COPY --chown=app:app migrations/ ./migrations/
+COPY --chown=app:app prompts/ ./prompts/
 COPY --chown=app:app alembic.ini ./
 
 USER app

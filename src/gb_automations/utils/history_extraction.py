@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 from gb_automations.utils.email_cleaning import (
     _FORWARD_HEADER_LINE,
+    _normalize,
     clean_body,
     find_reply_boundary_ranges,
 )
@@ -46,6 +47,8 @@ class ParsedHeader:
     email: str = ""
     date_text: str = ""    # raw date string, to be parsed by _parse_human_date
     subject: str = ""
+    to_text: str = ""      # raw `To:`/`Til:` header value (comma-separated)
+    cc_text: str = ""      # raw `Cc:`/`Kopi:` header value (comma-separated)
 
 
 # Inline reply-header patterns. `<email>` is OPTIONAL so the parser still works
@@ -76,11 +79,16 @@ _INLINE_REPLY_ON_WROTE = re.compile(
     re.IGNORECASE,
 )
 
-# Multi-line forward header: each line is `Field: value`.
+# Multi-line forward header: each line is `Field: value`. The `\*?` on each
+# side covers Gmail's HTML→plain rendering of Outlook's bolded headers
+# (`<b>Fra:</b>` → `*Fra:*`); the value may also have a trailing `*` when the
+# whole field was wrapped in bold.
 _FORWARD_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
-    "from": re.compile(r"^(?:Fra|From):\s*(?P<value>.+?)\s*$", re.IGNORECASE),
-    "date": re.compile(r"^(?:Date|Sendt|Sent|Dato):\s*(?P<value>.+?)\s*$", re.IGNORECASE),
-    "subject": re.compile(r"^(?:Subject|Emne):\s*(?P<value>.+?)\s*$", re.IGNORECASE),
+    "from": re.compile(r"^\*?(?:Fra|From):\*?\s*(?P<value>.+?)\*?\s*$", re.IGNORECASE),
+    "date": re.compile(r"^\*?(?:Date|Sendt|Sent|Dato):\*?\s*(?P<value>.+?)\*?\s*$", re.IGNORECASE),
+    "subject": re.compile(r"^\*?(?:Subject|Emne):\*?\s*(?P<value>.+?)\*?\s*$", re.IGNORECASE),
+    "to": re.compile(r"^\*?(?:Til|To):\*?\s*(?P<value>.+?)\*?\s*$", re.IGNORECASE),
+    "cc": re.compile(r"^\*?(?:Kopi|Cc):\*?\s*(?P<value>.+?)\*?\s*$", re.IGNORECASE),
 }
 
 # "Name <email@host>" — extract name + email from a forward-block From: value.
@@ -140,6 +148,10 @@ def parse_header(header_text: str) -> ParsedHeader:
                 parsed.date_text = value
             elif field == "subject":
                 parsed.subject = value
+            elif field == "to":
+                parsed.to_text = value
+            elif field == "cc":
+                parsed.cc_text = value
             break
     return parsed
 
@@ -412,7 +424,11 @@ def extract_history_blocks(
     # on one line — boundary detection and header parsing both depend on this.
     raw_body = _unwrap_bracketed_lines(raw_body)
 
-    normalized_lines = raw_body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # Use email_cleaning._normalize so line indices match what
+    # find_reply_boundary_ranges produced. Plain split("\n") here would skip
+    # multi-space-collapse splits the boundary detector saw, shifting indices
+    # downstream — slicing then over-reaches and chops off banner/body lines.
+    normalized_lines = _normalize(raw_body)
     boundaries = find_reply_boundary_ranges(raw_body)
     if not boundaries:
         return []
@@ -451,6 +467,8 @@ def extract_history_blocks(
                 subject=header.subject or _fwd_subject(parent_subject),
                 body=cleaned,
                 raw_body=raw_block_body,
+                to_field=header.to_text,
+                cc_field=header.cc_text,
             )
         )
 
