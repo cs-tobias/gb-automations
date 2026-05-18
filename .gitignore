@@ -32,6 +32,10 @@ htmlcov/
 .env.local
 .env.*.local
 
+# Installer state (written by `python -m gb_automations.scripts.setup_workspace`)
+.setup_state.json
+.setup_state.json.corrupt
+
 # Secrets (service account JSON, etc.) — never commit
 secrets/
 

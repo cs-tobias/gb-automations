@@ -59,4 +59,4 @@ docs/reference/       Prior architecture chat + the existing Apps Script
 4. **Stage 4** — Gmail Pub/Sub push for the email side. Domain-wide delegation for multi-inbox.
 5. **Stage 5+** — Frame, Toggl, Fiken, meeting transcripts, MCP server, RAG.
 
-See [docs/setup.md](docs/setup.md) for a complete fresh-deployment runbook (GCP + Workspace + Notion + Cloudflare + bring-up — ~1 hour), [docs/gotchas.md](docs/gotchas.md) for the pitfalls that runbook explicitly prevents, and [docs/reference/claude-chat.md](docs/reference/claude-chat.md) for the architecture conversation that led here.
+See [docs/setup.md](docs/setup.md) for the one-command interactive installer (`python -m gb_automations.scripts.setup_workspace` — ~15 min of clicks for a fresh workspace), [docs/setup-manual.md](docs/setup-manual.md) for the long-form click-by-click guide the installer automates, [docs/gotchas.md](docs/gotchas.md) for pitfalls both guides prevent, and [docs/reference/claude-chat.md](docs/reference/claude-chat.md) for the architecture conversation that led here.

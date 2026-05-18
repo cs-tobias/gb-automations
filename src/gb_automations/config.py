@@ -81,6 +81,34 @@ class Settings(BaseSettings):
     # "anyone with link can view" permission so Notion-rendered links work.
     attachments_folder_name: str = "Notion Email Attachments"
 
+    # Frame.io V4 (OAuth Web App via Adobe IMS).
+    # Goldbox is non-Enterprise, so Adobe's clean S2S credential isn't
+    # available — we use OAuth Web App with offline_access scope and store a
+    # long-lived refresh token. The whole team already shares one Frame.io
+    # account (petter@goldbox.no), so a single refresh token represents the
+    # studio. Bootstrap once via `python -m gb_automations.scripts.frame_oauth_bootstrap`.
+    frame_client_id: str = ""
+    frame_client_secret: str = ""
+    # Stored after the one-time OAuth bootstrap. Adobe IMS refresh tokens
+    # don't have an expiry under the offline_access scope, but they DO get
+    # invalidated if the user changes their Adobe password or the API
+    # credential is rotated — in which case re-run the bootstrap.
+    frame_refresh_token: str = ""
+    # The redirect URI registered in Adobe Developer Console for this app.
+    # MUST match exactly (Adobe rejects mismatches at /authorize and /token).
+    # Lives under the public hub domain because Adobe requires HTTPS even
+    # for localhost — the FastAPI route /oauth/frame/callback handles it.
+    frame_redirect_uri: str = ""
+    # Account + workspace the integration writes to. Resolved once during
+    # bootstrap (the script lists what the authenticated user can access and
+    # prompts for the right one) so the runtime client never has to guess.
+    frame_account_id: str = ""
+    frame_workspace_id: str = ""
+    # HMAC-SHA256 signing secret returned by Frame.io when the webhook is
+    # created via POST /v4/.../webhooks. Empty until the webhook is created;
+    # bootstrap script handles creation and stashes the secret here.
+    frame_webhook_secret: str = ""
+
 
 settings = Settings()
 

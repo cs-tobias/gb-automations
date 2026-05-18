@@ -1,0 +1,127 @@
+s.webhooks | [notion:4b8c] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:04:07 INFO    gb_automations.routes.webhooks | [notion:d139] 📓 Notion webhook received
+api-1  | 11:04:07 INFO    gb_automations.routes.webhooks | [notion:d139] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-810b-b235-dbbc126a958a parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:04:07 INFO    gb_automations.routes.webhooks | [notion:d139] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:04:12 INFO    gb_automations.routes.webhooks | [notion:c099] 📓 Notion webhook received
+api-1  | 11:04:12 INFO    gb_automations.routes.webhooks | [notion:c099] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-816f-8879-c8869d5bf011 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:04:12 INFO    gb_automations.routes.webhooks | [notion:c099] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:04:16 INFO    gb_automations.routes.webhooks | [notion:6618] 📓 Notion webhook received
+api-1  | 11:04:16 INFO    gb_automations.routes.webhooks | [notion:6618] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81a1-9823-e44781680e70 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:04:16 INFO    gb_automations.routes.webhooks | [notion:6618] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:04:23 INFO    gb_automations.routes.webhooks | [notion:1966] 📓 Notion webhook received
+api-1  | 11:04:23 INFO    gb_automations.routes.webhooks | [notion:1966] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81ae-8e1c-d63be3c83e15 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:04:23 INFO    gb_automations.routes.webhooks | [notion:1966] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:04:25 INFO    gb_automations.routes.webhooks | [notion:ffde] 📓 Notion webhook received
+api-1  | 11:04:25 INFO    gb_automations.routes.webhooks | [notion:ffde] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-815b-959c-cdc951d047de parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:04:25 INFO    gb_automations.routes.webhooks | [notion:ffde] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:13:06 INFO    gb_automations.routes.webhooks | [gmail:0d3f] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=189858
+api-1  | 11:13:07 INFO    gb_automations.routes.webhooks | [gmail:0d3f] ↳ found 1 changed thread(s) between historyId 189794 → 189858. Queuing background sync…
+api-1  | 11:13:07 INFO    gb_automations.sync.sync_thread | [gmail:0d3f] 🧵 sync_thread start: thread=19e166c93fdbc5c6 user=post@tobiaseek.com
+api-1  | 11:13:08 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]   • fetched 8 message(s) from Gmail
+api-1  | 11:13:08 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]   • matched project '003_GB_Project_3' (page=3611cc4e-c1c6-802e-b943-f1ff632ae312)
+api-1  | 11:13:08 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]   • extracted 18 prior email(s) from history (regex)
+api-1  | 11:13:09 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]   • upserted 7 contact(s)
+api-1  | 11:13:09 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]     ⊘ skipping msg 19e166c93fdbc5c6: no body content and no real attachments (signature-only forward; see extracted history)
+api-1  | 11:13:09 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]   → msg 19e166c93fdbc5c6: reconstructing 18 prior email(s)
+api-1  | 11:13:10 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]     📝 row (gmail message) 19e2b570c7291b99: from='Tobias Eek <post@tobiaseek.com>' subject='Re: OBOS-Versalen Inngangsparti og korridor' body=14 chars: 'ny mail, ahllo'
+api-1  | 11:13:10 INFO    gb_automations.clients.llm | [gmail:0d3f] LLM classify starting (input=14 chars)…
+api-1  | 11:13:20 INFO    gb_automations.clients.llm | [gmail:0d3f] LLM classify done in 10.5s (output=12 chars)
+api-1  | 11:13:25 INFO    gb_automations.clients.drive | [gmail:0d3f] drive ← uploaded 'test kl 0800 på sommeren.jpg' (1624.6 KB) → https://drive.google.com/file/d/1qx-3P2hJx4H0GZf_CwMNwPXU3dq_DqqE/view?usp=drivesdk
+api-1  | 11:13:25 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]     📎 uploaded 'test kl 0800 på sommeren.jpg' (1624.6 KB) from post@tobiaseek.com
+api-1  | 11:13:30 INFO    gb_automations.clients.drive | [gmail:0d3f] drive ← uploaded 'image.png' (3862.1 KB) → https://drive.google.com/file/d/1s0DLVg3r9wdfO2lxFrFxieKuwN7glkrX/view?usp=drivesdk
+api-1  | 11:13:30 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]     📎 uploaded 'image.png' (3862.1 KB) from post@tobiaseek.com
+api-1  | 11:13:39 INFO    gb_automations.clients.drive | [gmail:0d3f] drive ← uploaded '1 - skilt ved leiligheter.png' (250.5 KB) → https://drive.google.com/file/d/1WxXt5vaArG66lY-oOv7twUSFq3GwdSiI/view?usp=drivesdk
+api-1  | 11:13:39 INFO    gb_automations.sync.sync_thread | [gmail:0d3f]     📎 uploaded '1 - skilt ved leiligheter.png' (250.5 KB) from post@tobiaseek.com
+api-1  | 11:13:41 INFO    gb_automations.sync.sync_thread | [gmail:0d3f] 🧵 sync_thread done in 34.1s: +1 rows, 24 already present, 7 contact(s)
+api-1  | 11:13:41 INFO    gb_automations.routes.webhooks | [gmail:0d3f]   ✓ thread 19e166c93fdbc5c6 [003_GB_Project_3]: +1 rows, 24 already present
+api-1  | 11:14:20 INFO    gb_automations.routes.webhooks | [gmail:bb58] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=189940
+api-1  | 11:14:20 INFO    gb_automations.routes.webhooks | [gmail:bb58] ↳ no relevant changes since 189858 (nothing to sync)
+api-1  | 11:14:22 INFO    gb_automations.routes.webhooks | [notion:8307] 📓 Notion webhook received
+api-1  | 11:14:22 INFO    gb_automations.routes.webhooks | [notion:8307] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81d3-be05-e490b8480b97 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:14:22 INFO    gb_automations.routes.webhooks | [notion:8307] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:14:24 INFO    gb_automations.routes.webhooks | [notion:99f5] 📓 Notion webhook received
+api-1  | 11:14:24 INFO    gb_automations.routes.webhooks | [notion:99f5] 📓 Notion event: type=page.properties_updated entity=3611cc4e-c1c6-802e-b943-f1ff632ae312 parent_type=database parent_id=35d1cc4e-c1c6-8048-89fb-ea459550035b
+api-1  | 11:14:24 INFO    gb_automations.routes.webhooks | [notion:99f5] ↳ accepted; fetching page title from Notion…
+api-1  | 11:14:24 INFO    gb_automations.routes.webhooks | [notion:99f5] ↳ properties updated; checking if label rename is needed…
+api-1  | 11:14:24 INFO    gb_automations.routes.webhooks | [notion:99f5] ↳ no rename needed (title unchanged: '003_GB_Project_3')
+api-1  | 11:47:50 INFO    gb_automations.routes.webhooks | [gmail:b0bc] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190042
+api-1  | 11:47:51 INFO    gb_automations.routes.webhooks | [gmail:b0bc] ↳ found 1 changed thread(s) between historyId 189940 → 190042. Queuing background sync…
+api-1  | 11:47:51 INFO    gb_automations.sync.sync_thread | [gmail:b0bc] 🧵 sync_thread start: thread=19e2b76ceaf9facd user=post@tobiaseek.com
+api-1  | 11:47:52 INFO    gb_automations.routes.webhooks | [gmail:8a50] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190059
+api-1  | 11:47:52 INFO    gb_automations.sync.sync_thread | [gmail:b0bc]   • fetched 1 message(s) from Gmail
+api-1  | 11:47:52 INFO    gb_automations.routes.webhooks | [gmail:8a50] ↳ found 1 changed thread(s) between historyId 189940 → 190059. Queuing background sync…
+api-1  | 11:47:52 INFO    gb_automations.sync.sync_thread | [gmail:8a50] 🧵 sync_thread start: thread=19e2b76ceaf9facd user=post@tobiaseek.com
+api-1  | 11:47:53 INFO    gb_automations.sync.sync_thread | [gmail:8a50]   • fetched 1 message(s) from Gmail
+api-1  | 11:47:54 INFO    gb_automations.routes.webhooks | [gmail:b0bc]   ⊘ thread 19e2b76ceaf9facd skipped: no Notion project matches any thread label (thread labels: ['CATEGORY_PERSONAL', 'IMPORTANT', 'INBOX', 'UNREAD', 'cinesuit.com'])
+api-1  | 11:47:54 INFO    gb_automations.routes.webhooks | [gmail:fe6b] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190094
+api-1  | 11:47:54 INFO    gb_automations.routes.webhooks | [gmail:fe6b] ↳ no relevant changes since 190042 (nothing to sync)
+api-1  | 11:47:55 INFO    gb_automations.routes.webhooks | [gmail:8a50]   ⊘ thread 19e2b76ceaf9facd skipped: no Notion project matches any thread label (thread labels: ['CATEGORY_PERSONAL', 'IMPORTANT', 'INBOX', 'UNREAD', 'cinesuit.com'])
+api-1  | 11:48:00 INFO    gb_automations.routes.webhooks | [gmail:157a] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190125
+api-1  | 11:48:00 INFO    gb_automations.routes.webhooks | [gmail:157a] ↳ found 1 changed thread(s) between historyId 190059 → 190125. Queuing background sync…
+api-1  | 11:48:00 INFO    gb_automations.sync.sync_thread | [gmail:157a] 🧵 sync_thread start: thread=19e2b76ceaf9facd user=post@tobiaseek.com
+api-1  | 11:48:01 INFO    gb_automations.sync.sync_thread | [gmail:157a]   • fetched 1 message(s) from Gmail
+api-1  | 11:48:02 INFO    gb_automations.sync.sync_thread | [gmail:157a]   • matched project '002_GB_Project_2' (page=3601cc4e-c1c6-8070-b50a-f04113fc9686)
+api-1  | 11:48:02 INFO    gb_automations.sync.sync_thread | [gmail:157a]   • extracted 3 prior email(s) from history (regex)
+api-1  | 11:48:04 INFO    gb_automations.sync.sync_thread | [gmail:157a] Created contact Ingeborg Kvamme Skar (ingeborg.skar@olavthon.no)
+api-1  | 11:48:04 INFO    gb_automations.sync.sync_thread | [gmail:157a]   • upserted 3 contact(s)
+api-1  | 11:48:04 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📝 row (gmail message) 19e2b76ceaf9facd: from='Petter Burhol <petter@goldbox.no>' subject='Fwd: Re: Digital styling - tilbud Goldbox' body=0 chars: ''
+api-1  | 11:48:11 INFO    gb_automations.clients.drive | [gmail:157a] drive ← uploaded '~WRD0002.jpg' (0.8 KB) → https://drive.google.com/file/d/1YPGjAYzCwGUAHhJW5GqWOoIANPjERXaD/view?usp=drivesdk
+api-1  | 11:48:11 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📎 uploaded '~WRD0002.jpg' (0.8 KB) from petter@goldbox.no
+api-1  | 11:48:15 INFO    gb_automations.clients.drive | [gmail:157a] drive ← uploaded 'image001.png' (4.6 KB) → https://drive.google.com/file/d/1K0L5SSXcQHNFCqCAuP8ZF9o_ZF4GmVcS/view?usp=drivesdk
+api-1  | 11:48:15 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📎 uploaded 'image001.png' (4.6 KB) from petter@goldbox.no
+api-1  | 11:48:20 INFO    gb_automations.clients.drive | [gmail:157a] drive ← uploaded 'image002.png' (443.1 KB) → https://drive.google.com/file/d/1uDlzEtVZqL1kwdUdx2mfWWYmx8E8vPgx/view?usp=drivesdk
+api-1  | 11:48:20 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📎 uploaded 'image002.png' (443.1 KB) from petter@goldbox.no
+api-1  | 11:48:23 INFO    gb_automations.sync.sync_thread | [gmail:157a]   → msg 19e2b76ceaf9facd: reconstructing 3 prior email(s)
+api-1  | 11:48:23 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📝 row (history) 19e2b76ceaf9facd#fwd-542fd4dbe6: from='Ingeborg Kvamme Skar <ingeborg.skar@olavthon.no>' subject='Fwd: Re: Digital styling - tilbud Goldbox' body=516 chars: 'at dere sender ut fotograf som tar bilder av ferdigstilt leilighet, og deretter …'
+api-1  | 11:48:23 INFO    gb_automations.clients.llm | [gmail:157a] LLM classify starting (input=516 chars)…
+api-1  | 11:48:36 INFO    gb_automations.clients.llm | [gmail:157a] LLM classify done in 13.5s (output=32 chars)
+api-1  | 11:48:36 INFO    gb_automations.sync.sync_thread | [gmail:157a]     🏷  tagged: tilbud, spørsmål
+api-1  | 11:48:39 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📝 row (history) 19e2b76ceaf9facd#fwd-a3fa659299: from='Ingeborg Kvamme Skar <ingeborg.skar@olavthon.no>' subject='Fwd: Re: Digital styling - tilbud Goldbox' body=1390 chars: 'stor forskjell på prisen 😊 *Her er priser vi har fått fra Inviso på digital møbl…'
+api-1  | 11:48:39 INFO    gb_automations.clients.llm | [gmail:157a] LLM classify starting (input=1390 chars)…
+api-1  | 11:48:42 INFO    gb_automations.clients.llm | [gmail:157a] LLM classify done in 3.5s (output=32 chars)
+api-1  | 11:48:42 INFO    gb_automations.sync.sync_thread | [gmail:157a]     🏷  tagged: tilbud, spørsmål
+api-1  | 11:48:44 INFO    gb_automations.sync.sync_thread | [gmail:157a]     📝 row (history) 19e2b76ceaf9facd#fwd-4347e9b974: from='Ingeborg Kvamme Skar <ingeborg.skar@olavthon.no>' subject='SV: Re: Digital styling - tilbud Goldbox' body=1852 chars: 'Hei, Skjønner det, men så tror jeg uansett resultatet blir bedre hos dere, så vi…'
+api-1  | 11:48:44 INFO    gb_automations.clients.llm | [gmail:157a] LLM classify starting (input=1852 chars)…
+api-1  | 11:48:49 INFO    gb_automations.clients.llm | [gmail:157a] LLM classify done in 4.3s (output=32 chars)
+api-1  | 11:48:49 INFO    gb_automations.sync.sync_thread | [gmail:157a]     🏷  tagged: tilbud, underlag
+api-1  | 11:48:50 INFO    gb_automations.sync.sync_thread | [gmail:157a] 🧵 sync_thread done in 50.2s: +4 rows, 0 already present, 3 contact(s)
+api-1  | 11:48:50 INFO    gb_automations.routes.webhooks | [gmail:157a]   ✓ thread 19e2b76ceaf9facd [002_GB_Project_2]: +4 rows, 0 already present
+api-1  | 11:49:05 INFO    gb_automations.routes.webhooks | [notion:16f8] 📓 Notion webhook received
+api-1  | 11:49:05 INFO    gb_automations.routes.webhooks | [notion:16f8] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8127-ba6c-d3c9bb8cc225 parent_type=database parent_id=35d1cc4e-c1c6-80cf-8669-f1870f92cdae
+api-1  | 11:49:05 INFO    gb_automations.routes.webhooks | [notion:16f8] ↳ ignored: our own Contacts-DB row write (feedback loop, fine)
+api-1  | 11:49:06 INFO    gb_automations.routes.webhooks | [notion:7781] 📓 Notion webhook received
+api-1  | 11:49:06 INFO    gb_automations.routes.webhooks | [notion:7781] 📓 Notion event: type=page.properties_updated entity=3601cc4e-c1c6-8070-b50a-f04113fc9686 parent_type=database parent_id=35d1cc4e-c1c6-8048-89fb-ea459550035b
+api-1  | 11:49:06 INFO    gb_automations.routes.webhooks | [notion:7781] ↳ accepted; fetching page title from Notion…
+api-1  | 11:49:07 INFO    gb_automations.routes.webhooks | [notion:7781] ↳ properties updated; checking if label rename is needed…
+api-1  | 11:49:07 INFO    gb_automations.routes.webhooks | [notion:3f9b] 📓 Notion webhook received
+api-1  | 11:49:07 INFO    gb_automations.routes.webhooks | [notion:3f9b] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-813f-ab84-e8c41f41ec86 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:49:07 INFO    gb_automations.routes.webhooks | [notion:3f9b] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:49:07 INFO    gb_automations.routes.webhooks | [notion:7781] ↳ no rename needed (title unchanged: '002_GB_Project_2')
+api-1  | 11:49:29 INFO    gb_automations.routes.webhooks | [gmail:61dd] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190210
+api-1  | 11:49:29 INFO    gb_automations.routes.webhooks | [gmail:61dd] ↳ found 1 changed thread(s) between historyId 190125 → 190210. Queuing background sync…
+api-1  | 11:49:29 INFO    gb_automations.sync.sync_thread | [gmail:61dd] 🧵 sync_thread start: thread=19e2b7850061ace0 user=post@tobiaseek.com
+api-1  | 11:49:30 INFO    gb_automations.sync.sync_thread | [gmail:61dd]   • fetched 1 message(s) from Gmail
+api-1  | 11:49:30 INFO    gb_automations.routes.webhooks | [gmail:bdbd] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190223
+api-1  | 11:49:31 INFO    gb_automations.routes.webhooks | [gmail:bdbd] ↳ found 1 changed thread(s) between historyId 190125 → 190223. Queuing background sync…
+api-1  | 11:49:31 INFO    gb_automations.sync.sync_thread | [gmail:bdbd] 🧵 sync_thread start: thread=19e2b7850061ace0 user=post@tobiaseek.com
+api-1  | 11:49:31 INFO    gb_automations.routes.webhooks | [gmail:61dd]   ⊘ thread 19e2b7850061ace0 skipped: no Notion project matches any thread label (thread labels: ['CATEGORY_PERSONAL', 'IMPORTANT', 'INBOX', 'UNREAD', 'cinesuit.com'])
+api-1  | 11:49:31 INFO    gb_automations.sync.sync_thread | [gmail:bdbd]   • fetched 1 message(s) from Gmail
+api-1  | 11:49:32 INFO    gb_automations.routes.webhooks | [gmail:bdbd]   ⊘ thread 19e2b7850061ace0 skipped: no Notion project matches any thread label (thread labels: ['CATEGORY_PERSONAL', 'IMPORTANT', 'INBOX', 'UNREAD', 'cinesuit.com'])
+api-1  | 11:49:39 INFO    gb_automations.routes.webhooks | [notion:caef] 📓 Notion webhook received
+api-1  | 11:49:39 INFO    gb_automations.routes.webhooks | [notion:caef] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-81ea-b0ca-f8c5b7ed37d3 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:49:39 INFO    gb_automations.routes.webhooks | [notion:caef] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:49:44 INFO    gb_automations.routes.webhooks | [notion:ab46] 📓 Notion webhook received
+api-1  | 11:49:44 INFO    gb_automations.routes.webhooks | [notion:ab46] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8116-9b4f-f620c553ebca parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:49:44 INFO    gb_automations.routes.webhooks | [notion:ab46] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 11:49:50 INFO    gb_automations.routes.webhooks | [notion:fa55] 📓 Notion webhook received
+api-1  | 11:49:50 INFO    gb_automations.routes.webhooks | [notion:fa55] 📓 Notion event: type=page.created entity=3611cc4e-c1c6-8168-b43e-c4d7c1ce2736 parent_type=database parent_id=35d1cc4e-c1c6-80b7-ac1f-fb7d4fedbd9f
+api-1  | 11:49:50 INFO    gb_automations.routes.webhooks | [notion:fa55] ↳ ignored: our own Emails-DB row write (feedback loop, fine)
+api-1  | 12:17:52 INFO    gb_automations.routes.webhooks | [gmail:9837] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190322
+api-1  | 12:17:52 INFO    gb_automations.routes.webhooks | [gmail:9837] ↳ found 1 changed thread(s) between historyId 190223 → 190322. Queuing background sync…
+api-1  | 12:17:52 INFO    gb_automations.sync.sync_thread | [gmail:9837] 🧵 sync_thread start: thread=19e2b9250ffa43ef user=post@tobiaseek.com
+api-1  | 12:17:53 INFO    gb_automations.sync.sync_thread | [gmail:9837]   • fetched 1 message(s) from Gmail
+api-1  | 12:17:54 INFO    gb_automations.routes.webhooks | [gmail:9837]   ⊘ thread 19e2b9250ffa43ef skipped: no Notion project matches any thread label (thread labels: ['CATEGORY_UPDATES', 'INBOX', 'UNREAD', 'cinesuit.com'])
+api-1  | 12:19:43 INFO    gb_automations.routes.webhooks | [gmail:b6ee] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190329
+api-1  | 12:19:43 INFO    gb_automations.routes.webhooks | [gmail:b6ee] ↳ no relevant changes since 190322 (nothing to sync)
+api-1  | 12:21:38 INFO    gb_automations.routes.webhooks | [gmail:de51] 📬 Gmail push received: email=post@tobiaseek.com new_historyId=190360
+api-1  | 12:21:39 INFO    gb_automations.routes.webhooks | [gmail:de51] ↳ no relevant changes since 190329 (nothing to sync)

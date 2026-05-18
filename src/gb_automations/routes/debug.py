@@ -7,6 +7,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
+from gb_automations.clients import frame as frame_client
+from gb_automations.clients import frame_auth
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import llm as llm_client
 from gb_automations.clients import notion as notion_client
@@ -189,3 +191,34 @@ async def debug_projects() -> dict[str, Any]:
     except Exception as err:
         raise HTTPException(502, f"Notion call failed: {err}") from err
     return {"count": len(projects), "projects": projects}
+
+
+@router.get("/frame")
+async def debug_frame() -> dict[str, Any]:
+    """Frame.io connection smoke test.
+
+    Calls `GET /v4/me` to prove the full auth chain works end-to-end:
+    refresh token valid, IMS exchange succeeds, x-api-key recognized, V4
+    gateway responds. Returns the authenticated user's basic profile so
+    you can confirm it's the right account (petter@goldbox.no for Goldbox).
+
+    Fails with a 502 + the actual error message if anything is wrong —
+    typical failures are FRAME_REFRESH_TOKEN missing (run the bootstrap),
+    or refresh token revoked (re-run the bootstrap).
+    """
+    try:
+        me = await frame_client.whoami()
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    # Normalize whether the V4 response wraps in {data: …} or returns the
+    # object at the top level — the docs aren't 100% consistent and we'd
+    # rather not depend on the wrapping shape until we've seen real responses.
+    profile = me.get("data") if isinstance(me, dict) and "data" in me else me
+    return {
+        "ok": True,
+        "email": profile.get("email"),
+        "name": profile.get("name"),
+        "id": profile.get("id"),
+    }

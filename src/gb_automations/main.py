@@ -10,6 +10,7 @@ from gb_automations.config import settings
 from gb_automations.db import engine
 from gb_automations.jobs.scheduler import shutdown_scheduler, start_scheduler
 from gb_automations.routes import debug as debug_routes
+from gb_automations.routes import oauth as oauth_routes
 from gb_automations.routes import webhooks as webhook_routes
 
 # Log level is env-driven so ops can flip to DEBUG (shows outbound Notion/Gmail
@@ -84,6 +85,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="gb-automations", version="0.1.0", lifespan=lifespan)
 app.include_router(debug_routes.router)
+app.include_router(oauth_routes.router)
 app.include_router(webhook_routes.router)
 
 

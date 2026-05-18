@@ -49,7 +49,7 @@ After Frame: Toggl (daily aggregated hours → Notion), Fiken (accounting), meet
              cursors)
 ```
 
-Everything runs in Docker Compose. Public traffic enters via Cloudflare Tunnel at `https://hub.<domain>/…`. The full deployment runbook is [docs/setup.md](docs/setup.md); painful lessons captured in [docs/gotchas.md](docs/gotchas.md) — **always check gotchas.md before debugging an integration issue**, most have an entry.
+Everything runs in Docker Compose. Public traffic enters via Cloudflare Tunnel at `https://hub.<domain>/…`. Fresh deployments use the one-command installer described in [docs/setup.md](docs/setup.md) (`python -m gb_automations.scripts.setup_workspace`); the long-form click-by-click guide it automates is [docs/setup-manual.md](docs/setup-manual.md). Painful lessons captured in [docs/gotchas.md](docs/gotchas.md) — **always check gotchas.md before debugging an integration issue**, most have an entry.
 
 ## Repo layout
 
@@ -85,7 +85,8 @@ prompts/
   default.md          generic tagging prompt
   goldbox.md          Goldbox-specific tagging prompt (set TAGGING_PROMPT_PATH)
 docs/
-  setup.md            fresh-deployment runbook (GCP + Workspace + Notion + Cloudflare)
+  setup.md            one-command installer (python -m ...scripts.setup_workspace)
+  setup-manual.md     long-form click-by-click that the installer automates (fallback)
   gotchas.md          11+ entries of "this cost me hours, here's the fix"
   reference/          client brief, original Apps Script, prior Claude design chats, real logs
 migrations/           Alembic (sync engine for migrations; app uses async)
@@ -137,5 +138,5 @@ curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20ti
 | "What tags can the LLM apply?" | `EMAIL_TAGS` in [config.py](src/gb_automations/config.py); prompt body in [prompts/](prompts/) |
 | "How are signatures detected so they don't bloat Drive?" | `AttachmentFingerprint` model + the `(sender, content-sha1) seen_count ≥ 2` rule |
 | "Why isn't my new integration working?" | [docs/gotchas.md](docs/gotchas.md) first, then the relevant client wrapper in `clients/` |
-| "What's the full deployment story for a fresh workspace?" | [docs/setup.md](docs/setup.md) — top to bottom, ~1 hour |
+| "What's the full deployment story for a fresh workspace?" | [docs/setup.md](docs/setup.md) (installer, ~15 min) or [docs/setup-manual.md](docs/setup-manual.md) (long-form, ~1 hour) |
 | "What does the client actually want long-term?" | [docs/reference/client-brief.md](docs/reference/client-brief.md) |
