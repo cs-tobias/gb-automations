@@ -42,13 +42,16 @@ async def backfill() -> None:
             return
 
         upserted = 0
-        missing: list[tuple[str, str]] = []  # (project_name, user_email)
+        missing: list[tuple[str, str]] = []  # (label_name, user_email)
 
-        for project_name, page_id in projects.items():
+        # Keys of `projects` are the full nested Gmail label paths
+        # ("Projects/<year>/<title>"); values carry the Notion page ID + title.
+        for label_name, meta in projects.items():
+            page_id = meta["id"]
             for user in users:
-                label = gmail_client.find_label_by_name(user.email, project_name)
+                label = gmail_client.find_label_by_name(user.email, label_name)
                 if not label:
-                    missing.append((project_name, user.email))
+                    missing.append((label_name, user.email))
                     continue
                 stmt = (
                     insert(ProjectLabel)
@@ -56,19 +59,19 @@ async def backfill() -> None:
                         notion_page_id=page_id,
                         user_email=user.email,
                         gmail_label_id=label["id"],
-                        current_name=project_name,
+                        current_name=label_name,
                     )
                     .on_conflict_do_update(
                         index_elements=["notion_page_id", "user_email"],
                         set_={
                             "gmail_label_id": label["id"],
-                            "current_name": project_name,
+                            "current_name": label_name,
                         },
                     )
                 )
                 await session.execute(stmt)
                 upserted += 1
-                logger.info("  %s × %s → %s", project_name, user.email, label["id"])
+                logger.info("  %s × %s → %s", label_name, user.email, label["id"])
 
         await session.commit()
 
@@ -80,8 +83,8 @@ async def backfill() -> None:
         len(users),
         len(projects) * len(users),
     )
-    for project_name, email in missing:
-        logger.warning("  missing label %r in mailbox %s", project_name, email)
+    for label_name, email in missing:
+        logger.warning("  missing label %r in mailbox %s", label_name, email)
 
 
 def main() -> None:

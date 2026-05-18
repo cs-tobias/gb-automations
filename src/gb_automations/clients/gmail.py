@@ -17,6 +17,7 @@ from typing import Any
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import Resource, build
+from googleapiclient.errors import HttpError
 
 from gb_automations.config import settings
 
@@ -148,13 +149,8 @@ def find_label_by_name(user_email: str, name: str) -> dict[str, str] | None:
     return None
 
 
-def create_label(user_email: str, name: str) -> dict[str, Any]:
-    """Create a user label. Idempotent: returns the existing label if one with this name exists."""
-    logger.debug("gmail → labels.create(user=%s, name=%r)", user_email, name)
-    existing = find_label_by_name(user_email, name)
-    if existing:
-        return existing
-    service = gmail_for(user_email)
+def _create_single_label(service: Any, name: str) -> dict[str, Any]:
+    """One labels.create call — does NOT pre-create parents. Internal."""
     return (
         service.users()
         .labels()
@@ -170,15 +166,74 @@ def create_label(user_email: str, name: str) -> dict[str, Any]:
     )
 
 
+def create_label(user_email: str, name: str) -> dict[str, Any]:
+    """Create a user label, pre-creating every parent in a nested path.
+
+    Idempotent: if the full label already exists, returns it without API calls.
+
+    Gmail uses `/` as the hierarchy separator in label names, BUT
+    `users.labels.create` does NOT auto-create parent labels — if you POST
+    "Projects/2026/Acme" without "Projects" and "Projects/2026" existing
+    first, Gmail creates a single flat label whose literal name contains the
+    `/` characters. We walk the path top-down and create each missing prefix.
+    See docs/gotchas.md.
+    """
+    logger.debug("gmail → labels.create(user=%s, name=%r)", user_email, name)
+
+    # Snapshot the user's labels once; reuse for every prefix lookup so a
+    # 3-level path doesn't fan out into 3 separate labels.list calls.
+    existing_by_name = {label["name"]: label for label in list_labels(user_email)}
+    if name in existing_by_name:
+        return existing_by_name[name]
+
+    service = gmail_for(user_email)
+    parts = name.split("/")
+    last_label: dict[str, Any] | None = None
+    for i in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:i])
+        if prefix in existing_by_name:
+            last_label = existing_by_name[prefix]
+            continue
+        try:
+            last_label = _create_single_label(service, prefix)
+        except HttpError as err:
+            # 409 = a concurrent webhook just created this prefix. Re-fetch
+            # the labels and continue — treat as success, not a failure.
+            if err.resp.status == 409:
+                logger.info(
+                    "label %r already existed at create time (409); fetching", prefix
+                )
+                refreshed = find_label_by_name(user_email, prefix)
+                if refreshed is None:
+                    raise
+                last_label = refreshed
+            else:
+                raise
+        existing_by_name[prefix] = last_label  # type: ignore[assignment]
+
+    assert last_label is not None  # parts is non-empty so the loop runs at least once
+    return last_label
+
+
 def update_label_name(user_email: str, label_id: str, new_name: str) -> dict[str, Any]:
     """Rename a Gmail label (by ID) in this user's mailbox. Returns the updated resource.
 
     Used when a Notion project is renamed — we patch the label rather than
     create-new + delete-old so existing threads keep their label without churn.
+
+    If `new_name` is a nested path ("Projects/2026/Acme") and any parent
+    doesn't exist yet, pre-create it. Same gotcha as create_label: Gmail
+    would otherwise rename the label to a flat name with literal slashes.
     """
     logger.debug(
         "gmail → labels.patch(user=%s, id=%s, name=%r)", user_email, label_id, new_name
     )
+    if "/" in new_name:
+        # Ensure every parent prefix exists so Gmail renders the rename as
+        # a hierarchy move, not a flat name with literal slashes.
+        parent = new_name.rsplit("/", 1)[0]
+        create_label(user_email, parent)
+
     service = gmail_for(user_email)
     return (
         service.users()

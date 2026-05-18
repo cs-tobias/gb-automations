@@ -175,18 +175,30 @@ def extract_database_title(db: dict[str, Any]) -> str:
 # ============================================================
 
 
-async def get_project_pages() -> dict[str, str]:
-    """Project name → Notion page ID, for every top-level page the integration can see.
+async def get_project_pages() -> dict[str, dict[str, str]]:
+    """Full Gmail-label path → {id, title, created_time}, for every Notion project page.
+
+    The key is the *nested Gmail label name* (e.g. "Projects/2026/Acme") so it
+    matches the actual label names on synced Gmail threads — the
+    sync_thread → _pick_project intersection works directly without callers
+    having to rebuild paths on each lookup.
+
+    Value fields:
+      - id:           the Notion page ID
+      - title:        the raw page title (the leaf, e.g. "Acme") — used for logging
+      - created_time: ISO 8601 from Notion; the year segment of the key derives
+                      from this and is locked at project-creation time
 
     Excludes pages that are rows in the Contacts database OR in any year-
     partitioned Emails database. The Emails DB set is fetched from the local
     cache table populated by `notion_emails_db.get_emails_db_for_year`.
     """
     from gb_automations.clients import notion_emails_db
+    from gb_automations.utils.labels import project_label_path
 
     contacts_id = settings.contacts_db_id.replace("-", "")
     emails_db_ids = await notion_emails_db.all_known_db_ids()
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {}
 
     pages = await search_pages()
     for page in pages:
@@ -196,8 +208,15 @@ async def get_project_pages() -> dict[str, str]:
             if parent_db == contacts_id.lower() or parent_db in emails_db_ids:
                 continue
         title = extract_page_title(page)
-        if title:
-            out[title] = page["id"]
+        if not title:
+            continue
+        created_time = page.get("created_time", "")
+        label_path = project_label_path(title, created_time)
+        out[label_path] = {
+            "id": page["id"],
+            "title": title,
+            "created_time": created_time,
+        }
     return out
 
 

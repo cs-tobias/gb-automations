@@ -148,6 +148,16 @@ CONTACTS_PROPS = {
 }
 
 
+# Top-level Gmail label namespace for project labels. The full path we create
+# per project is "Projects/<year>/<project-name>" — Gmail uses `/` as the
+# hierarchy separator and auto-creates parent labels on demand.
+# Hardcoded (not env-configurable) on purpose: changing it after labels exist
+# would orphan every nested label in every mailbox (the ProjectLabel table
+# keys by Gmail label ID, so renames-by-ID still work, but the backfill script
+# looks up labels by full name and would no longer find them).
+PROJECTS_LABEL_PREFIX = "Projects"
+
+
 # Notion's multi-select API supports exactly these 10 colors. "default" is the
 # greyish unstyled chip we want to avoid — leaving it out makes every tag chip
 # carry a real color.

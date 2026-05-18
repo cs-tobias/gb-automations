@@ -315,19 +315,26 @@ def _collect_thread_label_names(
 
 
 def _pick_project(
-    thread_label_names: set[str], project_map: dict[str, str]
+    thread_label_names: set[str], project_map: dict[str, dict[str, str]]
 ) -> tuple[str | None, str | None]:
-    """Find the FIRST thread-label whose name matches a Notion project name.
+    """Find the FIRST thread-label whose name matches a Notion project's label path.
 
-    Returns (project_name, project_page_id) or (None, None) if no match.
+    `project_map` keys are full nested Gmail label paths (e.g.
+    "Projects/2026/Acme"), produced by `notion_client.get_project_pages()`.
+    Gmail thread labels carry the same nested name, so set intersection works
+    without rebuilding paths here.
+
+    Returns (project_title, project_page_id) — the *title* (leaf, e.g. "Acme")
+    so logs and SyncResult stay human-friendly, not the full label path.
     Deterministic by sorting candidates alphabetically so the same thread always
     matches the same project even if Gmail returns labels in different order.
     """
     candidates = sorted(thread_label_names & project_map.keys())
     if not candidates:
         return None, None
-    name = candidates[0]
-    return name, project_map[name]
+    label_path = candidates[0]
+    meta = project_map[label_path]
+    return meta["title"], meta["id"]
 
 
 # ============================================================

@@ -230,6 +230,20 @@ The `index=True` flag in the SQLAlchemy *model* (in `models.py`) is fine — tha
 
 ---
 
+## 12. Gmail's `labels.create` does NOT auto-create parents for nested labels
+
+**Symptom:** you POST a label named `Projects/2026/Acme` to `users.labels.create` expecting Gmail to render it as a nested label in the sidebar. Instead, Gmail creates a single flat label whose literal name is `Projects/2026/Acme` — the `/` characters show up as text, not as hierarchy separators.
+
+**Why:** Gmail uses `/` as the sidebar nesting separator at *render* time only. The `name` field on the Label resource is treated as an opaque string by the API. For Gmail to render `Projects/2026/Acme` as nested, each prefix (`Projects`, then `Projects/2026`) must already exist as its own label first. If any prefix is missing, Gmail just shows the slashes literally.
+
+**Fix:** before creating a leaf, walk the path top-down and pre-create each missing prefix. See [src/gb_automations/clients/gmail.py](../src/gb_automations/clients/gmail.py) `create_label` — it splits on `/`, snapshots the label list once, and calls `labels.create` for each prefix that isn't already present. Treat `409 Conflict` as success (concurrent webhook race).
+
+**Same trap on rename:** `labels.patch` has the identical behavior. If you rename a label to a new nested path whose parents don't exist, you get a flat label with literal slashes. `update_label_name` pre-creates the parent of the new name before patching.
+
+**Sources:** [labnol "Create Nested Labels in Gmail"](https://www.labnol.org/code/19895-create-nested-gmail-labels), [GAMADV-XTD3 wiki](https://github.com/taers232c/GAMADV-XTD3/wiki/Users-Gmail-Labels) (note the `buildpath` flag — it exists *because* the bare API doesn't do this).
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.

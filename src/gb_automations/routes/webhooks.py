@@ -36,6 +36,7 @@ from gb_automations.models import ProjectLabel, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync.sync_thread import sync_thread
 from gb_automations.sync.watches import cursor_source_for
+from gb_automations.utils.labels import project_label_path
 
 logger = logging.getLogger(__name__)
 
@@ -336,25 +337,30 @@ async def _notion_webhook_impl(request: Request) -> Response:
             media_type="application/json",
         )
 
+    # Year segment of the label path comes from Notion's immutable created_time,
+    # so renames only change the leaf — the year stays pinned to the project's
+    # creation year even if the title is edited across a year boundary.
+    label_name = project_label_path(title, page.get("created_time"))
+
     if event_type == "page.created":
-        logger.info("↳ creating Gmail label %r in all active mailboxes…", title)
-        result = await _create_label_for_all_users(page_id, title)
+        logger.info("↳ creating Gmail label %r in all active mailboxes…", label_name)
+        result = await _create_label_for_all_users(page_id, label_name)
         logger.info(
             "↳ done. label=%r succeeded=%d failed=%d",
-            title,
+            label_name,
             len(result["succeeded"]),
             len(result["failed"]),
         )
         return Response(
-            content=json.dumps({"label": title, **result}),
+            content=json.dumps({"label": label_name, **result}),
             media_type="application/json",
         )
 
     # page.properties_updated — title may or may not have changed.
     logger.info("↳ properties updated; checking if label rename is needed…")
-    rename_result = await _rename_label_for_all_users(page_id, title)
+    rename_result = await _rename_label_for_all_users(page_id, label_name)
     if rename_result.get("unchanged"):
-        logger.info("↳ no rename needed (title unchanged: %r)", title)
+        logger.info("↳ no rename needed (label unchanged: %r)", label_name)
     elif rename_result.get("no_mapping"):
         logger.warning(
             "↳ no project_labels mapping for page %s — run backfill_project_labels script",
@@ -363,12 +369,12 @@ async def _notion_webhook_impl(request: Request) -> Response:
     else:
         logger.info(
             "↳ done. new_label=%r renamed=%d failed=%d",
-            title,
+            label_name,
             len(rename_result["renamed"]),
             len(rename_result["failed"]),
         )
     return Response(
-        content=json.dumps({"label": title, **rename_result}),
+        content=json.dumps({"label": label_name, **rename_result}),
         media_type="application/json",
     )
 

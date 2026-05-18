@@ -185,7 +185,10 @@ async def debug_emails_schema() -> dict[str, Any]:
 
 @router.get("/projects")
 async def debug_projects() -> dict[str, Any]:
-    """Project name → page ID mapping. Used by Stage 4 (Notion → Gmail label flow)."""
+    """Gmail label path → {id, title, created_time} for every Notion project.
+
+    Keys are the nested label paths ("Projects/<year>/<title>") used in Gmail.
+    """
     try:
         projects = await notion_client.get_project_pages()
     except Exception as err:
