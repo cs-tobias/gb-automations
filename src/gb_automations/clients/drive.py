@@ -43,54 +43,81 @@ def drive_for(user_email: str) -> Resource:
     return build("drive", "v3", credentials=delegated, cache_discovery=False)
 
 
-@lru_cache(maxsize=32)
-def _ensure_attachments_folder(user_email: str, folder_name: str) -> str:
-    """Find or create the attachments folder under this user's Drive, return its ID.
+def _escape_drive_query(value: str) -> str:
+    # Drive v3 query strings are single-quoted; literal apostrophes (e.g. a
+    # project named "O'Brien") and backslashes must be backslash-escaped or
+    # the query is rejected with a 400.
+    return value.replace("\\", "\\\\").replace("'", "\\'")
 
-    Cached per (user, folder name) so repeated uploads inside a single sync
-    don't re-query Drive. Cache survives for the process lifetime; on
-    container restart the first upload re-queries (free).
+
+@lru_cache(maxsize=256)
+def _ensure_folder_path(user_email: str, path_segments: tuple[str, ...]) -> str:
+    """Find or create each segment top-down under user_email's My Drive, return leaf ID.
+
+    Walks `path_segments` left→right; at each level scopes the lookup by
+    `parent in parents` so two folders sharing a name in different subtrees
+    (e.g. "Projects/2026/Acme" vs "Projects/2025/Acme") don't collide.
+
+    Cached per (user, full path) so repeated uploads inside a sync only hit
+    Drive once per unique folder. Cache survives for the process lifetime; a
+    container restart re-queries on first use (free).
     """
+    if not path_segments:
+        raise ValueError("path_segments must be non-empty")
     service = drive_for(user_email)
-    # Search by name+type, my-Drive scope, non-trashed.
-    query = (
-        f"name = '{folder_name}' "
-        "and mimeType = 'application/vnd.google-apps.folder' "
-        "and trashed = false"
-    )
-    logger.debug("drive → files.list(name=%r) for %s", folder_name, user_email)
-    response = service.files().list(q=query, fields="files(id, name)", pageSize=5).execute()
-    files = response.get("files", [])
-    if files:
-        folder_id = files[0]["id"]
-        logger.debug("drive: existing attachments folder id=%s", folder_id)
-        return folder_id
-    # Create — first upload for this user.
-    logger.info("drive: creating attachments folder %r in %s's Drive", folder_name, user_email)
-    created = service.files().create(
-        body={
-            "name": folder_name,
+    parent_id = "root"
+    for depth, segment in enumerate(path_segments):
+        escaped = _escape_drive_query(segment)
+        query = (
+            f"name = '{escaped}' "
+            "and mimeType = 'application/vnd.google-apps.folder' "
+            f"and '{parent_id}' in parents "
+            "and trashed = false"
+        )
+        logger.debug(
+            "drive → files.list(name=%r, parent=%s) for %s",
+            segment, parent_id, user_email,
+        )
+        response = service.files().list(
+            q=query, fields="files(id, name)", pageSize=5
+        ).execute()
+        files = response.get("files", [])
+        if files:
+            parent_id = files[0]["id"]
+            continue
+        # Create the missing segment; subsequent depths attach below it.
+        logger.info(
+            "drive: creating folder %r under parent=%s in %s's Drive",
+            segment, parent_id, user_email,
+        )
+        body = {
+            "name": segment,
             "mimeType": "application/vnd.google-apps.folder",
-        },
-        fields="id",
-    ).execute()
-    return created["id"]
+            "parents": [parent_id],
+        }
+        created = service.files().create(body=body, fields="id").execute()
+        parent_id = created["id"]
+    return parent_id
 
 
 def upload_attachment(
     user_email: str,
-    folder_name: str,
+    folder_path: tuple[str, ...],
     filename: str,
     mime_type: str,
     content: bytes,
 ) -> str:
-    """Upload `content` to the named folder in `user_email`'s Drive.
+    """Upload `content` to the nested folder path in `user_email`'s Drive.
+
+    `folder_path` is a tuple of segment names from My Drive root to the leaf
+    (e.g. `("Notion Email Attachments", "Projects", "2026", "Acme")`). Missing
+    segments are created on first use.
 
     Returns a `https://drive.google.com/file/d/<id>/view` URL that anyone with
     the link can view. Notion renders this as a clickable file link.
     """
     service = drive_for(user_email)
-    folder_id = _ensure_attachments_folder(user_email, folder_name)
+    folder_id = _ensure_folder_path(user_email, folder_path)
 
     # The Drive API wants MediaIoBaseUpload for binary content. resumable=False
     # is fine here — these are typically small (KB-MB), one-shot is faster.

@@ -499,6 +499,21 @@ def clean_body(text: str, *, keep_image_markers: set[str] | None = None) -> str:
     return "\n".join(collapsed).strip()
 
 
+def body_before_quotes(text: str) -> str:
+    """Return the portion of `text` before the first reply/forward marker.
+
+    Used by signature-parsing fallbacks that need to scan the sender's own
+    content when no explicit sign-off ("Mvh", "Best regards", ...) is
+    present — running the structural heuristics on the whole body would
+    otherwise pick up signatures from quoted history.
+    """
+    if not text:
+        return ""
+    lines = _normalize(text)
+    cut_idx = _first_match_index(lines, _REPLY_MARKERS)
+    return "\n".join(lines[:cut_idx])
+
+
 def extract_signature_block(text: str) -> str:
     """Pull the signature region out of a sender's own message content.
 
@@ -509,11 +524,10 @@ def extract_signature_block(text: str) -> str:
     if not text:
         return ""
 
-    lines = _normalize(text)
-
-    # Trim away anything after a forward/reply marker so we only look at the sender's content.
-    cut_idx = _first_match_index(lines, _REPLY_MARKERS)
-    lines = lines[:cut_idx]
+    own_content = body_before_quotes(text)
+    if not own_content:
+        return ""
+    lines = own_content.split("\n")
 
     # Find the signature start within the sender's own content.
     for i, line in enumerate(lines):

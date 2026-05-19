@@ -214,6 +214,107 @@ async def classify(
 
 
 # ============================================================
+# classify_signature — title + phone extraction when regex fails
+# ============================================================
+
+
+_CLASSIFY_SIGNATURE_SYSTEM_PROMPT = (
+    "You extract a sender's signature fields from an email body. Most "
+    "senders are Norwegian (titles like 'Daglig leder', 'Digital rådgiver'), "
+    "but English titles ('CEO', 'Project Manager') appear too.\n\n"
+    "Return JSON with exactly two fields:\n"
+    "  - title: the sender's job title. May combine multiple roles ('Daglig "
+    "leder | Digital rådgiver'). Use null if no clear title is present.\n"
+    "  - phone: the sender's phone number as it appears in the signature "
+    "('90 60 94 41', '+47 906 09 441'). If multiple phones are listed, "
+    "return the first. Use null if no phone is present.\n\n"
+    "Rules:\n"
+    "  - Look at the sender's own signature only. Ignore quoted history, "
+    "reply headers, and other people's signatures.\n"
+    "  - Do not invent. If unsure, return null for that field.\n"
+    "  - Do not include the sender's name, email, company, or address in "
+    "the title field — title only.\n"
+    "  - Preserve the original wording. Do not translate."
+)
+
+
+async def classify_signature(
+    body: str, sender_name: str | None = None
+) -> tuple[str | None, str | None]:
+    """Extract (title, phone) from an email body using the LLM.
+
+    Best-effort: returns (None, None) on any failure (timeout, malformed
+    output, etc.) so callers can degrade gracefully. Designed as a second-pass
+    fallback after the structural regex parser has tried and failed.
+
+    `sender_name` is passed to the model as a hint so it can disambiguate
+    when the body contains multiple signatures (quoted history, forwards).
+    """
+    if not body or not body.strip():
+        return (None, None)
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": ["string", "null"]},
+            "phone": {"type": ["string", "null"]},
+        },
+        "required": ["title", "phone"],
+    }
+    sender_line = f"Sender name: {sender_name}\n\n" if sender_name else ""
+    messages = [
+        {"role": "system", "content": _CLASSIFY_SIGNATURE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"{sender_line}Email body:\n{body}",
+        },
+    ]
+
+    start = time.monotonic()
+    logger.info("LLM classify_signature starting (input=%d chars)…", len(body))
+    try:
+        content, _ = await _chat_streaming(
+            messages=messages,
+            format_schema=schema,
+            options={"temperature": 0.0},
+            timeout_s=settings.ollama_timeout_s,
+        )
+    except Exception as err:
+        logger.warning(
+            "LLM classify_signature failed after %.1fs: %s: %s",
+            time.monotonic() - start,
+            type(err).__name__,
+            err or "(no message)",
+        )
+        return (None, None)
+
+    content = content.strip()
+    if not content:
+        return (None, None)
+    logger.info(
+        "LLM classify_signature done in %.1fs (output=%d chars)",
+        time.monotonic() - start,
+        len(content),
+    )
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        logger.warning("LLM classify_signature returned non-JSON: %r", content[:300])
+        return (None, None)
+    if not isinstance(parsed, dict):
+        return (None, None)
+
+    def _clean(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    return (_clean(parsed.get("title")), _clean(parsed.get("phone")))
+
+
+# ============================================================
 # split_history — fallback splitter for under-split forwarded chains
 # ============================================================
 

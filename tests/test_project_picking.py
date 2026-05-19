@@ -23,12 +23,13 @@ def test_pick_projects_returns_all_matches_sorted():
     }
     labels = {"INBOX", "Projects/2026/Bravo", "Projects/2026/Alpha"}
 
-    titles, ids = _pick_projects(labels, project_map)
+    titles, ids, label_paths = _pick_projects(labels, project_map)
 
     # Sorted by full label path, so order is deterministic across re-syncs even
     # when Gmail returns labels in a different order.
     assert titles == ["Alpha", "Bravo"]
     assert ids == ["page-a", "page-b"]
+    assert label_paths == ["Projects/2026/Alpha", "Projects/2026/Bravo"]
 
 
 def test_pick_projects_returns_empty_when_no_label_matches():
@@ -37,10 +38,11 @@ def test_pick_projects_returns_empty_when_no_label_matches():
     }
     labels = {"INBOX", "SENT", "Projects/2025/Bravo"}  # different year, no match
 
-    titles, ids = _pick_projects(labels, project_map)
+    titles, ids, label_paths = _pick_projects(labels, project_map)
 
     assert titles == []
     assert ids == []
+    assert label_paths == []
 
 
 def test_pick_projects_single_match_returns_one_element_list():
@@ -50,10 +52,11 @@ def test_pick_projects_single_match_returns_one_element_list():
     }
     labels = {"Projects/2026/Alpha"}
 
-    titles, ids = _pick_projects(labels, project_map)
+    titles, ids, label_paths = _pick_projects(labels, project_map)
 
     assert titles == ["Alpha"]
     assert ids == ["page-a"]
+    assert label_paths == ["Projects/2026/Alpha"]
 
 
 def test_assemble_row_props_writes_multi_target_project_relation():

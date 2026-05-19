@@ -37,6 +37,7 @@ from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import AttachmentFingerprint, CompanyCache, ContactCache, EmailRow
 from gb_automations.utils.email_cleaning import (
+    body_before_quotes,
     clean_body,
     extract_signature_block,
     find_attachment_reference_line,
@@ -136,7 +137,9 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
     # projects" rather than "pick one." See _pick_projects docstring.
     project_map = await notion_client.get_project_pages()
     thread_label_names = _collect_thread_label_names(thread.messages, label_id_to_name)
-    project_names, project_page_ids = _pick_projects(thread_label_names, project_map)
+    project_names, project_page_ids, project_label_paths = _pick_projects(
+        thread_label_names, project_map
+    )
     result.project_name = ", ".join(project_names) or None
     result.project_page_id = project_page_ids[0] if project_page_ids else None
     if not project_page_ids:
@@ -187,6 +190,7 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
                         msg=msg,
                         extracted=splits.get(msg.message_id, []),
                         project_page_ids=project_page_ids,
+                        project_label_paths=project_label_paths,
                         user_email=user_email,
                         session=session,
                         contact_ids=contact_ids,
@@ -336,7 +340,7 @@ def _collect_thread_label_names(
 
 def _pick_projects(
     thread_label_names: set[str], project_map: dict[str, dict[str, str]]
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Find EVERY thread-label whose name matches a Notion project's label path.
 
     `project_map` keys are full nested Gmail label paths (e.g.
@@ -344,10 +348,12 @@ def _pick_projects(
     Gmail thread labels carry the same nested name, so set intersection works
     without rebuilding paths here.
 
-    Returns (titles, page_ids) — the *titles* (leaf names, e.g. "Acme") so logs
-    and SyncResult stay human-friendly, not the full label paths. Both lists
-    are aligned in sorted-by-label-path order, so the same thread always picks
-    projects in the same order regardless of how Gmail orders labels.
+    Returns (titles, page_ids, label_paths) — *titles* (leaf names, e.g.
+    "Acme") for human-friendly logs/SyncResult, *page_ids* for Notion
+    relations, and *label_paths* (full nested names) for downstream Drive
+    folder placement. All three lists are aligned in sorted-by-label-path
+    order, so the same thread always picks projects in the same order
+    regardless of how Gmail orders labels.
 
     Dual-labeled threads return multiple entries. The `Project` relation on
     each row is set to all of them — Notion relations are multi-target. This
@@ -357,7 +363,7 @@ def _pick_projects(
     matched = sorted(thread_label_names & project_map.keys())
     titles = [project_map[name]["title"] for name in matched]
     ids = [project_map[name]["id"] for name in matched]
-    return titles, ids
+    return titles, ids, matched
 
 
 # ============================================================
@@ -431,22 +437,51 @@ async def _upsert_thread_contacts(
         sender_email = find_sender_email(msg.from_field)
         if not sender_email or sender_email not in seen:
             continue
-        sig = extract_signature_block(msg.plain_body)
-        if not sig:
-            continue
-        # Phone parses off the raw signature block (existing behavior).
-        phone = extract_phone(sig)
-        if phone and not seen[sender_email]["phone"]:
-            seen[sender_email]["phone"] = phone
-        # Structured signature fields — only set if not already populated by
-        # an earlier message in the thread. First-write-wins.
-        fields = parse_signature(sig, sender_name=seen[sender_email]["name"])
-        if fields.title and not seen[sender_email]["title"]:
-            seen[sender_email]["title"] = fields.title
-        if fields.address and not seen[sender_email]["address"]:
-            seen[sender_email]["address"] = fields.address
-        if fields.company and not seen[sender_email]["signature_company"]:
-            seen[sender_email]["signature_company"] = fields.company
+        sender_record = seen[sender_email]
+        # Layer 1a: signature region detected by sign-off marker ("Mvh",
+        # "Best regards", ...). When present this is the cleanest input —
+        # parse_signature anchors on it tightly.
+        # Layer 1b: when no sign-off marker exists (Rino's case: name → title
+        # → phone with no "Mvh" line), fall back to the sender's own content
+        # before any quoted history. parse_signature is structure-aware and
+        # tolerates raw-body input — see its module docstring.
+        sig_source = extract_signature_block(msg.plain_body) or body_before_quotes(
+            msg.plain_body
+        )
+        if sig_source:
+            phone = extract_phone(sig_source)
+            if phone and not sender_record["phone"]:
+                sender_record["phone"] = phone
+            fields = parse_signature(sig_source, sender_name=sender_record["name"])
+            if fields.title and not sender_record["title"]:
+                sender_record["title"] = fields.title
+            if fields.address and not sender_record["address"]:
+                sender_record["address"] = fields.address
+            if fields.company and not sender_record["signature_company"]:
+                sender_record["signature_company"] = fields.company
+
+        # Layer 2: LLM fallback when both title and phone are still missing.
+        # Best-effort — failure leaves whatever layer 1 found in place. We
+        # only trigger this when there's something to gain, since Ollama
+        # round-trips add 3-30s of latency. address/company are not LLM-
+        # extracted (regex handles those well; the LLM call focuses on the
+        # two fields where false negatives have been observed in the wild).
+        if not sender_record["title"] and not sender_record["phone"]:
+            try:
+                llm_title, llm_phone = await llm_client.classify_signature(
+                    body_before_quotes(msg.plain_body) or msg.plain_body,
+                    sender_name=sender_record["name"],
+                )
+            except Exception:
+                logger.exception(
+                    "classify_signature failed for %s; leaving fields empty",
+                    sender_email,
+                )
+                llm_title, llm_phone = (None, None)
+            if llm_title and not sender_record["title"]:
+                sender_record["title"] = llm_title
+            if llm_phone and not sender_record["phone"]:
+                sender_record["phone"] = llm_phone
 
     # 3. Upsert Companies (one per unique domain) before contacts, since each
     # contact needs a company_page_id to populate the relation. Prefer the
@@ -678,6 +713,7 @@ async def _sync_message(
     msg: gmail_client.GmailMessage,
     extracted: list[ExtractedMessage],
     project_page_ids: list[str],
+    project_label_paths: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str],
@@ -710,6 +746,7 @@ async def _sync_message(
     created, skipped = await _sync_single_message(
         msg=msg,
         project_page_ids=project_page_ids,
+        project_label_paths=project_label_paths,
         user_email=user_email,
         session=session,
         contact_ids=contact_ids,
@@ -732,6 +769,7 @@ async def _sync_message(
             parent_msg=msg,
             extracted=extracted,
             project_page_ids=project_page_ids,
+            project_label_paths=project_label_paths,
             user_email=user_email,
             session=session,
             contact_ids=contact_ids,
@@ -748,6 +786,7 @@ async def _sync_single_message(
     *,
     msg: gmail_client.GmailMessage,
     project_page_ids: list[str],
+    project_label_paths: list[str] | None = None,
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str] | None = None,
@@ -864,6 +903,7 @@ async def _sync_single_message(
             user_email=user_email,
             session=session,
             thread_tracker=thread_tracker or ThreadAttachmentTracker(),
+            project_label_paths=project_label_paths or [],
         )
         if uploaded:
             try:
@@ -896,6 +936,7 @@ async def _sync_forwarded_chain(
     parent_msg: gmail_client.GmailMessage,
     extracted: list[ExtractedMessage],
     project_page_ids: list[str],
+    project_label_paths: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str],
@@ -923,6 +964,7 @@ async def _sync_forwarded_chain(
             inner=inner,
             synthetic_id=synth_id,
             project_page_ids=project_page_ids,
+            project_label_paths=project_label_paths,
             user_email=user_email,
             session=session,
             contact_ids=contact_ids,
@@ -941,6 +983,7 @@ async def _sync_extracted_message(
     inner: ExtractedMessage,
     synthetic_id: str,
     project_page_ids: list[str],
+    project_label_paths: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str],
@@ -1038,6 +1081,7 @@ async def _sync_extracted_message(
             user_email=user_email,
             session=session,
             thread_tracker=thread_tracker or ThreadAttachmentTracker(),
+            project_label_paths=project_label_paths or [],
         )
         if uploaded:
             try:
@@ -1639,22 +1683,36 @@ async def _is_repeating_signature_image(
     return result.scalar_one() >= 2
 
 
+# Same sender + same filename + sizes within this window → treated as a
+# duplicate of the earlier upload in the thread. Gmail re-wraps inline
+# signature images between messages (TIFF metadata, MIME transfer encoding
+# normalization), so a pixel-identical signature can shift by ~100 B
+# between messages. ±10 KB is comfortably above that noise floor while
+# still far below the size of a real re-sent document — a designer
+# sending revisjon-3.pdf with material changes will swing more than 10 KB.
+SIZE_TOLERANCE_BYTES = 10 * 1024
+
+
 @dataclass
 class ThreadAttachmentTracker:
-    """Per-thread memory of attachment bytes we've already uploaded.
+    """Per-thread memory of attachments already uploaded, scoped by sender + filename.
 
-    Gmail re-carries attachments on every reply in a thread (the MIME tree
-    rebuilds the quoted message). Without this, the same PDF would upload
-    once per reply that quoted it. We map each (filename, size) we've seen
-    to the sha1 of the bytes we uploaded; if a later message has the same
-    (filename, size) AND the same sha1, we know it's a re-carry and skip.
+    Two failure modes this prevents:
+    1. Gmail re-carries attachments on every reply (quoted MIME tree). Without
+       this, the same PDF uploads once per reply that quoted it.
+    2. A sender attaches the same signature image to multiple messages in the
+       thread, and Gmail re-wraps the bytes between messages so neither sha1
+       nor exact size match — but it's still the same image.
 
-    Filename+size is the cheap pre-filter: if those don't match, we don't
-    even need to hash to be sure it's a different attachment. We only hash
-    on a (filename, size) collision to confirm the bytes are identical.
+    Key: `(sender_lower, filename)`. Value: list of `(size, sha1)` recorded
+    for every successful upload of that key. A later attachment matches if
+    either (a) its sha1 equals a prior sha1 (exact re-carry from a quote) or
+    (b) its size is within ±SIZE_TOLERANCE_BYTES of a prior size (same image,
+    different MIME wrapping). Sender keying prevents false positives when two
+    thread participants legitimately share a filename like `screenshot.png`.
     """
 
-    seen: dict[tuple[str, int], str] = field(default_factory=dict)
+    seen: dict[tuple[str, str], list[tuple[int, str]]] = field(default_factory=dict)
 
 
 async def _upload_attachments(
@@ -1665,6 +1723,7 @@ async def _upload_attachments(
     user_email: str,
     session: AsyncSession,
     thread_tracker: ThreadAttachmentTracker,
+    project_label_paths: list[str],
 ) -> list[dict[str, str]]:
     """Download + upload each non-signature attachment, return uploaded {name, url} list.
 
@@ -1677,13 +1736,32 @@ async def _upload_attachments(
     `thread_tracker` carries forward attachment-bytes memory across all
     messages in the same thread so we don't re-upload bytes that a reply
     quoted from an earlier message.
+    `project_label_paths` is the list of Gmail-label paths matched for this
+    thread (e.g. `["Projects/2026/Acme", "Projects/2026/Beta"]`). Each
+    attachment uploads once per project into
+    `<attachments_folder_name>/<label-path-segments>/`. The row's `Files`
+    property is set to the union of returned URLs — Notion shows every link
+    on the row regardless of which project subfolder it lives in.
 
-    Failures are per-attachment — one Drive error doesn't stop the rest. The
-    row already exists in Notion before this is called, so even a total
-    upload failure leaves a valid (file-less) row behind.
+    Failures are per-attachment (per-project) — one Drive error doesn't stop
+    the rest. The row already exists in Notion before this is called, so
+    even a total upload failure leaves a valid (file-less) row behind.
     """
     uploaded: list[dict[str, str]] = []
     sender = (attributed_sender or "").lower() or user_email.lower()
+    # Pre-compute one folder path tuple per matched project. The root segment
+    # (`settings.attachments_folder_name`) keeps everything under a single
+    # top-level container in My Drive, with `Projects/<year>/<name>` nested
+    # below — matching the Gmail label hierarchy 1:1.
+    root = settings.attachments_folder_name
+    folder_paths: list[tuple[str, ...]] = [
+        (root, *label_path.split("/")) for label_path in project_label_paths
+    ]
+    if not folder_paths:
+        # Defensive: every sync_thread caller arrives here only after
+        # _pick_projects matched ≥1 project. If we ever wire in a no-project
+        # path, fall back to the flat root rather than uploading nothing.
+        folder_paths = [(root,)]
     for d in decisions:
         if not d.upload:
             logger.info(
@@ -1715,17 +1793,22 @@ async def _upload_attachments(
                 "    ⏏  skip attachment %r: empty content from Gmail", d.attachment.filename
             )
             continue
-        # Thread-level dedup: if this exact (filename, size) → sha1 already
-        # got uploaded earlier in the same thread, the current message is
-        # just a reply re-carrying the bytes. Attach to the original sender's
-        # row only.
+        # Thread-level dedup. Scoped by (sender, filename) — see
+        # ThreadAttachmentTracker docstring for the rationale on why size
+        # equality alone wasn't enough.
         content_sha1 = hashlib.sha1(content).hexdigest()
-        tracker_key = (d.attachment.filename, d.attachment.size)
-        previous_sha1 = thread_tracker.seen.get(tracker_key)
-        if previous_sha1 is not None and previous_sha1 == content_sha1:
+        tracker_key = (sender, d.attachment.filename)
+        prior_entries = thread_tracker.seen.get(tracker_key, [])
+        is_dup = any(
+            prior_sha1 == content_sha1
+            or abs(prior_size - d.attachment.size) <= SIZE_TOLERANCE_BYTES
+            for prior_size, prior_sha1 in prior_entries
+        )
+        if is_dup:
             logger.info(
-                "    ⏏  skip attachment %r: duplicate-in-thread (already uploaded)",
+                "    ⏏  skip attachment %r: same sender %s already attached this file in thread",
                 d.attachment.filename,
+                sender,
             )
             continue
         if await _is_repeating_signature_image(sender, d.attachment.filename, content, session):
@@ -1735,28 +1818,44 @@ async def _upload_attachments(
                 sender,
             )
             continue
-        try:
-            url = await asyncio.to_thread(
-                drive_client.upload_attachment,
-                user_email,
-                settings.attachments_folder_name,
+        # Upload once per matched project subfolder. Each project's folder
+        # becomes self-contained (good for archival/export), at the cost of N
+        # Drive files for an N-project email — the team chose this trade-off
+        # deliberately.
+        any_uploaded = False
+        for folder_path in folder_paths:
+            try:
+                url = await asyncio.to_thread(
+                    drive_client.upload_attachment,
+                    user_email,
+                    folder_path,
+                    d.attachment.filename,
+                    d.attachment.mime_type,
+                    content,
+                )
+            except Exception:
+                logger.exception(
+                    "    ✗ Drive upload failed for %r → %s",
+                    d.attachment.filename,
+                    "/".join(folder_path),
+                )
+                continue
+            uploaded.append({"name": d.attachment.filename, "url": url})
+            any_uploaded = True
+            logger.info(
+                "    📎 uploaded %r (%.1f KB) from %s → %s",
                 d.attachment.filename,
-                d.attachment.mime_type,
-                content,
+                len(content) / 1024,
+                sender,
+                "/".join(folder_path),
             )
-        except Exception:
-            logger.exception(
-                "    ✗ Drive upload failed for %r", d.attachment.filename
+        if any_uploaded:
+            # Only mark seen if at least one project copy made it through —
+            # otherwise a transient Drive failure would prevent a retry on
+            # the next thread sync.
+            thread_tracker.seen.setdefault(tracker_key, []).append(
+                (d.attachment.size, content_sha1)
             )
-            continue
-        thread_tracker.seen[tracker_key] = content_sha1
-        uploaded.append({"name": d.attachment.filename, "url": url})
-        logger.info(
-            "    📎 uploaded %r (%.1f KB) from %s",
-            d.attachment.filename,
-            len(content) / 1024,
-            sender,
-        )
     return uploaded
 
 
