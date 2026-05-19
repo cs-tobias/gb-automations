@@ -222,12 +222,19 @@ _CLASSIFY_SIGNATURE_SYSTEM_PROMPT = (
     "You extract a sender's signature fields from an email body. Most "
     "senders are Norwegian (titles like 'Daglig leder', 'Digital rådgiver'), "
     "but English titles ('CEO', 'Project Manager') appear too.\n\n"
-    "Return JSON with exactly two fields:\n"
+    "Return JSON with exactly three fields:\n"
     "  - title: the sender's job title. May combine multiple roles ('Daglig "
     "leder | Digital rådgiver'). Use null if no clear title is present.\n"
     "  - phone: the sender's phone number as it appears in the signature "
     "('90 60 94 41', '+47 906 09 441'). If multiple phones are listed, "
-    "return the first. Use null if no phone is present.\n\n"
+    "return the first. Use null if no phone is present.\n"
+    "  - signature_first_line: the verbatim text of the FIRST line of the "
+    "signature block (usually the sender's name line, e.g. 'Rino Larsen'). "
+    "Return the line EXACTLY as it appears in the body — preserve spaces, "
+    "punctuation, and capitalization. Downstream code matches this string "
+    "against body lines to locate the signature region, so even one extra "
+    "or missing character will cause the match to fail. Use null if there "
+    "is no recognizable signature block.\n\n"
     "Rules:\n"
     "  - Look at the sender's own signature only. Ignore quoted history, "
     "reply headers, and other people's signatures.\n"
@@ -240,26 +247,30 @@ _CLASSIFY_SIGNATURE_SYSTEM_PROMPT = (
 
 async def classify_signature(
     body: str, sender_name: str | None = None
-) -> tuple[str | None, str | None]:
-    """Extract (title, phone) from an email body using the LLM.
+) -> tuple[str | None, str | None, str | None]:
+    """Extract (title, phone, signature_first_line) from an email body via LLM.
 
-    Best-effort: returns (None, None) on any failure (timeout, malformed
-    output, etc.) so callers can degrade gracefully. Designed as a second-pass
-    fallback after the structural regex parser has tried and failed.
+    Best-effort: returns (None, None, None) on any failure (timeout, malformed
+    output, etc.) so callers can degrade gracefully.
+
+    `signature_first_line` is the verbatim first line of the signature region
+    (usually the sender's name line). Downstream callers use it to locate the
+    signature in the body for tasks like dropping signature-region attachments.
 
     `sender_name` is passed to the model as a hint so it can disambiguate
     when the body contains multiple signatures (quoted history, forwards).
     """
     if not body or not body.strip():
-        return (None, None)
+        return (None, None, None)
 
     schema = {
         "type": "object",
         "properties": {
             "title": {"type": ["string", "null"]},
             "phone": {"type": ["string", "null"]},
+            "signature_first_line": {"type": ["string", "null"]},
         },
-        "required": ["title", "phone"],
+        "required": ["title", "phone", "signature_first_line"],
     }
     sender_line = f"Sender name: {sender_name}\n\n" if sender_name else ""
     messages = [
@@ -286,11 +297,11 @@ async def classify_signature(
             type(err).__name__,
             err or "(no message)",
         )
-        return (None, None)
+        return (None, None, None)
 
     content = content.strip()
     if not content:
-        return (None, None)
+        return (None, None, None)
     logger.info(
         "LLM classify_signature done in %.1fs (output=%d chars)",
         time.monotonic() - start,
@@ -301,9 +312,9 @@ async def classify_signature(
         parsed = json.loads(content)
     except json.JSONDecodeError:
         logger.warning("LLM classify_signature returned non-JSON: %r", content[:300])
-        return (None, None)
+        return (None, None, None)
     if not isinstance(parsed, dict):
-        return (None, None)
+        return (None, None, None)
 
     def _clean(value: Any) -> str | None:
         if not isinstance(value, str):
@@ -311,7 +322,11 @@ async def classify_signature(
         stripped = value.strip()
         return stripped or None
 
-    return (_clean(parsed.get("title")), _clean(parsed.get("phone")))
+    return (
+        _clean(parsed.get("title")),
+        _clean(parsed.get("phone")),
+        _clean(parsed.get("signature_first_line")),
+    )
 
 
 # ============================================================
