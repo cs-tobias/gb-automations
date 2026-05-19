@@ -17,10 +17,13 @@ Usage (inside the container):
     docker compose exec api python -m gb_automations.scripts.reset_thread \\
         --thread 19e166c93fdbc5c6
 
-The default also clears `attachment_fingerprints` (signature-detection state)
-and `emails_db_cache` (the year-partitioned Emails DB router's persistent
-lookup) so the next sync starts from a clean slate. Pass `--keep-fingerprints`
-or `--keep-db-cache` to preserve either across the reset.
+The default also clears `attachment_fingerprints` (signature-detection state),
+`emails_db_cache` (the year-partitioned Emails DB router's persistent lookup),
+and `contact_cache` + `company_cache` (so contacts/companies get re-resolved
+against Notion on the next sync — required when you've manually deleted the
+Notion Contacts/Companies rows, otherwise stale Notion page IDs in the cache
+will cause Notion PATCH failures). Pass `--keep-fingerprints`, `--keep-db-cache`,
+or `--keep-contacts` to preserve any of them across the reset.
 
 Restart the api container after a full reset that includes the DB cache —
 the year-DB router also holds an in-process dict cache that survives the
@@ -45,7 +48,13 @@ import logging
 from sqlalchemy import delete
 
 from gb_automations.db import SessionLocal
-from gb_automations.models import AttachmentFingerprint, EmailRow, EmailsDbCache
+from gb_automations.models import (
+    AttachmentFingerprint,
+    CompanyCache,
+    ContactCache,
+    EmailRow,
+    EmailsDbCache,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
 logger = logging.getLogger("reset_thread")
@@ -55,8 +64,9 @@ async def _reset(
     thread_id: str | None,
     keep_fingerprints: bool,
     keep_db_cache: bool,
-) -> tuple[int, int, int]:
-    """Delete cached rows. Returns (email_rows, fingerprints, db_cache_rows)."""
+    keep_contacts: bool,
+) -> tuple[int, int, int, int, int]:
+    """Delete cached rows. Returns (email_rows, fingerprints, db_cache, contacts, companies)."""
     async with SessionLocal() as session:
         if thread_id:
             email_stmt = delete(EmailRow).where(EmailRow.gmail_thread_id == thread_id)
@@ -67,10 +77,13 @@ async def _reset(
 
         fp_count = 0
         db_cache_count = 0
-        # Per-thread resets always keep the fingerprint + DB-router caches.
-        # Signatures are sender-scoped (not thread-scoped) and the year-DB
-        # router state is workspace-wide — clearing either on a single-thread
-        # reset would affect unrelated threads.
+        contact_count = 0
+        company_count = 0
+        # Per-thread resets always keep the workspace-wide caches. Signatures
+        # are sender-scoped, the year-DB router state is workspace-wide, and
+        # the contact/company caches are keyed by email/domain (also workspace-
+        # wide) — clearing any of them on a single-thread reset would affect
+        # unrelated threads.
         if thread_id is None:
             if not keep_fingerprints:
                 fp_result = await session.execute(delete(AttachmentFingerprint))
@@ -78,9 +91,18 @@ async def _reset(
             if not keep_db_cache:
                 db_result = await session.execute(delete(EmailsDbCache))
                 db_cache_count = db_result.rowcount or 0
+            if not keep_contacts:
+                # Order matters: contact_cache rows reference company_cache
+                # rows indirectly (Notion-side relation). Local rows have no
+                # FK so we could delete in any order, but doing contacts
+                # first mirrors the upsert order in sync_thread.
+                contact_result = await session.execute(delete(ContactCache))
+                contact_count = contact_result.rowcount or 0
+                company_result = await session.execute(delete(CompanyCache))
+                company_count = company_result.rowcount or 0
 
         await session.commit()
-        return email_count, fp_count, db_cache_count
+        return email_count, fp_count, db_cache_count, contact_count, company_count
 
 
 def _parse_args() -> argparse.Namespace:
@@ -116,13 +138,29 @@ def _parse_args() -> argparse.Namespace:
             "is to wipe it so the next sync re-resolves year DBs from Notion."
         ),
     )
+    parser.add_argument(
+        "--keep-contacts",
+        action="store_true",
+        help=(
+            "On a full reset, preserve the contact_cache + company_cache "
+            "tables. Default is to wipe both so the next sync re-resolves "
+            "contacts/companies against Notion — required when you've "
+            "manually deleted the Notion Contacts/Companies rows, otherwise "
+            "stale notion_page_id values in the cache cause PATCH failures."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    email_count, fp_count, db_cache_count = asyncio.run(
-        _reset(args.thread, args.keep_fingerprints, args.keep_db_cache)
+    email_count, fp_count, db_cache_count, contact_count, company_count = asyncio.run(
+        _reset(
+            args.thread,
+            args.keep_fingerprints,
+            args.keep_db_cache,
+            args.keep_contacts,
+        )
     )
 
     if args.thread:
@@ -141,7 +179,13 @@ def main() -> None:
         return
 
     # Full reset
-    if email_count == 0 and fp_count == 0 and db_cache_count == 0:
+    if (
+        email_count == 0
+        and fp_count == 0
+        and db_cache_count == 0
+        and contact_count == 0
+        and company_count == 0
+    ):
         logger.warning("Nothing to clear — cache is already empty.")
         return
     parts = [f"{email_count} email_row(s)"]
@@ -153,6 +197,12 @@ def main() -> None:
         parts.append(f"{db_cache_count} emails_db_cache row(s)")
     elif args.keep_db_cache:
         parts.append("(db cache kept)")
+    if contact_count or company_count:
+        parts.append(
+            f"{contact_count} contact_cache + {company_count} company_cache row(s)"
+        )
+    elif args.keep_contacts:
+        parts.append("(contacts/companies kept)")
     logger.info(
         "Full reset complete: cleared %s. Reapply Gmail labels to re-sync.",
         ", ".join(parts),

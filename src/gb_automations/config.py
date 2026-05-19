@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # via the `Thread ID` text property that spans years.
     emails_parent_page_id: str = ""
     contacts_db_id: str = ""
+    # Companies graph. Goldbox manages it like Contacts — created manually in
+    # Notion, ID discovered by setup_workspace. One row per email domain; the
+    # display Name comes from the sender's signature when available, falling
+    # back to a capitalized domain stem.
+    companies_db_id: str = ""
     # Optional: if set, the Notion webhook only acts on pages parented to this database.
     # If empty, every page.created event the integration sees is treated as a project.
     projects_db_id: str = ""
@@ -144,7 +149,26 @@ CONTACTS_PROPS = {
     "name": "Name",
     "email": "Email",
     "phone": "Phone",
+    # Pulled from the sender's signature (title line below the name).
+    "title": "Title",
+    # Joined street + postal/city line from the signature.
+    "address": "Address",
+    # Single-relation to the Companies DB (replaces old free-text Company).
     "company": "Company",
+    # Multi-select managed manually by Goldbox — mirrors project status,
+    # which lives outside our automations. Code never writes this property.
+    "company_status": "Company Status",
+}
+
+
+# Companies DB. Dedup key is the email domain (rich_text) so that Goldbox can
+# freely rename the title — "Olavthon" → "Thon Eiendom" — without breaking the
+# upsert path. Contacts relate IN to Company via CONTACTS_PROPS["company"];
+# the inverse relation on this DB ("Contacts") is auto-maintained by Notion.
+COMPANIES_PROPS = {
+    "name": "Name",
+    "domain": "Domain",
+    "contacts": "Contacts",
 }
 
 

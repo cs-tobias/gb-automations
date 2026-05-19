@@ -69,7 +69,7 @@ The installer prompts for this string in step 9. Save it in your password manage
 ### Not required today
 
 - Adobe IMS / Frame.io credentials — the Frame.io integration is out of scope for today's installer; it'll be added next week.
-- Ollama installed on the host — Ollama runs as a container in the compose stack, no host install needed.
+- Ollama installed on the host — Ollama runs as a container by default. The api auto-pulls the model on first boot. Mac devs who want native Metal acceleration can opt out — see [Mac dev: native Ollama for Metal](#mac-dev-native-ollama-for-metal).
 
 ## What the installer does, in order
 
@@ -98,6 +98,43 @@ The installer prompts for this string in step 9. Save it in your password manage
 
 Total: typically ~15 minutes of clicks + ~5 minutes of background waiting (mostly Cloudflare zone activation and the LLM model pull).
 
+## Platform notes
+
+### Windows client: GPU passthrough
+
+Bring the stack up with the GPU override layered on:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+Requires Docker Desktop with the WSL2 backend and current NVIDIA drivers on the host. Verify the container sees the GPU:
+
+```bash
+docker compose exec ollama nvidia-smi
+```
+
+The api auto-pulls the LLM model on first boot — watch progress with `docker compose logs -f api`.
+
+### Mac dev: native Ollama for Metal
+
+In-container Ollama is CPU-only on Mac (Docker Desktop has no Metal passthrough). For dev, native Ollama with Metal is meaningfully faster:
+
+```bash
+brew install ollama
+OLLAMA_HOST=0.0.0.0:11434 ollama serve   # 0.0.0.0 so the api container can reach it via host.docker.internal
+```
+
+In `.env`, point the api at the native process and stop the unused in-container service so it doesn't waste disk + idle RAM:
+
+```bash
+# in .env
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+docker compose stop ollama
+docker compose up -d --force-recreate api
+```
+
 ## When something goes wrong
 
 1. **Read [docs/gotchas.md](gotchas.md) first.** Most failures have an entry.
@@ -122,7 +159,7 @@ Recovery commands (run on the host):
 | Need to backfill a missed thread | `docker compose exec api python -m gb_automations.sync.sync_one --email USER --thread THREAD_ID` |
 | Want to re-sync from scratch | Delete the relevant Notion rows yourself, then `docker compose exec api python -m gb_automations.scripts.reset_thread`. Reapply the Gmail label to trigger a fresh sync. |
 | Project rename in Notion didn't update Gmail label | `docker compose exec api python -m gb_automations.scripts.backfill_project_labels`, then rename again |
-| Email tagging stopped working | `docker compose restart ollama`; if still broken, re-pull: `docker compose exec api python -m gb_automations.scripts.pull_llm_model` |
+| Email tagging stopped working | `docker compose restart ollama && docker compose restart api` (api auto-pulls the model on boot if missing); if still broken, re-pull manually: `docker compose exec api python -m gb_automations.scripts.pull_llm_model` |
 | Container won't pick up new `.env` | `docker compose up -d --force-recreate api` (not `restart`) |
 | Service account key compromised | Rotate: generate new JSON in GCP → swap `secrets/gcp-service-account.json` → restart api |
 

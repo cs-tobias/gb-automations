@@ -312,7 +312,7 @@ def list_history(user_email: str, start_history_id: str, max_results: int = 100)
         .list(
             userId="me",
             startHistoryId=start_history_id,
-            historyTypes=["messageAdded", "labelAdded"],
+            historyTypes=["messageAdded", "labelAdded", "labelRemoved"],
             maxResults=max_results,
         )
         .execute()

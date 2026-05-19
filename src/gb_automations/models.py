@@ -76,6 +76,23 @@ class ContactCache(Base):
     )
 
 
+class CompanyCache(Base):
+    """email domain → Notion company page ID.
+
+    Same shape as ContactCache but keyed by domain. The display name in Notion
+    (e.g. "Thon Eiendom") can be edited freely by Goldbox without affecting
+    dedup, because we look up by domain.
+    """
+
+    __tablename__ = "company_cache"
+
+    domain: Mapped[str] = mapped_column(String(254), primary_key=True)
+    notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class AttachmentFingerprint(Base):
     """Tracks (sender, content-hash) repetition counts for signature detection.
 

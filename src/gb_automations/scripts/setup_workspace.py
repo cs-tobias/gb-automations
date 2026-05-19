@@ -600,11 +600,14 @@ def step_16_notion_dbs(s: dict[str, Any]) -> None:
 
     projects_id = notion.find_db_id_by_title(dbs, ["Project", "Projects"])
     contacts_id = notion.find_db_id_by_title(dbs, ["Contact", "Contacts"])
+    companies_id = notion.find_db_id_by_title(dbs, ["Company", "Companies"])
 
     if not projects_id:
         projects_id = prompts.ask("Could not auto-detect Projects DB; paste its ID")
     if not contacts_id:
         contacts_id = prompts.ask("Could not auto-detect Contacts DB; paste its ID")
+    if not companies_id:
+        companies_id = prompts.ask("Could not auto-detect Companies DB; paste its ID")
 
     parent_page_id = notion.find_page_id_by_title(token, ["Emails", "Emails parent", "Mail"])
     if not parent_page_id:
@@ -619,6 +622,7 @@ def step_16_notion_dbs(s: dict[str, Any]) -> None:
             "NOTION_TOKEN": token,
             "PROJECTS_DB_ID": projects_id,
             "CONTACTS_DB_ID": contacts_id,
+            "COMPANIES_DB_ID": companies_id,
             "EMAILS_PARENT_PAGE_ID": parent_page_id,
         },
     )
@@ -773,12 +777,16 @@ def step_18_seed(s: dict[str, Any]) -> None:
     _exec_in_api(["python", "-m", "gb_automations.scripts.start_watches"])
     _exec_in_api(["python", "-m", "gb_automations.scripts.backfill_project_labels"])
 
-    if prompts.confirm("Pull the ~5GB Ollama LLM model now? (slow, but only once)", default=True):
+    if prompts.confirm(
+        "Pre-pull the ~5GB Ollama LLM model now with visible progress? "
+        "(otherwise the api will pull it in the background on first boot)",
+        default=True,
+    ):
         _exec_in_api(["python", "-m", "gb_automations.scripts.pull_llm_model"])
     else:
-        prompts.warn(
-            "Skipped. Run later: "
-            "docker compose exec api python -m gb_automations.scripts.pull_llm_model"
+        prompts.info(
+            "Skipped. The api container will auto-pull on next start; "
+            "watch progress with `docker compose logs -f api`."
         )
 
 

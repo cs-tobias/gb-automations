@@ -98,6 +98,68 @@ def is_internal(email: str) -> bool:
     return False
 
 
+# Free-mail / consumer-mailbox providers. A `@gmail.com` address is a person,
+# not a representative of "Gmail the company" — and the same goes for every
+# other consumer provider. We use this to skip company-row creation for these
+# domains entirely; the contact still exists, just with no Company relation.
+#
+# Extend this list rather than guessing in code at the call site. Coverage
+# target: the long tail of Norwegian + international consumer providers Goldbox
+# is likely to receive briefs from. Add new entries here when you spot a real
+# "person, not company" row landing in the Companies DB.
+_FREE_MAIL_DOMAINS = frozenset({
+    # Google
+    "gmail.com",
+    "googlemail.com",
+    # Microsoft
+    "outlook.com",
+    "outlook.no",
+    "hotmail.com",
+    "hotmail.no",
+    "hotmail.co.uk",
+    "live.com",
+    "live.no",
+    "msn.com",
+    # Apple
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    # Yahoo / AOL
+    "yahoo.com",
+    "yahoo.no",
+    "yahoo.co.uk",
+    "ymail.com",
+    "aol.com",
+    # ProtonMail
+    "proton.me",
+    "protonmail.com",
+    "pm.me",
+    # GMX
+    "gmx.com",
+    "gmx.de",
+    "gmx.net",
+    # Norwegian ISPs / consumer
+    "online.no",
+    "broadpark.no",
+    "getmail.no",
+    "start.no",
+    "c2i.net",
+})
+
+
+def is_free_mail_domain(domain: str) -> bool:
+    """True for consumer/free-mail providers (gmail.com, outlook.com, …).
+
+    Used to suppress company-row creation: an `@gmail.com` address is a
+    person, not a representative of a "Gmail" company. The contact is still
+    created — only the Company relation is left empty.
+
+    Empty/invalid domains return False (caller already filters those out
+    before this check matters).
+    """
+    return domain.lower() in _FREE_MAIL_DOMAINS
+
+
 def company_from_domain(email: str) -> str:
     """Best-effort company name from the email domain.
 

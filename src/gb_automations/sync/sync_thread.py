@@ -35,7 +35,7 @@ from gb_automations.clients import notion as notion_client
 from gb_automations.clients import notion_emails_db
 from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import AttachmentFingerprint, ContactCache, EmailRow
+from gb_automations.models import AttachmentFingerprint, CompanyCache, ContactCache, EmailRow
 from gb_automations.utils.email_cleaning import (
     clean_body,
     extract_signature_block,
@@ -54,11 +54,13 @@ from gb_automations.utils.participants import (
     company_from_domain,
     extract_name,
     find_sender_email,
+    is_free_mail_domain,
     is_internal,
     parse_participant,
     strict_email_or_empty,
 )
 from gb_automations.utils.phone import extract_phone
+from gb_automations.utils.signature_parsing import parse_signature
 
 logger = logging.getLogger(__name__)
 
@@ -119,19 +121,26 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
         result.skipped_reason = "thread has no messages"
         return result
 
-    # 2. Pick the Notion project for this thread
+    # 2. Pick the Notion projects for this thread. Multiple labels (dual-tagged
+    # thread) all flow into the Project relation — Notion supports many-target
+    # relations and the team treats this as "this email is shared across
+    # projects" rather than "pick one." See _pick_projects docstring.
     project_map = await notion_client.get_project_pages()
     thread_label_names = _collect_thread_label_names(thread.messages, label_id_to_name)
-    project_name, project_page_id = _pick_project(thread_label_names, project_map)
-    result.project_name = project_name
-    result.project_page_id = project_page_id
-    if not project_page_id:
+    project_names, project_page_ids = _pick_projects(thread_label_names, project_map)
+    result.project_name = ", ".join(project_names) or None
+    result.project_page_id = project_page_ids[0] if project_page_ids else None
+    if not project_page_ids:
         result.skipped_reason = (
             f"no Notion project matches any thread label "
             f"(thread labels: {sorted(thread_label_names)})"
         )
         return result
-    logger.info("  • matched project %r (page=%s)", project_name, project_page_id)
+    logger.info(
+        "  • matched %d project(s): %s",
+        len(project_page_ids),
+        ", ".join(f"{n!r}={p}" for n, p in zip(project_names, project_page_ids)),
+    )
 
     # 3 + 4 + 5. Use one DB session for the whole thread so cache writes are
     # atomic. The history-reconstruction LLM call needs the session for the
@@ -164,7 +173,7 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
                     created_count, skipped_count = await _sync_message(
                         msg=msg,
                         extracted=splits.get(msg.message_id, []),
-                        project_page_id=project_page_id,
+                        project_page_ids=project_page_ids,
                         user_email=user_email,
                         session=session,
                         contact_ids=contact_ids,
@@ -314,27 +323,30 @@ def _collect_thread_label_names(
     return names
 
 
-def _pick_project(
+def _pick_projects(
     thread_label_names: set[str], project_map: dict[str, dict[str, str]]
-) -> tuple[str | None, str | None]:
-    """Find the FIRST thread-label whose name matches a Notion project's label path.
+) -> tuple[list[str], list[str]]:
+    """Find EVERY thread-label whose name matches a Notion project's label path.
 
     `project_map` keys are full nested Gmail label paths (e.g.
     "Projects/2026/Acme"), produced by `notion_client.get_project_pages()`.
     Gmail thread labels carry the same nested name, so set intersection works
     without rebuilding paths here.
 
-    Returns (project_title, project_page_id) — the *title* (leaf, e.g. "Acme")
-    so logs and SyncResult stay human-friendly, not the full label path.
-    Deterministic by sorting candidates alphabetically so the same thread always
-    matches the same project even if Gmail returns labels in different order.
+    Returns (titles, page_ids) — the *titles* (leaf names, e.g. "Acme") so logs
+    and SyncResult stay human-friendly, not the full label paths. Both lists
+    are aligned in sorted-by-label-path order, so the same thread always picks
+    projects in the same order regardless of how Gmail orders labels.
+
+    Dual-labeled threads return multiple entries. The `Project` relation on
+    each row is set to all of them — Notion relations are multi-target. This
+    is intentional: when the team genuinely runs an email across two projects,
+    we don't want to silently drop one.
     """
-    candidates = sorted(thread_label_names & project_map.keys())
-    if not candidates:
-        return None, None
-    label_path = candidates[0]
-    meta = project_map[label_path]
-    return meta["title"], meta["id"]
+    matched = sorted(thread_label_names & project_map.keys())
+    titles = [project_map[name]["title"] for name in matched]
+    ids = [project_map[name]["id"] for name in matched]
+    return titles, ids
 
 
 # ============================================================
@@ -350,15 +362,20 @@ async def _upsert_thread_contacts(
     """Walk every external participant in the thread, upsert each to Notion Contacts.
 
     Returns {email: notion_page_id} for every successfully upserted contact.
-    Also tries to enrich each sender's contact with a phone number pulled from
-    their signature block (matches Apps Script behavior).
+    Also enriches each sender's contact with fields parsed from their
+    signature block: phone, title, address, and a relation to a Company
+    row (auto-upserted by domain — see _upsert_company).
 
     `splits` is the dict produced by `_presplit_forwarded_chains` — for any
     message that was LLM-split, we also extract participants from each inner
     forwarded message so the original (forwarded) senders/recipients get
     upserted as contacts instead of being lost.
     """
-    seen: dict[str, dict[str, Any]] = {}  # email → {name, email, phone, company}
+    # email → {name, email, phone, title, address, signature_company}
+    # `signature_company` is the human-readable name pulled from the sender's
+    # signature ("Thon Eiendom"), used to title the Company row. Domain is
+    # always derivable from email, so we don't carry it here.
+    seen: dict[str, dict[str, Any]] = {}
 
     def add_participant(raw: str) -> None:
         # Upsert EVERY participant (internal + external) so the From/To/Cc
@@ -374,7 +391,9 @@ async def _upsert_thread_contacts(
                 "name": parsed.name,
                 "email": parsed.email,
                 "phone": None,
-                "company": company_from_domain(parsed.email),
+                "title": None,
+                "address": None,
+                "signature_company": None,
             }
         elif parsed.name and not seen[parsed.email]["name"]:
             seen[parsed.email]["name"] = parsed.name
@@ -397,19 +416,71 @@ async def _upsert_thread_contacts(
                 for raw in _split_addresses(inner.cc_field):
                     add_participant(raw)
 
-        # 2. If this message's signature has a phone, attach it to the sender's contact.
+        # 2. Enrich the sender's record from their signature.
+        sender_email = find_sender_email(msg.from_field)
+        if not sender_email or sender_email not in seen:
+            continue
         sig = extract_signature_block(msg.plain_body)
-        if sig:
-            phone = extract_phone(sig)
-            sender_email = find_sender_email(msg.from_field)
-            if phone and sender_email in seen and not seen[sender_email]["phone"]:
-                seen[sender_email]["phone"] = phone
+        if not sig:
+            continue
+        # Phone parses off the raw signature block (existing behavior).
+        phone = extract_phone(sig)
+        if phone and not seen[sender_email]["phone"]:
+            seen[sender_email]["phone"] = phone
+        # Structured signature fields — only set if not already populated by
+        # an earlier message in the thread. First-write-wins.
+        fields = parse_signature(sig, sender_name=seen[sender_email]["name"])
+        if fields.title and not seen[sender_email]["title"]:
+            seen[sender_email]["title"] = fields.title
+        if fields.address and not seen[sender_email]["address"]:
+            seen[sender_email]["address"] = fields.address
+        if fields.company and not seen[sender_email]["signature_company"]:
+            seen[sender_email]["signature_company"] = fields.company
 
-    # 3. Upsert each contact via cache → Notion.
+    # 3. Upsert Companies (one per unique domain) before contacts, since each
+    # contact needs a company_page_id to populate the relation. Prefer the
+    # signature-derived company name — fall back to the capitalized domain
+    # stem so every company row has a sensible title even when no sender in
+    # the thread carries a full signature for that domain.
+    # Free-mail domains (gmail.com, outlook.com, …) represent individuals,
+    # not companies — skip them entirely so the Companies DB doesn't get a
+    # bogus "Gmail" row, and the contact's Company relation stays empty (the
+    # truthful state: we don't know what company this person belongs to).
+    domain_to_company_page: dict[str, str] = {}
+    domains_with_company: dict[str, str] = {}
+    for contact in seen.values():
+        domain = _domain_of(contact["email"])
+        if not domain or is_free_mail_domain(domain):
+            continue
+        sig_company = contact.get("signature_company")
+        # Prefer the longest/most descriptive name across multiple senders on
+        # the same domain — usually only one anyway.
+        if sig_company and (
+            domain not in domains_with_company
+            or len(sig_company) > len(domains_with_company[domain])
+        ):
+            domains_with_company[domain] = sig_company
+
+    for contact in seen.values():
+        domain = _domain_of(contact["email"])
+        if not domain or domain in domain_to_company_page:
+            continue
+        if is_free_mail_domain(domain):
+            continue
+        name = domains_with_company.get(domain) or company_from_domain(contact["email"])
+        try:
+            page_id = await _upsert_company(domain=domain, name=name, session=session)
+            if page_id:
+                domain_to_company_page[domain] = page_id
+        except Exception:
+            logger.exception("Failed to upsert company for domain %s", domain)
+
+    # 4. Upsert each contact via cache → Notion.
     out: dict[str, str] = {}
     for contact in seen.values():
         try:
-            page_id = await _upsert_contact(contact, session)
+            company_page_id = domain_to_company_page.get(_domain_of(contact["email"]))
+            page_id = await _upsert_contact(contact, company_page_id, session)
             if page_id:
                 out[contact["email"]] = page_id
         except Exception:
@@ -422,40 +493,70 @@ def _split_addresses(*fields: str) -> list[str]:
     return [chunk for field in fields if field for chunk in field.split(",")]
 
 
-async def _upsert_contact(contact: dict[str, Any], session: AsyncSession) -> str | None:
-    """Find-or-create a contact. Cache first, then Notion query, then create."""
+def _domain_of(email: str) -> str:
+    """Lowercased part after '@', or '' if the email is malformed."""
+    return email.split("@", 1)[1].lower() if "@" in email else ""
+
+
+async def _upsert_contact(
+    contact: dict[str, Any],
+    company_page_id: str | None,
+    session: AsyncSession,
+) -> str | None:
+    """Find-or-create a contact. Cache first, then Notion query, then create.
+
+    On cache/Notion hit, best-effort enriches any blank fields (phone, title,
+    address, company relation) — never overwrites manual edits.
+    """
     email = contact["email"]
     name = contact["name"] or contact["email"]
     phone = contact["phone"]
-    company = contact["company"]
+    title = contact["title"]
+    address = contact["address"]
 
     # 1. Local cache hit?
     cached = await session.get(ContactCache, email)
     if cached:
-        if phone:
-            # Best-effort phone enrichment — only if existing has none. We don't
-            # know whether Notion already has one without querying, so just try
-            # the update; Notion no-ops if the value is the same.
-            try:
-                contact_obj = await notion_client.find_contact_by_email(email)
-                existing_phone = (
-                    (contact_obj or {}).get("properties", {}).get("Phone", {}).get("phone_number")
-                )
-                if not existing_phone:
-                    await notion_client.update_contact_phone(cached.notion_page_id, phone)
-            except Exception:
-                logger.exception("Phone enrichment failed for %s", email)
+        try:
+            existing = await notion_client.find_contact_by_email(email)
+            existing_props = (existing or {}).get("properties", {})
+            await notion_client.patch_contact_enrichment(
+                cached.notion_page_id,
+                existing_props=existing_props,
+                phone=phone,
+                title=title,
+                address=address,
+                company_page_id=company_page_id,
+            )
+        except Exception:
+            logger.exception("Enrichment failed for %s", email)
         return cached.notion_page_id
 
     # 2. Notion already has this contact (e.g. created in another run)?
     existing = await notion_client.find_contact_by_email(email)
     if existing:
         await _cache_contact(session, email=email, page_id=existing["id"])
+        try:
+            await notion_client.patch_contact_enrichment(
+                existing["id"],
+                existing_props=existing.get("properties", {}),
+                phone=phone,
+                title=title,
+                address=address,
+                company_page_id=company_page_id,
+            )
+        except Exception:
+            logger.exception("Enrichment failed for %s", email)
         return existing["id"]
 
     # 3. Create in Notion.
     created = await notion_client.create_contact(
-        name=name, email=email, phone=phone, company=company
+        name=name,
+        email=email,
+        phone=phone,
+        title=title,
+        address=address,
+        company_page_id=company_page_id,
     )
     page_id = created["id"]
     await _cache_contact(session, email=email, page_id=page_id)
@@ -468,6 +569,35 @@ async def _cache_contact(session: AsyncSession, *, email: str, page_id: str) -> 
         insert(ContactCache)
         .values(email=email, notion_page_id=page_id)
         .on_conflict_do_update(index_elements=["email"], set_={"notion_page_id": page_id})
+    )
+    await session.execute(stmt)
+
+
+async def _upsert_company(
+    *, domain: str, name: str, session: AsyncSession
+) -> str | None:
+    """Find-or-create a company row by domain. Cache first, then Notion."""
+    cached = await session.get(CompanyCache, domain)
+    if cached:
+        return cached.notion_page_id
+
+    existing = await notion_client.find_company_by_domain(domain)
+    if existing:
+        await _cache_company(session, domain=domain, page_id=existing["id"])
+        return existing["id"]
+
+    created = await notion_client.create_company(name=name, domain=domain)
+    page_id = created["id"]
+    await _cache_company(session, domain=domain, page_id=page_id)
+    logger.info("Created company %s (%s)", name, domain)
+    return page_id
+
+
+async def _cache_company(session: AsyncSession, *, domain: str, page_id: str) -> None:
+    stmt = (
+        insert(CompanyCache)
+        .values(domain=domain, notion_page_id=page_id)
+        .on_conflict_do_update(index_elements=["domain"], set_={"notion_page_id": page_id})
     )
     await session.execute(stmt)
 
@@ -498,7 +628,7 @@ async def _sync_message(
     *,
     msg: gmail_client.GmailMessage,
     extracted: list[ExtractedMessage],
-    project_page_id: str,
+    project_page_ids: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str],
@@ -530,7 +660,7 @@ async def _sync_message(
     # 1. The regex single-row path runs for every Gmail message.
     created, skipped = await _sync_single_message(
         msg=msg,
-        project_page_id=project_page_id,
+        project_page_ids=project_page_ids,
         user_email=user_email,
         session=session,
         contact_ids=contact_ids,
@@ -551,7 +681,7 @@ async def _sync_message(
         c, s = await _sync_forwarded_chain(
             parent_msg=msg,
             extracted=extracted,
-            project_page_id=project_page_id,
+            project_page_ids=project_page_ids,
             user_email=user_email,
             session=session,
             contact_ids=contact_ids,
@@ -567,7 +697,7 @@ async def _sync_message(
 async def _sync_single_message(
     *,
     msg: gmail_client.GmailMessage,
-    project_page_id: str,
+    project_page_ids: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str] | None = None,
@@ -587,18 +717,38 @@ async def _sync_single_message(
 
     Returns `(1, 0)` if a new row was created, `(0, 1)` if it was already there.
     """
-    # 1. Local cache hit?
+    # 1. Local cache hit? Re-PATCH the Project relation in case the user has
+    # swapped labels since the row was created (mis-labeled → corrected). The
+    # PATCH is idempotent so we can do this unconditionally; the Notion-side
+    # feedback-loop filter swallows the resulting webhook echo.
     cached = await session.get(EmailRow, msg.message_id)
     if cached:
         logger.debug("    dedup hit (local cache) for msg %s", msg.message_id)
+        try:
+            await notion_client.patch_email_row_project(
+                cached.notion_page_id, project_page_ids
+            )
+        except Exception:
+            logger.exception(
+                "    project reconciliation failed for msg %s", msg.message_id
+            )
         return (0, 1)
 
     db_id, emails_db_props = await _resolve_db_for_date(msg.date)
 
     # 2. Notion already has a row for this message ID (different user synced it)?
+    # Same reconciliation rationale as the local-cache branch.
     existing = await notion_client.find_email_row_by_message_id(msg.message_id, db_id)
     if existing:
         logger.debug("    dedup hit (Notion query) for msg %s", msg.message_id)
+        try:
+            await notion_client.patch_email_row_project(
+                existing["id"], project_page_ids
+            )
+        except Exception:
+            logger.exception(
+                "    project reconciliation failed for msg %s", msg.message_id
+            )
         await _cache_email_row(
             session,
             message_id=msg.message_id,
@@ -642,7 +792,7 @@ async def _sync_single_message(
     )
     properties = await _build_email_row_properties(
         msg=msg,
-        project_page_id=project_page_id,
+        project_page_ids=project_page_ids,
         user_email=user_email,
         emails_db_props=emails_db_props,
         body=cleaned_body,
@@ -694,7 +844,7 @@ async def _sync_forwarded_chain(
     *,
     parent_msg: gmail_client.GmailMessage,
     extracted: list[ExtractedMessage],
-    project_page_id: str,
+    project_page_ids: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str],
@@ -721,7 +871,7 @@ async def _sync_forwarded_chain(
             parent_msg=parent_msg,
             inner=inner,
             synthetic_id=synth_id,
-            project_page_id=project_page_id,
+            project_page_ids=project_page_ids,
             user_email=user_email,
             session=session,
             contact_ids=contact_ids,
@@ -739,7 +889,7 @@ async def _sync_extracted_message(
     parent_msg: gmail_client.GmailMessage,
     inner: ExtractedMessage,
     synthetic_id: str,
-    project_page_id: str,
+    project_page_ids: list[str],
     user_email: str,
     session: AsyncSession,
     contact_ids: dict[str, str],
@@ -761,6 +911,14 @@ async def _sync_extracted_message(
     cached = await session.get(EmailRow, synthetic_id)
     if cached:
         logger.debug("    dedup hit (local cache) for extracted %s", synthetic_id)
+        try:
+            await notion_client.patch_email_row_project(
+                cached.notion_page_id, project_page_ids
+            )
+        except Exception:
+            logger.exception(
+                "    project reconciliation failed for extracted %s", synthetic_id
+            )
         return (0, 1)
 
     db_id, emails_db_props = await _resolve_db_for_date(inner.date)
@@ -768,6 +926,14 @@ async def _sync_extracted_message(
     existing = await notion_client.find_email_row_by_message_id(synthetic_id, db_id)
     if existing:
         logger.debug("    dedup hit (Notion query) for extracted %s", synthetic_id)
+        try:
+            await notion_client.patch_email_row_project(
+                existing["id"], project_page_ids
+            )
+        except Exception:
+            logger.exception(
+                "    project reconciliation failed for extracted %s", synthetic_id
+            )
         await _cache_email_row(
             session,
             message_id=synthetic_id,
@@ -796,7 +962,7 @@ async def _sync_extracted_message(
         parent_msg=parent_msg,
         inner=inner,
         synthetic_id=synthetic_id,
-        project_page_id=project_page_id,
+        project_page_ids=project_page_ids,
         user_email=user_email,
         emails_db_props=emails_db_props,
         body=display_body,
@@ -897,7 +1063,7 @@ def _emails_from(raw_field: str) -> list[str]:
 async def _build_email_row_properties(
     *,
     msg: gmail_client.GmailMessage,
-    project_page_id: str,
+    project_page_ids: list[str],
     user_email: str,
     emails_db_props: set[str],
     body: str,
@@ -926,7 +1092,7 @@ async def _build_email_row_properties(
         subject=msg.subject,
         thread_id=msg.thread_id,
         message_id=msg.message_id,
-        project_page_id=project_page_id,
+        project_page_ids=project_page_ids,
         from_email=from_email,
         to_emails=to_emails,
         cc_emails=cc_emails,
@@ -941,7 +1107,7 @@ async def _build_extracted_row_properties(
     parent_msg: gmail_client.GmailMessage,
     inner: ExtractedMessage,
     synthetic_id: str,
-    project_page_id: str,
+    project_page_ids: list[str],
     user_email: str,
     emails_db_props: set[str],
     body: str,
@@ -974,7 +1140,7 @@ async def _build_extracted_row_properties(
         subject=inner.subject,
         thread_id=parent_msg.thread_id,
         message_id=synthetic_id,
-        project_page_id=project_page_id,
+        project_page_ids=project_page_ids,
         from_email=from_email,
         to_emails=to_emails,
         cc_emails=cc_emails,
@@ -990,7 +1156,7 @@ async def _assemble_row_props(
     subject: str,
     thread_id: str,
     message_id: str,
-    project_page_id: str,
+    project_page_ids: list[str],
     from_email: str,
     to_emails: list[str],
     cc_emails: list[str],
@@ -1046,7 +1212,7 @@ async def _assemble_row_props(
     maybe_set("subject", {"title": [{"text": {"content": (subject or "(no subject)")[:1900]}}]})
     maybe_set("thread_id", {"rich_text": [{"text": {"content": thread_id}}]})
     maybe_set("message_id", {"rich_text": [{"text": {"content": message_id}}]})
-    maybe_set("project", {"relation": [{"id": project_page_id}]})
+    maybe_set("project", {"relation": [{"id": pid} for pid in project_page_ids]})
     if from_contact_id:
         maybe_set("from_contact", {"relation": [{"id": from_contact_id}]})
     if to_contact_ids:

@@ -437,11 +437,17 @@ def _collect_changed_thread_ids(history_response: dict[str, Any]) -> set[str]:
     """Extract every Gmail thread ID touched by the history response.
 
     We re-sync at the thread level (cheap, idempotent via dedup), so anything
-    that mentions a thread — messageAdded, labelAdded — triggers a re-sync.
+    that mentions a thread — messageAdded, labelAdded, labelRemoved — triggers
+    a re-sync. labelRemoved is what catches "user fixed a mislabel": the
+    add-side fires on the new project, the remove-side fires on the old one,
+    and sync_thread's reconciliation re-points existing rows. Without
+    labelsRemoved here, swap-only events (where the same user action toggles
+    both labels but the add isn't routed to us) would silently leave rows
+    pointing at the old project.
     """
     thread_ids: set[str] = set()
     for entry in history_response.get("history", []) or []:
-        for change_type in ("messagesAdded", "labelsAdded"):
+        for change_type in ("messagesAdded", "labelsAdded", "labelsRemoved"):
             for change in entry.get(change_type, []) or []:
                 msg = change.get("message") or {}
                 tid = msg.get("threadId")

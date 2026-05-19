@@ -10,6 +10,7 @@ from gb_automations.utils.participants import (
     extract_email,
     extract_name,
     find_sender_email,
+    is_free_mail_domain,
     is_internal,
     parse_participant,
     strict_email_or_empty,
@@ -213,3 +214,39 @@ def test_strict_email_or_empty_returns_empty_for_empty_string():
 
 def test_strict_email_or_empty_returns_empty_for_no_at_sign():
     assert strict_email_or_empty("not an email") == ""
+
+
+# ============================================================
+# is_free_mail_domain
+# ============================================================
+
+
+def test_is_free_mail_domain_recognizes_gmail():
+    assert is_free_mail_domain("gmail.com") is True
+
+
+def test_is_free_mail_domain_recognizes_outlook_hotmail_icloud():
+    assert is_free_mail_domain("outlook.com") is True
+    assert is_free_mail_domain("hotmail.com") is True
+    assert is_free_mail_domain("hotmail.no") is True
+    assert is_free_mail_domain("icloud.com") is True
+
+
+def test_is_free_mail_domain_recognizes_norwegian_consumer_isps():
+    assert is_free_mail_domain("online.no") is True
+    assert is_free_mail_domain("yahoo.no") is True
+
+
+def test_is_free_mail_domain_case_insensitive():
+    assert is_free_mail_domain("GMAIL.COM") is True
+    assert is_free_mail_domain("Outlook.Com") is True
+
+
+def test_is_free_mail_domain_rejects_real_company_domains():
+    assert is_free_mail_domain("goldbox.no") is False
+    assert is_free_mail_domain("metropolis.no") is False
+    assert is_free_mail_domain("thon.no") is False
+
+
+def test_is_free_mail_domain_rejects_empty_string():
+    assert is_free_mail_domain("") is False

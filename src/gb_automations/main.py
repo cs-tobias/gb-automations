@@ -1,8 +1,10 @@
+import asyncio
 import logging
 import logging.config
 import os
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from sqlalchemy import text
 
@@ -74,12 +76,62 @@ def _validate_required_settings() -> None:
 _validate_required_settings()
 
 
+async def _ensure_model_present() -> None:
+    # Auto-pull the configured Ollama model on startup so a fresh `docker
+    # compose up` is sufficient — no one needs to remember a manual step. Best
+    # effort: if Ollama is unreachable (e.g. Mac dev opted out and the native
+    # process isn't running), log and move on. The tagging client already
+    # treats Ollama failures as `[]` per project convention.
+    base = settings.ollama_base_url.rstrip("/")
+    want = settings.ollama_model
+    log = logging.getLogger(__name__)
+
+    await asyncio.sleep(3)
+
+    deadline = asyncio.get_event_loop().time() + 180
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                resp = await client.get(f"{base}/api/tags")
+                resp.raise_for_status()
+                tags = resp.json().get("models") or []
+                if any(m.get("name") == want for m in tags):
+                    log.info("Ollama model %s already present, skipping pull", want)
+                    return
+                break
+            except Exception as err:
+                if asyncio.get_event_loop().time() >= deadline:
+                    log.warning(
+                        "Ollama not reachable at %s after 3 min (%s) — "
+                        "skipping auto-pull. Tagging will be a no-op until "
+                        "Ollama is available.",
+                        base,
+                        err,
+                    )
+                    return
+                await asyncio.sleep(10)
+
+    try:
+        from gb_automations.scripts.pull_llm_model import pull
+
+        log.info("Ollama model %s missing — starting background pull", want)
+        rc = await pull()
+        if rc == 0:
+            log.info("Ollama model %s pulled successfully", want)
+        else:
+            log.warning("Ollama model pull returned non-zero status %s", rc)
+    except Exception as err:
+        log.warning("Auto-pull of Ollama model failed: %s", err)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()
+    pull_task = asyncio.create_task(_ensure_model_present())
     try:
         yield
     finally:
+        pull_task.cancel()
         shutdown_scheduler()
 
 

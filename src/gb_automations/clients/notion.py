@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from gb_automations.config import CONTACTS_PROPS, EMAILS_PROPS, settings
+from gb_automations.config import COMPANIES_PROPS, CONTACTS_PROPS, EMAILS_PROPS, settings
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ async def get_project_pages() -> dict[str, dict[str, str]]:
 
     The key is the *nested Gmail label name* (e.g. "Projects/2026/Acme") so it
     matches the actual label names on synced Gmail threads — the
-    sync_thread → _pick_project intersection works directly without callers
+    sync_thread → _pick_projects intersection works directly without callers
     having to rebuild paths on each lookup.
 
     Value fields:
@@ -359,6 +359,30 @@ async def patch_email_row_files(page_id: str, files: list[dict[str, str]]) -> No
         _raise_for_status(response)
 
 
+async def patch_email_row_project(page_id: str, project_page_ids: list[str]) -> None:
+    """Set the Project relation on an existing email row. Idempotent.
+
+    Called on every dedup-cache hit during sync_thread so that Gmail label
+    swaps (user mislabels a thread, then corrects it) propagate to already-
+    synced rows. PATCHing the same value is a no-op on Notion's side; the
+    /webhooks/notion self-write filter swallows the resulting webhook echo.
+
+    Pass an empty list to clear the relation (currently unused — see the
+    "remove-only" follow-up in the original plan).
+    """
+    props = {
+        EMAILS_PROPS["project"]: {
+            "relation": [{"id": pid} for pid in project_page_ids]
+        }
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(f"/pages/{page_id}", json={"properties": props}),
+            op_name=f"PATCH /pages/{page_id} project",
+        )
+        _raise_for_status(response)
+
+
 # ============================================================
 # Contacts DB
 # ============================================================
@@ -382,9 +406,24 @@ async def find_contact_by_email(email: str) -> dict[str, Any] | None:
 
 
 async def create_contact(
-    *, name: str, email: str, phone: str | None = None, company: str | None = None
+    *,
+    name: str,
+    email: str,
+    phone: str | None = None,
+    title: str | None = None,
+    address: str | None = None,
+    company_page_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a new row in the Contacts DB. Returns the created page object."""
+    """Create a new row in the Contacts DB. Returns the created page object.
+
+    `company_page_id` is the Notion page ID of the related Company row;
+    when provided, it populates the single-relation. The old free-text
+    `Company` property is gone — pass nothing (don't fall back to a name
+    guess here; the caller is responsible for resolving + upserting the
+    Company first).
+
+    `Company Status` is intentionally absent: it's managed manually in Notion.
+    """
     if not settings.contacts_db_id:
         raise RuntimeError("CONTACTS_DB_ID is not configured")
     properties: dict[str, Any] = {
@@ -393,8 +432,12 @@ async def create_contact(
     }
     if phone:
         properties[CONTACTS_PROPS["phone"]] = {"phone_number": phone}
-    if company:
-        properties[CONTACTS_PROPS["company"]] = {"rich_text": [{"text": {"content": company}}]}
+    if title:
+        properties[CONTACTS_PROPS["title"]] = {"rich_text": [{"text": {"content": title}}]}
+    if address:
+        properties[CONTACTS_PROPS["address"]] = {"rich_text": [{"text": {"content": address}}]}
+    if company_page_id:
+        properties[CONTACTS_PROPS["company"]] = {"relation": [{"id": company_page_id}]}
     async with _client() as client:
         response = await client.post(
             "/pages",
@@ -418,6 +461,111 @@ async def patch_contact(page_id: str, properties: dict[str, Any]) -> dict[str, A
 async def update_contact_phone(page_id: str, phone: str) -> None:
     """Convenience wrapper for the common "add phone if missing" case."""
     await patch_contact(page_id, {CONTACTS_PROPS["phone"]: {"phone_number": phone}})
+
+
+async def patch_contact_enrichment(
+    page_id: str,
+    *,
+    existing_props: dict[str, Any] | None = None,
+    phone: str | None = None,
+    title: str | None = None,
+    address: str | None = None,
+    company_page_id: str | None = None,
+) -> None:
+    """Fill blank enrichment fields on an existing contact; never overwrite.
+
+    Mirrors the established phone-enrichment pattern at
+    `_upsert_contact` in `sync/sync_thread.py` — read what Notion currently
+    has, only write the fields that are empty there. Goldbox can edit any of
+    these fields manually in Notion without us clobbering their work.
+
+    Pass `existing_props` (the `properties` dict from a prior find/query) to
+    avoid an extra round-trip; otherwise this issues a fresh GET.
+    """
+    if not any([phone, title, address, company_page_id]):
+        return
+
+    if existing_props is None:
+        async with _client() as client:
+            response = await client.get(f"/pages/{page_id}")
+            _raise_for_status(response)
+            existing_props = response.json().get("properties", {})
+
+    to_write: dict[str, Any] = {}
+
+    if phone and not _has_phone(existing_props.get(CONTACTS_PROPS["phone"])):
+        to_write[CONTACTS_PROPS["phone"]] = {"phone_number": phone}
+    if title and not _has_rich_text(existing_props.get(CONTACTS_PROPS["title"])):
+        to_write[CONTACTS_PROPS["title"]] = {"rich_text": [{"text": {"content": title}}]}
+    if address and not _has_rich_text(existing_props.get(CONTACTS_PROPS["address"])):
+        to_write[CONTACTS_PROPS["address"]] = {"rich_text": [{"text": {"content": address}}]}
+    if company_page_id and not _has_relation(existing_props.get(CONTACTS_PROPS["company"])):
+        to_write[CONTACTS_PROPS["company"]] = {"relation": [{"id": company_page_id}]}
+
+    if to_write:
+        await patch_contact(page_id, to_write)
+
+
+def _has_phone(prop: dict[str, Any] | None) -> bool:
+    return bool(prop and prop.get("phone_number"))
+
+
+def _has_rich_text(prop: dict[str, Any] | None) -> bool:
+    return bool(prop and prop.get("rich_text"))
+
+
+def _has_relation(prop: dict[str, Any] | None) -> bool:
+    return bool(prop and prop.get("relation"))
+
+
+# ============================================================
+# Companies DB
+# ============================================================
+
+
+async def find_company_by_domain(domain: str) -> dict[str, Any] | None:
+    """Query the Companies DB for an existing row whose Domain matches.
+
+    Dedup is by email domain, not by Name — see COMPANIES_PROPS in config.py
+    for the reasoning. Domain is rich_text in Notion, so we use the equals
+    filter on rich_text.
+    """
+    if not settings.companies_db_id:
+        raise RuntimeError("COMPANIES_DB_ID is not configured")
+    async with _client() as client:
+        response = await client.post(
+            f"/databases/{settings.companies_db_id}/query",
+            json={
+                "filter": {
+                    "property": COMPANIES_PROPS["domain"],
+                    "rich_text": {"equals": domain},
+                },
+                "page_size": 1,
+            },
+        )
+        _raise_for_status(response)
+        results = response.json().get("results", [])
+        return results[0] if results else None
+
+
+async def create_company(*, name: str, domain: str) -> dict[str, Any]:
+    """Create a new row in the Companies DB. Returns the created page object."""
+    if not settings.companies_db_id:
+        raise RuntimeError("COMPANIES_DB_ID is not configured")
+    properties: dict[str, Any] = {
+        COMPANIES_PROPS["name"]: {"title": [{"text": {"content": name}}]},
+        COMPANIES_PROPS["domain"]: {"rich_text": [{"text": {"content": domain}}]},
+    }
+    async with _client() as client:
+        response = await client.post(
+            "/pages",
+            json={
+                "parent": {"database_id": settings.companies_db_id},
+                "properties": properties,
+            },
+        )
+        _raise_for_status(response)
+        return response.json()
 
 
 # ============================================================
