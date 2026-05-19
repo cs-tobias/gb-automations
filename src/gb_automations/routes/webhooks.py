@@ -2,18 +2,19 @@
 
 - /webhooks/echo  — logs and reflects whatever it gets; used to verify the
   Cloudflare Tunnel is wired up.
-- /webhooks/notion — Notion → Gmail label flow. When a page is created in
-  Notion (optionally scoped to a specific Projects database), create a Gmail
-  label with the page's title in every active user's mailbox.
+- /webhooks/notion — Notion → Gmail label flow. Triggered by a "Sync to Gmail"
+  Notion button on the Projects DB: POST with bearer auth and a JSON body
+  {"page_id": "<id>"}. Creates the Gmail label across active mailboxes the
+  first time, renames it on later clicks if the project title changed, and
+  reconciles per-user rows that drifted.
 
-Stage 4c will add /webhooks/gmail (Pub/Sub push) for the inbound side.
+/webhooks/gmail handles the inbound side (Pub/Sub push from Gmail history).
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -24,18 +25,18 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from google.auth.transport import requests as g_requests
 from google.oauth2 import id_token
+from googleapiclient.errors import HttpError
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
-from gb_automations.clients import notion_emails_db
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import ProjectLabel, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync.sync_thread import sync_thread
-from gb_automations.sync.watches import cursor_source_for
+from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
 from gb_automations.utils.labels import project_label_path
 
 logger = logging.getLogger(__name__)
@@ -76,51 +77,42 @@ async def echo(request: Request) -> dict[str, Any]:
 # ============================================================
 
 
-def _verify_notion_signature(body: bytes, signature_header: str | None) -> bool:
-    """Constant-time HMAC-SHA256 check against NOTION_WEBHOOK_SECRET.
+def _verify_bearer(auth_header: str | None) -> bool:
+    """Constant-time check of the Authorization header against NOTION_WEBHOOK_SECRET.
 
-    Notion sends `X-Notion-Signature: sha256=<hex>` where the digest is HMAC-SHA256
-    of the raw body using the verification token as key.
+    Notion buttons let you set a custom Authorization header; we use that as the
+    sole auth for this endpoint (button webhooks are NOT HMAC-signed the way
+    database-event subscriptions are).
+
+    Accept either `Bearer <secret>` or the bare `<secret>` — Notion's UI doesn't
+    enforce a scheme, so operators may paste the raw secret in the Value field.
+    Compare both candidates in constant time to avoid leaking which form matched.
     """
-    if not settings.notion_webhook_secret or not signature_header:
+    if not settings.notion_webhook_secret or not auth_header:
         return False
-    if not signature_header.startswith("sha256="):
-        return False
-    provided = signature_header.removeprefix("sha256=")
-    expected = hmac.new(
-        settings.notion_webhook_secret.encode("utf-8"), body, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(provided, expected)
+    secret = settings.notion_webhook_secret
+    match_bearer = hmac.compare_digest(auth_header, f"Bearer {secret}")
+    match_bare = hmac.compare_digest(auth_header, secret)
+    return match_bearer or match_bare
 
 
-_PROJECT_EVENT_TYPES = ("page.created", "page.properties_updated")
+def _page_parented_to_projects_db(page: dict[str, Any]) -> bool:
+    """Parent check: page is a row in the configured Projects database.
 
+    When PROJECTS_DB_ID is unset (some local/dev workspaces), skip the check —
+    the button can only be placed on the Projects DB anyway.
 
-def _is_project_page(event: dict[str, Any]) -> bool:
-    """True if this event refers to a page in the configured Projects DB.
-
-    Accepts both `page.created` (new project → create label) and
-    `page.properties_updated` (project renamed → rename label). The dispatcher
-    branches on event type after this filter.
-
-    When PROJECTS_DB_ID is set, only pages parented to that database qualify.
-    Otherwise, accept any matching event regardless of parent.
+    The REST API returns `parent.type == "database_id"` with the id in
+    `parent.database_id`. Notion's button-webhook envelope uses
+    `parent.type == "data_source_id"` but still includes `database_id` as a
+    sibling field. We just look for `database_id` regardless of `type`.
     """
-    if event.get("type") not in _PROJECT_EVENT_TYPES:
-        return False
     if not settings.projects_db_id:
         return True
-
-    # Webhook payload uses parent.type == "database" with the DB id in parent.id.
-    # Page-parented or workspace-parented pages have different types ("page",
-    # "workspace") and are not what we want.
-    data = event.get("data") or {}
-    parent = data.get("parent") or {}
-    if parent.get("type") not in ("database", "database_id"):
-        return False
-    parent_id = (parent.get("id") or parent.get("database_id") or "").replace("-", "")
-    target_id = settings.projects_db_id.replace("-", "")
-    return parent_id == target_id
+    parent = page.get("parent") or {}
+    parent_db = (parent.get("database_id") or "").replace("-", "").lower()
+    target = settings.projects_db_id.replace("-", "").lower()
+    return parent_db == target
 
 
 async def _create_label_for_all_users(
@@ -128,11 +120,16 @@ async def _create_label_for_all_users(
 ) -> dict[str, list[str]]:
     """Create the label in every active user's mailbox AND record the (project, user) → label_id
     mapping so a future rename can target each label by ID.
+
+    Returns lists of user emails per outcome: `created` minted a fresh label,
+    `already_present` was an idempotent no-op (label was already in that
+    mailbox), `failed` errored.
     """
     async with SessionLocal() as session:
         users = (await session.execute(select(User).where(User.active.is_(True)))).scalars().all()
 
-    succeeded: list[str] = []
+    created: list[str] = []
+    already_present: list[str] = []
     failed: list[str] = []
     label_ids_by_user: dict[str, str] = {}
     loop = asyncio.get_running_loop()
@@ -141,7 +138,10 @@ async def _create_label_for_all_users(
             label = await loop.run_in_executor(
                 _executor, partial(gmail_client.create_label, user.email, label_name)
             )
-            succeeded.append(user.email)
+            if label.get("_created"):
+                created.append(user.email)
+            else:
+                already_present.append(user.email)
             label_ids_by_user[user.email] = label["id"]
         except Exception:
             logger.exception("Failed to create label %r for %s", label_name, user.email)
@@ -166,16 +166,26 @@ async def _create_label_for_all_users(
                 await session.execute(stmt)
             await session.commit()
 
-    return {"succeeded": succeeded, "failed": failed}
+    return {"created": created, "already_present": already_present, "failed": failed}
 
 
-async def _rename_label_for_all_users(
-    notion_page_id: str, new_name: str
+async def _reconcile_label_for_all_users(
+    notion_page_id: str, expected_name: str
 ) -> dict[str, Any]:
-    """Rename the Gmail label across every user that has a stored mapping for this project.
+    """Force every active user's Gmail label for this project to match `expected_name`.
 
-    Returns a dict with keys: renamed (list[str]), failed (list[str]), and one of
-    {unchanged: True, no_mapping: True} when the call was a no-op.
+    Notion is the source of truth. On every button click we fetch the live label
+    name from Gmail (by stored ID), compare to `expected_name`, and patch back
+    if they differ. This catches three drift cases in one place:
+
+    1. Project renamed in Notion → DB row is stale → live label still has the
+       old name → patch.
+    2. Label renamed manually in Gmail → DB row may "look fine" (current_name
+       matches expected) but the live label diverged → patch.
+    3. Label deleted in Gmail → labels.get returns 404 → create-by-name and
+       rewrite the row with the fresh ID (self-heal).
+
+    Returns: {patched: [emails], healed: [emails], unchanged: [emails], failed: [emails]}.
     """
     async with SessionLocal() as session:
         rows = list(
@@ -189,64 +199,146 @@ async def _rename_label_for_all_users(
         )
 
     if not rows:
-        # Either the project predates this feature (run the backfill) or it's
-        # genuinely a non-project event (page in another DB) we somehow accepted.
-        return {"renamed": [], "failed": [], "no_mapping": True}
+        return {"patched": [], "healed": [], "unchanged": [], "failed": [], "no_mapping": True}
 
-    if all(r.current_name == new_name for r in rows):
-        return {"renamed": [], "failed": [], "unchanged": True}
-
-    succeeded: list[str] = []
+    patched: list[str] = []
+    healed_ids: dict[str, str] = {}
+    unchanged: list[str] = []
     failed: list[str] = []
     loop = asyncio.get_running_loop()
+
     for row in rows:
-        if row.current_name == new_name:
-            continue  # already up-to-date for this user
+        try:
+            live = await loop.run_in_executor(
+                _executor,
+                partial(gmail_client.get_label, row.user_email, row.gmail_label_id),
+            )
+        except HttpError as err:
+            if err.resp.status == 404:
+                logger.warning(
+                    "Stale label %s for %s (page=%s); creating by name and healing the row",
+                    row.gmail_label_id,
+                    row.user_email,
+                    notion_page_id,
+                )
+                try:
+                    label = await loop.run_in_executor(
+                        _executor,
+                        partial(gmail_client.create_label, row.user_email, expected_name),
+                    )
+                    healed_ids[row.user_email] = label["id"]
+                    continue
+                except Exception:
+                    logger.exception(
+                        "Self-heal failed for %s (page=%s)", row.user_email, notion_page_id
+                    )
+                    failed.append(row.user_email)
+                    continue
+            logger.exception(
+                "Failed to fetch label %s for %s (page=%s)",
+                row.gmail_label_id,
+                row.user_email,
+                notion_page_id,
+            )
+            failed.append(row.user_email)
+            continue
+        except Exception:
+            logger.exception(
+                "Failed to fetch label %s for %s (page=%s)",
+                row.gmail_label_id,
+                row.user_email,
+                notion_page_id,
+            )
+            failed.append(row.user_email)
+            continue
+
+        if live.get("name") == expected_name:
+            unchanged.append(row.user_email)
+            continue
+
+        logger.info(
+            "↳ drift detected for %s: live=%r expected=%r; patching",
+            row.user_email,
+            live.get("name"),
+            expected_name,
+        )
         try:
             await loop.run_in_executor(
                 _executor,
                 partial(
-                    gmail_client.update_label_name, row.user_email, row.gmail_label_id, new_name
+                    gmail_client.update_label_name,
+                    row.user_email,
+                    row.gmail_label_id,
+                    expected_name,
                 ),
             )
-            succeeded.append(row.user_email)
+            patched.append(row.user_email)
         except Exception:
             logger.exception(
-                "Failed to rename label %s for %s (page=%s)",
+                "Failed to patch label %s for %s (page=%s)",
                 row.gmail_label_id,
                 row.user_email,
                 notion_page_id,
             )
             failed.append(row.user_email)
 
-    if succeeded:
+    if patched or healed_ids:
         async with SessionLocal() as session:
+            touched = patched + list(healed_ids.keys())
             await session.execute(
                 update(ProjectLabel)
                 .where(ProjectLabel.notion_page_id == notion_page_id)
-                .where(ProjectLabel.user_email.in_(succeeded))
-                .values(current_name=new_name)
+                .where(ProjectLabel.user_email.in_(touched))
+                .values(current_name=expected_name)
             )
+            for email, fresh_id in healed_ids.items():
+                await session.execute(
+                    update(ProjectLabel)
+                    .where(ProjectLabel.notion_page_id == notion_page_id)
+                    .where(ProjectLabel.user_email == email)
+                    .values(gmail_label_id=fresh_id)
+                )
             await session.commit()
 
-    return {"renamed": succeeded, "failed": failed}
+    return {
+        "patched": patched,
+        "healed": list(healed_ids.keys()),
+        "unchanged": unchanged,
+        "failed": failed,
+    }
+
+
+def _json(payload: dict[str, Any], status: int = 200) -> Response:
+    return Response(
+        content=json.dumps(payload), media_type="application/json", status_code=status
+    )
 
 
 @router.post("/notion")
 async def notion_webhook(request: Request) -> Response:
-    """Notion webhook receiver.
+    """Notion "Sync to Gmail" button receiver.
 
-    On first registration Notion sends a body containing `verification_token`.
-    Echo it back (in the body AND in X-Notion-Verification-Token header) so Notion
-    confirms the URL belongs to us. After that, every event is signed with HMAC-SHA256
-    using that token as the key.
+    The Notion Projects DB has a Button property whose automation sends a POST
+    here with `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` and JSON body
+    `{"page_id": "<id>"}` (Notion substitutes `{{page.id}}` per click).
+
+    Idempotent: creates the label first time, renames if the title changed,
+    reconciles any per-user rows that drifted (e.g. a workspace user was added
+    after the project was first synced).
     """
     with request_scope("notion"):
         return await _notion_webhook_impl(request)
 
 
 async def _notion_webhook_impl(request: Request) -> Response:
-    logger.info("📓 Notion webhook received")
+    logger.info("📓 Notion button click received")
+
+    if not _verify_bearer(request.headers.get("Authorization")):
+        logger.warning(
+            "Notion button auth failed (NOTION_WEBHOOK_SECRET set: %s)",
+            bool(settings.notion_webhook_secret),
+        )
+        raise HTTPException(401, "Bad or missing bearer token")
 
     raw_body = await request.body()
     try:
@@ -254,74 +346,14 @@ async def _notion_webhook_impl(request: Request) -> Response:
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON body") from None
 
-    # Phase 1: verification handshake (URL ownership check). Notion sends a token,
-    # we echo it back. The token also becomes NOTION_WEBHOOK_SECRET going forward.
-    verification_token = payload.get("verification_token")
-    if verification_token:
-        logger.warning(
-            "Notion webhook verification received. Paste this into NOTION_WEBHOOK_SECRET in .env "
-            "(then docker compose up -d --force-recreate api): %s",
-            verification_token,
-        )
-        return Response(
-            content=json.dumps({"verification_token": verification_token}),
-            media_type="application/json",
-            headers={"X-Notion-Verification-Token": verification_token},
-        )
-
-    # Phase 2: signed event. Verify signature before doing anything.
-    signature = request.headers.get("X-Notion-Signature") or request.headers.get(
-        "x-notion-signature"
-    )
-    if not _verify_notion_signature(raw_body, signature):
-        logger.warning(
-            "Notion webhook signature mismatch (NOTION_WEBHOOK_SECRET set: %s)",
-            bool(settings.notion_webhook_secret),
-        )
-        raise HTTPException(401, "Bad or missing signature")
-
-    event_type = payload.get("type", "unknown")
-    entity_id = (payload.get("entity") or {}).get("id")
-    parent = (payload.get("data") or {}).get("parent") or {}
-    logger.info(
-        "📓 Notion event: type=%s entity=%s parent_type=%s parent_id=%s",
-        event_type,
-        entity_id,
-        parent.get("type"),
-        parent.get("id"),
-    )
-
-    if not _is_project_page(payload):
-        # Classify the ignore reason so the log is informative. The most common
-        # source of "ignored" events is our own writes echoing back from Notion:
-        # creating email rows and contacts fires page.created webhooks too.
-        # With year-partitioned Emails DBs we check membership in the local
-        # cache of known year DB IDs (populated by the year router as each
-        # year's DB gets resolved/created).
-        parent_id_clean = (parent.get("id") or "").replace("-", "").lower()
-        known_emails_dbs = await notion_emails_db.all_known_db_ids()
-        if parent_id_clean in known_emails_dbs:
-            reason = "our own Emails-DB row write (feedback loop, fine)"
-        elif parent_id_clean == settings.contacts_db_id.replace("-", "").lower():
-            reason = "our own Contacts-DB row write (feedback loop, fine)"
-        elif event_type not in _PROJECT_EVENT_TYPES:
-            reason = f"event type {event_type!r} is not a project create/rename"
-        else:
-            reason = "parent is not the configured Projects DB"
-        logger.info("↳ ignored: %s", reason)
-        return Response(
-            content=json.dumps({"ignored": True, "reason": reason}),
-            media_type="application/json",
-        )
-
-    logger.info("↳ accepted; fetching page title from Notion…")
-
-    # Pull the page ID from the event and fetch the page to read its current title.
-    # The webhook payload often omits the full properties, so fetching is safer.
-    entity = payload.get("entity") or {}
-    page_id = entity.get("id") or (payload.get("data") or {}).get("id")
+    # Notion button webhooks wrap the page in `data` (the full page object,
+    # including `id`, `parent`, `created_time`, `properties`). We re-fetch the
+    # page below to pick up any edits made between the click and our processing,
+    # but the envelope is what tells us *which* page to fetch.
+    data = payload.get("data") or {}
+    page_id = (data.get("id") or "").strip()
     if not page_id:
-        raise HTTPException(400, "No page id in event payload")
+        raise HTTPException(400, "Missing data.id in Notion button payload")
 
     try:
         page = await notion_client.get_page(page_id)
@@ -329,12 +361,25 @@ async def _notion_webhook_impl(request: Request) -> Response:
         logger.exception("Failed to fetch Notion page %s", page_id)
         raise HTTPException(502, f"Notion fetch failed: {err}") from err
 
+    if not _page_parented_to_projects_db(page):
+        logger.warning("↳ page %s is not in the Projects DB; rejecting", page_id)
+        return _json(
+            {
+                "page_id": page_id,
+                "action": "rejected",
+                "reason": "page is not in the configured Projects DB",
+            }
+        )
+
     title = notion_client.extract_page_title(page)
     if not title:
-        logger.info("↳ page has no title yet, skipping label creation")
-        return Response(
-            content=json.dumps({"ignored": True, "reason": "page has no title"}),
-            media_type="application/json",
+        logger.info("↳ page %s has no title yet, skipping", page_id)
+        return _json(
+            {
+                "page_id": page_id,
+                "action": "skipped",
+                "reason": "page has no title yet",
+            }
         )
 
     # Year segment of the label path comes from Notion's immutable created_time,
@@ -342,40 +387,68 @@ async def _notion_webhook_impl(request: Request) -> Response:
     # creation year even if the title is edited across a year boundary.
     label_name = project_label_path(title, page.get("created_time"))
 
-    if event_type == "page.created":
-        logger.info("↳ creating Gmail label %r in all active mailboxes…", label_name)
-        result = await _create_label_for_all_users(page_id, label_name)
-        logger.info(
-            "↳ done. label=%r succeeded=%d failed=%d",
-            label_name,
-            len(result["succeeded"]),
-            len(result["failed"]),
-        )
-        return Response(
-            content=json.dumps({"label": label_name, **result}),
-            media_type="application/json",
-        )
+    # Two operations on every click, in this order:
+    #   1. Reconcile existing rows: compare each user's live Gmail label name
+    #      against `label_name` and patch any drift (whether the drift came
+    #      from a Notion rename or a Gmail-side rename).
+    #   2. Top up missing rows: create the label for any active user who
+    #      doesn't yet have a project_labels row (new workspace user, or a
+    #      first-ever sync of this project — same code path either way).
+    # Order matters: step 1 is a no-op when there are no rows yet (first sync),
+    # and step 2's create is idempotent so it doesn't re-create labels users
+    # already have.
+    reconcile = await _reconcile_label_for_all_users(page_id, label_name)
+    topup = await _create_label_for_all_users(page_id, label_name)
 
-    # page.properties_updated — title may or may not have changed.
-    logger.info("↳ properties updated; checking if label rename is needed…")
-    rename_result = await _rename_label_for_all_users(page_id, label_name)
-    if rename_result.get("unchanged"):
-        logger.info("↳ no rename needed (label unchanged: %r)", label_name)
-    elif rename_result.get("no_mapping"):
-        logger.warning(
-            "↳ no project_labels mapping for page %s — run backfill_project_labels script",
-            page_id,
-        )
+    if reconcile.get("no_mapping"):
+        action = "created"
+    elif reconcile["patched"] or reconcile["healed"]:
+        action = "synced"
     else:
-        logger.info(
-            "↳ done. new_label=%r renamed=%d failed=%d",
-            label_name,
-            len(rename_result["renamed"]),
-            len(rename_result["failed"]),
+        action = "unchanged"
+
+    failed = list({*reconcile["failed"], *topup["failed"]})
+
+    # Build a plain-English summary of what actually happened. The reconcile
+    # phase already emits a "↳ drift detected for X: live=A expected=B" log
+    # when it patches, so the summary here just needs to confirm the outcome
+    # and report any genuine side effects (new label minted, healed, failed).
+    parts: list[str] = []
+    if action == "created":
+        parts.append(f"created label {label_name!r} in {len(topup['created'])} mailbox(es)")
+    elif reconcile["patched"]:
+        parts.append(f"renamed label to {label_name!r} in {len(reconcile['patched'])} mailbox(es)")
+        if topup["created"]:
+            parts.append(f"also created in {len(topup['created'])} new mailbox(es)")
+    elif reconcile["healed"]:
+        parts.append(
+            f"re-created missing label {label_name!r} in {len(reconcile['healed'])} mailbox(es)"
         )
-    return Response(
-        content=json.dumps({"label": label_name, **rename_result}),
-        media_type="application/json",
+    elif topup["created"]:
+        # Reconcile said nothing changed for existing rows, but top-up minted
+        # the label somewhere new (e.g. a new active user was added since the
+        # last sync of this project).
+        parts.append(f"created label {label_name!r} in {len(topup['created'])} new mailbox(es)")
+    else:
+        parts.append(f"label {label_name!r} already up to date everywhere")
+
+    if failed:
+        parts.append(f"FAILED in {len(failed)} mailbox(es): {', '.join(failed)}")
+
+    logger.info("↳ done — %s", "; ".join(parts))
+
+    return _json(
+        {
+            "page_id": page_id,
+            "label": label_name,
+            "action": action,
+            "patched": reconcile["patched"],
+            "healed": reconcile["healed"],
+            "unchanged": reconcile["unchanged"],
+            "created": topup["created"],
+            "already_present": topup["already_present"],
+            "failed": failed,
+        }
     )
 
 
@@ -433,27 +506,62 @@ async def _save_history_cursor(email: str, history_id: str) -> None:
         await session.commit()
 
 
-def _collect_changed_thread_ids(history_response: dict[str, Any]) -> set[str]:
-    """Extract every Gmail thread ID touched by the history response.
+def _collect_project_thread_ids(
+    history_response: dict[str, Any], project_label_ids: set[str]
+) -> set[str]:
+    """Extract Gmail thread IDs touched by history entries that involve a
+    project label.
 
-    We re-sync at the thread level (cheap, idempotent via dedup), so anything
-    that mentions a thread — messageAdded, labelAdded, labelRemoved — triggers
-    a re-sync. labelRemoved is what catches "user fixed a mislabel": the
-    add-side fires on the new project, the remove-side fires on the old one,
-    and sync_thread's reconciliation re-points existing rows. Without
-    labelsRemoved here, swap-only events (where the same user action toggles
-    both labels but the add isn't routed to us) would silently leave rows
-    pointing at the old project.
+    We re-sync at the thread level (cheap, idempotent via dedup) but only
+    when the event involves a label we care about. The rules per event type:
+
+    - messagesAdded — keep the thread if the message's `labelIds` contains a
+      project label. (A new email landing on a project-labeled thread; or a
+      labeled message landing fresh in the mailbox.)
+    - labelsAdded — keep the thread if the entry's `labelIds` (the labels
+      just added) intersect our project labels. This is the "user just filed
+      this email into a project" case.
+    - labelsRemoved — keep the thread if the entry's `labelIds` (the labels
+      just removed) intersect our project labels. Catches "user moved this
+      email from project A to project B": the add-side fires on B, the
+      remove-side fires on A, and sync_thread's reconciliation re-points
+      existing rows. Without it, swap-only events (where the same user
+      action toggles both labels but the add isn't routed to us) would
+      silently leave Notion rows pointing at the old project.
+
+    Non-project label noise — UNREAD toggles, CATEGORY_UPDATES, user-private
+    labels — gets dropped here so the rest of the pipeline never sees it.
     """
     thread_ids: set[str] = set()
     for entry in history_response.get("history", []) or []:
-        for change_type in ("messagesAdded", "labelsAdded", "labelsRemoved"):
+        for change in entry.get("messagesAdded", []) or []:
+            msg = change.get("message") or {}
+            tid = msg.get("threadId")
+            if not tid:
+                continue
+            if project_label_ids.intersection(msg.get("labelIds", []) or []):
+                thread_ids.add(tid)
+        for change_type in ("labelsAdded", "labelsRemoved"):
             for change in entry.get(change_type, []) or []:
                 msg = change.get("message") or {}
                 tid = msg.get("threadId")
-                if tid:
+                if not tid:
+                    continue
+                if project_label_ids.intersection(change.get("labelIds", []) or []):
                     thread_ids.add(tid)
     return thread_ids
+
+
+def _history_has_any_changes(history_response: dict[str, Any]) -> bool:
+    """True if the history response contains any thread-level change at all,
+    regardless of which labels are involved. Used to distinguish "Gmail sent
+    us an empty ping" (rare; ack quietly) from "Gmail sent us non-project
+    activity" (common; ack quietly and advance the cursor)."""
+    for entry in history_response.get("history", []) or []:
+        for change_type in ("messagesAdded", "labelsAdded", "labelsRemoved"):
+            if entry.get(change_type):
+                return True
+    return False
 
 
 @router.post("/gmail")
@@ -500,15 +608,17 @@ async def _gmail_webhook_impl(request: Request) -> Response:
         logger.warning("Pub/Sub message missing emailAddress or historyId: %s", data)
         return Response(content=json.dumps({"ignored": True}), media_type="application/json")
 
-    logger.info("📬 Gmail push received: email=%s new_historyId=%s", email, new_history_id)
-
     # Look up the last historyId we processed for this user.
     last_history_id = await _load_history_cursor(email)
     if not last_history_id:
         # First push for this user — we don't know the starting point yet. Save the
         # incoming one as the baseline so subsequent pushes have something to diff against.
         await _save_history_cursor(email, new_history_id)
-        logger.info("↳ first push seen, saved as baseline (no sync yet)")
+        logger.info(
+            "📬 Gmail push received for %s: first push, saved historyId=%s as baseline",
+            email,
+            new_history_id,
+        )
         return Response(
             content=json.dumps({"initialized": True, "history_id": new_history_id}),
             media_type="application/json",
@@ -524,17 +634,37 @@ async def _gmail_webhook_impl(request: Request) -> Response:
         logger.exception("Gmail history.list failed for %s", email)
         raise HTTPException(502, "Gmail history fetch failed") from None
 
-    thread_ids = _collect_changed_thread_ids(history)
+    # Gmail's watch filter is intentionally coarse (INBOX/SENT) — we can't tighten
+    # it (50-label cap vs hundreds of projects/year, and parent labels don't
+    # propagate to children in the API). So the first thing we do with every push
+    # is filter it against the project labels this mailbox actually cares about.
+    # Non-project activity gets silently acked here, with the cursor still
+    # advancing so we don't reprocess the same irrelevant history next time.
+    project_label_ids = await fetch_project_label_ids_for_user(email)
+    thread_ids = _collect_project_thread_ids(history, project_label_ids)
     if not thread_ids:
-        logger.info("↳ no relevant changes since %s (nothing to sync)", last_history_id)
         await _save_history_cursor(email, new_history_id)
+        if _history_has_any_changes(history):
+            logger.debug(
+                "Gmail push ignored for %s: no project-label activity since %s",
+                email,
+                last_history_id,
+            )
+        else:
+            logger.debug(
+                "Gmail push ignored for %s: empty history since %s",
+                email,
+                last_history_id,
+            )
         return Response(
             content=json.dumps({"email": email, "synced": [], "errored": []}),
             media_type="application/json",
         )
 
     logger.info(
-        "↳ found %d changed thread(s) between historyId %s → %s. Queuing background sync…",
+        "📬 Gmail push received: email=%s new_historyId=%s — %d project thread(s) to sync (historyId %s → %s)",
+        email,
+        new_history_id,
         len(thread_ids),
         last_history_id,
         new_history_id,
@@ -570,20 +700,22 @@ async def _run_thread_syncs_background(
     for tid in thread_ids:
         try:
             result = await sync_thread(email, tid)
+            label = result.thread_subject or "(unknown thread)"
             if result.project_page_id:
                 logger.info(
-                    "  ✓ thread %s [%s]: +%d rows, %d already present",
-                    tid,
+                    "  ✓ %r [%s]: +%d row(s), %d already present",
+                    label,
                     result.project_name,
                     result.rows_created,
                     result.rows_already_present,
                 )
             else:
                 logger.info(
-                    "  ⊘ thread %s skipped: %s",
-                    tid,
+                    "  ⊘ %r skipped: %s",
+                    label,
                     result.skipped_reason or "no project match",
                 )
+            logger.debug("  (thread_id=%s)", tid)
         except Exception:
             logger.exception("sync_thread failed for %s / %s", email, tid)
 

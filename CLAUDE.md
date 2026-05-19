@@ -49,7 +49,9 @@ After Frame: Toggl (daily aggregated hours → Notion), Fiken (accounting), meet
              cursors)
 ```
 
-Everything runs in Docker Compose. Public traffic enters via Cloudflare Tunnel at `https://hub.<domain>/…`. Fresh deployments use the one-command installer described in [docs/setup.md](docs/setup.md) (`python -m gb_automations.scripts.setup_workspace`); the long-form click-by-click guide it automates is [docs/setup-manual.md](docs/setup-manual.md). Painful lessons captured in [docs/gotchas.md](docs/gotchas.md) — **always check gotchas.md before debugging an integration issue**, most have an entry.
+Everything runs in Docker Compose. Public traffic enters via Cloudflare Tunnel at `https://hub.<domain>/…`. Fresh deployments follow the short checklist in [docs/guide.md](docs/guide.md), which fans out to [docs/google-setup.md](docs/google-setup.md), [docs/notion-setup.md](docs/notion-setup.md), and [docs/cloudflare-setup.md](docs/cloudflare-setup.md). The GCP side is one paste of [scripts/gcp-bootstrap.sh](scripts/gcp-bootstrap.sh) into Cloud Shell. Painful lessons captured in [docs/gotchas.md](docs/gotchas.md) — **always check gotchas.md before debugging an integration issue**, most have an entry.
+
+> Ignore `docs/setup.md`, `docs/setup-manual.md`, and `src/gb_automations/scripts/setup_workspace.py` (+ `_installer/`). The auto-installer was abandoned; the docs above are the real flow. Don't reference, link, or modify those files unless explicitly asked.
 
 ## Repo layout
 
@@ -79,16 +81,18 @@ src/gb_automations/
     participants.py   parse From/To/Cc, internal-vs-external classification
     phone.py          extract NO/intl phone numbers from signatures
   jobs/scheduler.py   APScheduler — renews Gmail watches
-  scripts/            one-shot CLIs (seed_users, start_watches, backfill_project_labels,
-                      pull_llm_model, reset_thread)
+  scripts/            one-shot CLIs (seed_users, start_watches, pull_llm_model, reset_thread)
 prompts/
   default.md          generic tagging prompt
   goldbox.md          Goldbox-specific tagging prompt (set TAGGING_PROMPT_PATH)
 docs/
-  setup.md            one-command installer (python -m ...scripts.setup_workspace)
-  setup-manual.md     long-form click-by-click that the installer automates (fallback)
+  guide.md            short checklist for a fresh deployment (THE entrypoint)
+  google-setup.md     GCP / Workspace steps (paired with scripts/gcp-bootstrap.sh)
+  notion-setup.md     Notion integration, DB setup, Sync-to-Gmail button
+  cloudflare-setup.md Cloudflare zone + tunnel setup
   gotchas.md          11+ entries of "this cost me hours, here's the fix"
   reference/          client brief, original Apps Script, prior Claude design chats, real logs
+  setup.md, setup-manual.md   ABANDONED auto-installer docs — ignore
 migrations/           Alembic (sync engine for migrations; app uses async)
 tests/                pytest — unit tests for cleaning/splitting/extraction/participants
 ```
@@ -138,5 +142,5 @@ curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20ti
 | "What tags can the LLM apply?" | `EMAIL_TAGS` in [config.py](src/gb_automations/config.py); prompt body in [prompts/](prompts/) |
 | "How are signatures detected so they don't bloat Drive?" | `AttachmentFingerprint` model + the `(sender, content-sha1) seen_count ≥ 2` rule |
 | "Why isn't my new integration working?" | [docs/gotchas.md](docs/gotchas.md) first, then the relevant client wrapper in `clients/` |
-| "What's the full deployment story for a fresh workspace?" | [docs/setup.md](docs/setup.md) (installer, ~15 min) or [docs/setup-manual.md](docs/setup-manual.md) (long-form, ~1 hour) |
+| "What's the full deployment story for a fresh workspace?" | [docs/guide.md](docs/guide.md) → [google-setup.md](docs/google-setup.md) + [scripts/gcp-bootstrap.sh](scripts/gcp-bootstrap.sh) + [notion-setup.md](docs/notion-setup.md) + [cloudflare-setup.md](docs/cloudflare-setup.md) |
 | "What does the client actually want long-term?" | [docs/reference/client-brief.md](docs/reference/client-brief.md) |

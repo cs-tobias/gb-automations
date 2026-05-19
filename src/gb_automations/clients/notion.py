@@ -405,6 +405,40 @@ async def find_contact_by_email(email: str) -> dict[str, Any] | None:
         return results[0] if results else None
 
 
+async def find_contact_by_name_exact(name: str) -> dict[str, Any] | None:
+    """Find a contact by exact-string Name match.
+
+    Returns the row only if exactly ONE contact has this name; returns None
+    on zero matches OR on multiple matches. Ambiguous matches are treated as
+    a miss so the caller falls through to "create new row" rather than
+    guessing which existing person to attach to — a wrong guess silently
+    attaches emails to the wrong contact, which is the failure mode we most
+    want to avoid.
+
+    Used as a fallback after `find_contact_by_email` misses, so a manually-
+    created contact row (with a Name but no Email yet) can be matched and
+    have its empty Email field filled — additively — rather than producing
+    a duplicate row.
+    """
+    if not settings.contacts_db_id:
+        raise RuntimeError("CONTACTS_DB_ID is not configured")
+    if not name.strip():
+        return None
+    async with _client() as client:
+        response = await client.post(
+            f"/databases/{settings.contacts_db_id}/query",
+            json={
+                "filter": {"property": CONTACTS_PROPS["name"], "title": {"equals": name}},
+                "page_size": 2,  # enough to detect "more than one"
+            },
+        )
+        _raise_for_status(response)
+        results = response.json().get("results", [])
+        if len(results) == 1:
+            return results[0]
+        return None
+
+
 async def create_contact(
     *,
     name: str,
@@ -467,6 +501,7 @@ async def patch_contact_enrichment(
     page_id: str,
     *,
     existing_props: dict[str, Any] | None = None,
+    email: str | None = None,
     phone: str | None = None,
     title: str | None = None,
     address: str | None = None,
@@ -474,15 +509,17 @@ async def patch_contact_enrichment(
 ) -> None:
     """Fill blank enrichment fields on an existing contact; never overwrite.
 
-    Mirrors the established phone-enrichment pattern at
-    `_upsert_contact` in `sync/sync_thread.py` — read what Notion currently
-    has, only write the fields that are empty there. Goldbox can edit any of
-    these fields manually in Notion without us clobbering their work.
+    The "additive-only, everywhere" rule: we read each property's current
+    value from Notion and only write fields that are empty there. Applies
+    to every field including Email — if Goldbox has a manually-created row
+    with a Name but no Email, this fills the Email; if they already have an
+    email there, we leave it. Same rule across phone/title/address/company.
+    Goldbox can edit any field manually without us clobbering their work.
 
     Pass `existing_props` (the `properties` dict from a prior find/query) to
     avoid an extra round-trip; otherwise this issues a fresh GET.
     """
-    if not any([phone, title, address, company_page_id]):
+    if not any([email, phone, title, address, company_page_id]):
         return
 
     if existing_props is None:
@@ -493,6 +530,8 @@ async def patch_contact_enrichment(
 
     to_write: dict[str, Any] = {}
 
+    if email and not _has_email(existing_props.get(CONTACTS_PROPS["email"])):
+        to_write[CONTACTS_PROPS["email"]] = {"email": email}
     if phone and not _has_phone(existing_props.get(CONTACTS_PROPS["phone"])):
         to_write[CONTACTS_PROPS["phone"]] = {"phone_number": phone}
     if title and not _has_rich_text(existing_props.get(CONTACTS_PROPS["title"])):
@@ -504,6 +543,10 @@ async def patch_contact_enrichment(
 
     if to_write:
         await patch_contact(page_id, to_write)
+
+
+def _has_email(prop: dict[str, Any] | None) -> bool:
+    return bool(prop and prop.get("email"))
 
 
 def _has_phone(prop: dict[str, Any] | None) -> bool:

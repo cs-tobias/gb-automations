@@ -145,6 +145,8 @@ A response with `server: cloudflare` + `cf-ray: ...` headers + your service's bo
 
 ## 8. Notion webhook payload uses `parent.type == "database"`, NOT `"database_id"`
 
+**Status:** legacy — applies to Notion's automatic database-event webhook subscriptions. The Projects → Gmail label sync was switched to a button-triggered webhook (see §13), so this filtering code is no longer in the repo. Kept here because anyone wiring up a new Notion auto-subscription elsewhere will hit the same shape.
+
 **Symptom:** `page.created` events arrive at your webhook, signatures verify, but your filter for "is this a row in the Projects database?" rejects every event.
 
 **Why:** Notion's REST API uses `parent.type == "database_id"` and stores the ID in `parent.database_id`. But Notion's *webhook* events use `parent.type == "database"` and store the ID in `parent.id`. They look almost identical — easy miss.
@@ -241,6 +243,36 @@ The `index=True` flag in the SQLAlchemy *model* (in `models.py`) is fine — tha
 **Same trap on rename:** `labels.patch` has the identical behavior. If you rename a label to a new nested path whose parents don't exist, you get a flat label with literal slashes. `update_label_name` pre-creates the parent of the new name before patching.
 
 **Sources:** [labnol "Create Nested Labels in Gmail"](https://www.labnol.org/code/19895-create-nested-gmail-labels), [GAMADV-XTD3 wiki](https://github.com/taers232c/GAMADV-XTD3/wiki/Users-Gmail-Labels) (note the `buildpath` flag — it exists *because* the bare API doesn't do this).
+
+---
+
+## 13. Notion button webhooks are NOT HMAC-signed — auth has to be a custom header
+
+**Symptom:** you build a `/webhooks/notion` handler that verifies `X-Notion-Signature` (as you did for the database-event subscription) and start getting 401s when the Notion **Button** "Send webhook" action calls it. There's no signature header in the request.
+
+**Why:** Notion's two webhook surfaces are completely different products. The integration's **Webhooks** subscription (for `page.created` etc.) HMAC-signs the body with the verification token (`X-Notion-Signature: sha256=<hex>`). The Button's **Send webhook** automation has no signing — it just sends whatever body and headers you typed into the button config. Notion's docs don't put these side-by-side, so it's easy to assume parity.
+
+**Fix:** authenticate the button via a custom header instead. We use `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` — the same env var that used to be the HMAC signing key — and compare with `hmac.compare_digest`. See [src/gb_automations/routes/webhooks.py](../src/gb_automations/routes/webhooks.py) `_verify_bearer`.
+
+**Variable-substitution gotcha:** the button's body field supports Notion variables (`{{page.id}}`) but you have to insert them via the variable picker in the UI, not type the braces by hand. Always verify in the body preview pane that the rendered value is a real UUID — if you see the literal string `{{page.id}}` arriving at the handler, the substitution didn't take.
+
+---
+
+## 14. Gmail's `users.watch()` filter can't be tightened to `Projects/*` — filtering happens in our code
+
+**Symptom:** you'd expect Gmail to only push us activity on threads tagged with a `Projects/*` label, but the watch is configured with `labelIds: ["INBOX", "SENT"]` and we get pushes for *every* inbox change (promo mail, UNREAD toggles, CATEGORY_UPDATES). Looks wrong at first glance.
+
+**Why two upstream options don't work:**
+
+1. *Pass project label IDs to `users.watch()`.* Gmail documents a ~50-label cap per watch; Goldbox does ~200 projects/year. Even rotating year-buckets blows past it eventually, and re-registering the watch on every project create adds operational fragility.
+
+2. *Watch the parent label (`Projects` or `Projects/2026`).* Gmail's hierarchy is a UI convention — every label is flat in the API. Verified live: a thread tagged `Projects/2026/Acme` carries only that leaf in its message `labelIds`, never the parent. `threads.list(labelIds=['<Projects/2026 ID>'])` returns zero results even when child-labeled threads exist. So a parent-label watch would receive *nothing*.
+
+Gmail filter rules don't save us either — they only run on incoming messages, not when the team manually files an existing email into a project.
+
+**Fix (the design we shipped):** keep the coarse `INBOX/SENT` watch and filter in `_gmail_webhook_impl` immediately after `history.list`, using the `project_labels` table (one DB query) to decide whether the push touches a label we care about. Non-project pushes silently advance the cursor and return — zero Gmail/Notion calls, zero `sync_thread` invocation, one debug-level log line. From a docker-logs perspective, irrelevant pushes become invisible.
+
+**Side effect to expect:** Pub/Sub message volume is unchanged — Gmail still pushes everything in INBOX/SENT. What changes is what *our app does* with those pushes. If you ever need to debug a push that should have synced but didn't, set the log level to DEBUG and look for `"Gmail push ignored for ..."` lines.
 
 ---
 

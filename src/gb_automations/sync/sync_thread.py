@@ -73,6 +73,7 @@ class SyncResult:
     thread_id: str
     project_name: str | None
     project_page_id: str | None
+    thread_subject: str | None = None  # subject of the first message; populated after Gmail fetch
     messages_seen: int = 0
     rows_created: int = 0
     rows_already_present: int = 0
@@ -108,18 +109,26 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
     """Sync one Gmail thread into Notion. See module docstring for behavior."""
     started = time.monotonic()
     result = SyncResult(thread_id=thread_id, project_name=None, project_page_id=None)
-    logger.info("🧵 sync_thread start: thread=%s user=%s", thread_id, user_email)
+    logger.debug("🧵 sync_thread start: thread=%s user=%s", thread_id, user_email)
 
     # 1. Fetch thread + label map from Gmail (sync API, threadpool-wrapped)
     thread = await asyncio.to_thread(gmail_client.get_thread, user_email, thread_id)
     labels = await asyncio.to_thread(gmail_client.list_labels, user_email)
     label_id_to_name = {label["id"]: label["name"] for label in labels}
     result.messages_seen = len(thread.messages)
-    logger.info("  • fetched %d message(s) from Gmail", result.messages_seen)
 
     if not thread.messages:
         result.skipped_reason = "thread has no messages"
+        logger.info("🧵 sync start: <empty thread> for %s", user_email)
         return result
+
+    result.thread_subject = thread.messages[0].subject or "(no subject)"
+    logger.info(
+        "🧵 sync start: %r (%d msg) for %s",
+        result.thread_subject,
+        result.messages_seen,
+        user_email,
+    )
 
     # 2. Pick the Notion projects for this thread. Multiple labels (dual-tagged
     # thread) all flow into the Project relation — Notion supports many-target
@@ -139,6 +148,10 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
     logger.info(
         "  • matched %d project(s): %s",
         len(project_page_ids),
+        ", ".join(repr(n) for n in project_names),
+    )
+    logger.debug(
+        "  • project page IDs: %s",
         ", ".join(f"{n!r}={p}" for n, p in zip(project_names, project_page_ids)),
     )
 
@@ -192,7 +205,7 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
 
     elapsed = time.monotonic() - started
     logger.info(
-        "🧵 sync_thread done in %.1fs: +%d rows, %d already present, %d contact(s)",
+        "🧵 sync done in %.1fs: +%d row(s), %d already present, %d contact(s)",
         elapsed,
         result.rows_created,
         result.rows_already_present,
@@ -226,7 +239,6 @@ async def _extract_history_for_thread(
     first_msg = thread.messages[0]
 
     if not has_quoted_history_hint(first_msg.plain_body):
-        logger.info("  • no quoted-history hint in first message; skipping extraction")
         return {}
 
     extracted = extract_history_blocks(
@@ -235,7 +247,6 @@ async def _extract_history_for_thread(
         parent_date=first_msg.date,
     )
     if not extracted:
-        logger.info("  • no prior emails recovered from first message's body")
         return {}
 
     logger.info("  • extracted %d prior email(s) from history (regex)", len(extracted))
@@ -503,10 +514,18 @@ async def _upsert_contact(
     company_page_id: str | None,
     session: AsyncSession,
 ) -> str | None:
-    """Find-or-create a contact. Cache first, then Notion query, then create.
+    """Find-or-create a contact. Cache first, then Notion email-match, then
+    Notion exact-name match, then create.
 
-    On cache/Notion hit, best-effort enriches any blank fields (phone, title,
-    address, company relation) — never overwrites manual edits.
+    Additive-only on any existing row: every field (Email, Phone, Title,
+    Address, Company) is only written if currently empty in Notion. We never
+    overwrite a value Goldbox put there, on any field including Name and
+    Email. See `patch_contact_enrichment`.
+
+    The name fallback exists so a manually-created contact row (a Name but
+    no Email yet) gets matched and has its Email filled additively, rather
+    than producing a duplicate row. Name match is exact-string and one-result
+    only — ambiguous matches fall through to create.
     """
     email = contact["email"]
     name = contact["name"] or contact["email"]
@@ -532,7 +551,7 @@ async def _upsert_contact(
             logger.exception("Enrichment failed for %s", email)
         return cached.notion_page_id
 
-    # 2. Notion already has this contact (e.g. created in another run)?
+    # 2. Notion already has this contact by email?
     existing = await notion_client.find_contact_by_email(email)
     if existing:
         await _cache_contact(session, email=email, page_id=existing["id"])
@@ -549,7 +568,37 @@ async def _upsert_contact(
             logger.exception("Enrichment failed for %s", email)
         return existing["id"]
 
-    # 3. Create in Notion.
+    # 3. Fall back to exact-name match. Catches the "manually-created contact
+    # row with a Name but no Email" case. Ambiguous names (multiple matches)
+    # intentionally fall through to create — guessing is worse than duplicating.
+    # We do NOT use the contact's name from the email if it's just the email
+    # address (the `name or email` fallback above), since matching by email-as-
+    # name against a real human name would mis-attach.
+    if contact["name"]:
+        existing_by_name = await notion_client.find_contact_by_name_exact(contact["name"])
+        if existing_by_name:
+            page_id = existing_by_name["id"]
+            await _cache_contact(session, email=email, page_id=page_id)
+            try:
+                # Email is passed here so the empty Email field on their
+                # manually-created row gets filled additively.
+                await notion_client.patch_contact_enrichment(
+                    page_id,
+                    existing_props=existing_by_name.get("properties", {}),
+                    email=email,
+                    phone=phone,
+                    title=title,
+                    address=address,
+                    company_page_id=company_page_id,
+                )
+            except Exception:
+                logger.exception("Enrichment failed for %s (matched by name)", email)
+            logger.info(
+                "Matched existing contact %r by name; linked email %s", contact["name"], email
+            )
+            return page_id
+
+    # 4. Create in Notion.
     created = await notion_client.create_contact(
         name=name,
         email=email,
@@ -674,10 +723,11 @@ async def _sync_message(
     # the regex row from §1.
     if extracted:
         logger.info(
-            "  → msg %s: reconstructing %d prior email(s)",
-            msg.message_id,
+            "  → %r: reconstructing %d prior email(s)",
+            msg.subject or "(no subject)",
             len(extracted),
         )
+        logger.debug("       (message_id=%s)", msg.message_id)
         c, s = await _sync_forwarded_chain(
             parent_msg=msg,
             extracted=extracted,
@@ -778,18 +828,19 @@ async def _sync_single_message(
     )
     if not cleaned_body and not has_potential_attachments:
         logger.info(
-            "    ⊘ skipping msg %s: no body content and no real attachments "
+            "    ⊘ skipping msg %r: no body content and no real attachments "
             "(signature-only forward; see extracted history)",
-            msg.message_id,
+            msg.subject or "(no subject)",
         )
+        logger.debug("       (message_id=%s)", msg.message_id)
         return (0, 0)
 
     # 4. Create the row.
     logger.info(
-        "    📝 row (gmail message) %s: %s",
-        msg.message_id,
+        "    📝 row (gmail message): %s",
         _format_extraction_preview(msg.from_field, msg.subject, cleaned_body),
     )
+    logger.debug("       (message_id=%s)", msg.message_id)
     properties = await _build_email_row_properties(
         msg=msg,
         project_page_ids=project_page_ids,
@@ -954,10 +1005,10 @@ async def _sync_extracted_message(
         display_body = inner.body
 
     logger.info(
-        "    📝 row (history) %s: %s",
-        synthetic_id,
+        "    📝 row (history): %s",
         _format_extraction_preview(inner.from_field, inner.subject, display_body),
     )
+    logger.debug("       (synthetic_id=%s)", synthetic_id)
     properties = await _build_extracted_row_properties(
         parent_msg=parent_msg,
         inner=inner,
@@ -1197,6 +1248,11 @@ async def _assemble_row_props(
         )
         if tags:
             logger.info("    🏷  tagged: %s", ", ".join(tags))
+        else:
+            # The LLM ran (timing logged in clients/llm.py) but chose no tag
+            # from the taxonomy. Worth surfacing so it doesn't look like
+            # tagging was silently skipped or quietly failed.
+            logger.info("    🏷  no tag matched")
 
     from_contact_id = contact_ids.get(from_email) if from_email else None
     to_contact_ids = [contact_ids[e] for e in to_emails if e in contact_ids]

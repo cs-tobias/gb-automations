@@ -19,8 +19,6 @@ On the **Public Hostnames** step, click **Add a public hostname**:
    - URL: `api:8000`
 
 6. https://www.notion.so/profile/integrations -> new integration -> "Copy the **Internal Integration Secret** (starts with `ntn_…`) → paste into `.env` as `NOTION_TOKEN`"
-2. Open the **Webhooks** tab → **+ Create a subscription**
-3. **Endpoint URL**: `https://hub.{your-domain}/webhooks/notion`
-4. **Events**: tick **`page.created`** AND **`page.properties_updated`**
-5. Click **Save**
+7. Set `NOTION_WEBHOOK_SECRET` in `.env` to a long random string (`openssl rand -hex 32`); reload api.
+8. Add the **Sync to Gmail** button to the Projects DB per [docs/notion-setup.md](notion-setup.md) Part 4 — it POSTs to `/webhooks/notion` with that secret as a bearer token on each click.
 

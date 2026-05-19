@@ -149,6 +149,18 @@ def find_label_by_name(user_email: str, name: str) -> dict[str, str] | None:
     return None
 
 
+def get_label(user_email: str, label_id: str) -> dict[str, Any]:
+    """Fetch a single label by ID. Raises HttpError(404) if it doesn't exist.
+
+    Cheaper than list_labels when we just want one — used by the button handler
+    to detect Gmail-side renames (live label name diverged from what Notion
+    expects) without scanning every label in the mailbox.
+    """
+    logger.debug("gmail → labels.get(user=%s, id=%s)", user_email, label_id)
+    service = gmail_for(user_email)
+    return service.users().labels().get(userId="me", id=label_id).execute()
+
+
 def _create_single_label(service: Any, name: str) -> dict[str, Any]:
     """One labels.create call — does NOT pre-create parents. Internal."""
     return (
@@ -171,6 +183,12 @@ def create_label(user_email: str, name: str) -> dict[str, Any]:
 
     Idempotent: if the full label already exists, returns it without API calls.
 
+    The returned dict carries an extra `_created` boolean: True when this call
+    actually minted the leaf label, False when the leaf was already present
+    (the idempotent no-op path). Callers use this to log "created" vs.
+    "already present" honestly instead of counting every successful call as
+    a create.
+
     Gmail uses `/` as the hierarchy separator in label names, BUT
     `users.labels.create` does NOT auto-create parent labels — if you POST
     "Projects/2026/Acme" without "Projects" and "Projects/2026" existing
@@ -184,18 +202,22 @@ def create_label(user_email: str, name: str) -> dict[str, Any]:
     # 3-level path doesn't fan out into 3 separate labels.list calls.
     existing_by_name = {label["name"]: label for label in list_labels(user_email)}
     if name in existing_by_name:
-        return existing_by_name[name]
+        return {**existing_by_name[name], "_created": False}
 
     service = gmail_for(user_email)
     parts = name.split("/")
     last_label: dict[str, Any] | None = None
+    leaf_created = False
     for i in range(1, len(parts) + 1):
         prefix = "/".join(parts[:i])
+        is_leaf = i == len(parts)
         if prefix in existing_by_name:
             last_label = existing_by_name[prefix]
             continue
         try:
             last_label = _create_single_label(service, prefix)
+            if is_leaf:
+                leaf_created = True
         except HttpError as err:
             # 409 = a concurrent webhook just created this prefix. Re-fetch
             # the labels and continue — treat as success, not a failure.
@@ -212,7 +234,7 @@ def create_label(user_email: str, name: str) -> dict[str, Any]:
         existing_by_name[prefix] = last_label  # type: ignore[assignment]
 
     assert last_label is not None  # parts is non-empty so the loop runs at least once
-    return last_label
+    return {**last_label, "_created": leaf_created}
 
 
 def update_label_name(user_email: str, label_id: str, new_name: str) -> dict[str, Any]:

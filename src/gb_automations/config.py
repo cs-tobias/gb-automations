@@ -28,8 +28,9 @@ class Settings(BaseSettings):
     # display Name comes from the sender's signature when available, falling
     # back to a capitalized domain stem.
     companies_db_id: str = ""
-    # Optional: if set, the Notion webhook only acts on pages parented to this database.
-    # If empty, every page.created event the integration sees is treated as a project.
+    # Optional: if set, the Notion button webhook rejects clicks from pages whose
+    # parent isn't this database. If empty, the parent check is skipped (the button
+    # is only placed on the Projects DB template anyway).
     projects_db_id: str = ""
 
     # Webhook auth secrets
@@ -59,16 +60,20 @@ class Settings(BaseSettings):
     # so we don't need the heavyweight long-output budgets the LLM splitter had.
     ollama_base_url: str = "http://ollama:11434"
     ollama_model: str = "llama3.1:8b-instruct-q4_K_M"
-    # Tagging is ~10 output tokens — short. 30s covers cold model load.
-    ollama_timeout_s: float = 30.0
+    # Tagging is ~10 output tokens, normally < 5s. We pad to 5 minutes because
+    # the host machine can be slow (a dev laptop or a shared box) — under that
+    # condition we'd rather wait than abort. Anything past 5 min is almost
+    # certainly a stuck Ollama, not slow inference, and *should* fail.
+    ollama_timeout_s: float = 300.0
 
     # History-split fallback runs only when the regex splitter under-splits an
     # exotic forward (rare). Output is larger (one JSON object per message in
     # the chain) and the prompt is bigger, so the call legitimately needs
-    # longer than tagging. Default 90s. Sync_thread already runs the fallback
-    # in the background sync, so a slower one-shot call doesn't block webhook
-    # ack.
-    ollama_split_timeout_s: float = 90.0
+    # longer than tagging. Same 5-minute reasoning as ollama_timeout_s — wait
+    # out a slow box, but bail on a genuinely stuck one. Sync_thread already
+    # runs the fallback in the background sync, so a slower one-shot call
+    # doesn't block webhook ack.
+    ollama_split_timeout_s: float = 300.0
 
     # Tagging via LLM classify(). ON by default — adds ~1-2s per Notion row
     # (one classify call against Ollama). Set TAGGING_ENABLED=false in .env to
@@ -145,30 +150,38 @@ EMAILS_PROPS = {
     "files": "Files",
 }
 
+# Property names match Goldbox's existing Kontaktpersoner DB. Change the
+# strings here if the DB is renamed in Notion; code references everywhere
+# go through this dict.
 CONTACTS_PROPS = {
-    "name": "Name",
-    "email": "Email",
-    "phone": "Phone",
+    "name": "Navn",
+    "email": "E-post",
+    "phone": "Telefon",
     # Pulled from the sender's signature (title line below the name).
-    "title": "Title",
+    "title": "Tittel",
     # Joined street + postal/city line from the signature.
-    "address": "Address",
-    # Single-relation to the Companies DB (replaces old free-text Company).
-    "company": "Company",
-    # Multi-select managed manually by Goldbox — mirrors project status,
-    # which lives outside our automations. Code never writes this property.
-    "company_status": "Company Status",
+    "address": "Adresse",
+    # Single-relation to the Companies DB.
+    "company": "Kunder",
+    # Managed manually by Goldbox — mirrors project status, which lives
+    # outside our automations. Code never writes this property.
+    "company_status": "Kundestatus",
 }
 
 
-# Companies DB. Dedup key is the email domain (rich_text) so that Goldbox can
-# freely rename the title — "Olavthon" → "Thon Eiendom" — without breaking the
-# upsert path. Contacts relate IN to Company via CONTACTS_PROPS["company"];
-# the inverse relation on this DB ("Contacts") is auto-maintained by Notion.
+# Companies DB. Dedup key is the email domain ("Nettside" in Norwegian),
+# stored as rich_text so Goldbox can freely rename the title — "Olavthon" →
+# "Thon Eiendom" — without breaking the upsert path. Contacts relate IN to
+# Company via CONTACTS_PROPS["company"]; the inverse relation on this DB
+# ("Kontaktpersoner") is auto-maintained by Notion.
+#
+# Note: Goldbox sees "Nettside" but the value is the email domain
+# (motionindex.io) rather than a full URL (https://motionindex.com). That's
+# what we can reliably derive from every email; team is aware.
 COMPANIES_PROPS = {
-    "name": "Name",
-    "domain": "Domain",
-    "contacts": "Contacts",
+    "name": "Navn",
+    "domain": "Nettside",
+    "contacts": "Kontaktpersoner",
 }
 
 

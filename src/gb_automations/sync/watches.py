@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import SyncCursor, User
+from gb_automations.models import ProjectLabel, SyncCursor, User
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,24 @@ GMAIL_CURSOR_SOURCE_PREFIX = "gmail_history:"
 
 def cursor_source_for(email: str) -> str:
     return f"{GMAIL_CURSOR_SOURCE_PREFIX}{email.lower()}"
+
+
+async def fetch_project_label_ids_for_user(email: str) -> set[str]:
+    """Return the set of Gmail label IDs in this user's mailbox that map to a
+    Notion project. Cheap DB-only lookup; used by the Gmail webhook to filter
+    pushes before any external API call.
+
+    Gmail's watch filter can't be tightened to project labels directly (the
+    50-label cap can't hold a year of Goldbox projects, and parent labels
+    don't propagate to children in the API), so we accept Gmail's coarse
+    INBOX/SENT push and filter against this set as the first thing the
+    webhook does.
+    """
+    async with SessionLocal() as session:
+        rows = await session.execute(
+            select(ProjectLabel.gmail_label_id).where(ProjectLabel.user_email == email)
+        )
+        return {row[0] for row in rows}
 
 
 async def start_watch_for_user(user_email: str) -> dict:

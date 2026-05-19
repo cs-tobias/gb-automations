@@ -166,18 +166,15 @@ docker compose up -d --force-recreate api
 
 > `docker compose restart` does NOT reload `.env` — must use `up -d --force-recreate`.
 
-## 10. Register the Notion webhook *(3 min)*
+## 10. Add the Notion "Sync to Gmail" button *(3 min)*
 
-1. https://www.notion.so/profile/integrations → `gb-automations` → **Webhooks** → Add subscription:
-   - Endpoint: `https://hub.goldbox.no/webhooks/notion`
-   - Events: **`page.created`** AND **`page.properties_updated`** (the second is what propagates project renames into Gmail label renames)
-2. Notion sends a verification POST to your endpoint → log shows the token:
-   ```bash
-   docker compose logs api | grep "Notion webhook verification"
-   ```
-3. Paste the `secret_…` token into Notion's "Verification token" field → confirm.
-4. Paste the **same** token into `.env` as `NOTION_WEBHOOK_SECRET`.
-5. Recreate api: `docker compose up -d --force-recreate api`
+The Projects → Gmail label sync is driven by a Notion **Button** property that fires a webhook on click. No automatic Notion subscription is used; the button is the only trigger.
+
+1. Set `NOTION_WEBHOOK_SECRET` in `.env` to a long random string (e.g. `openssl rand -hex 32`).
+2. Recreate api so it picks up the secret: `docker compose up -d --force-recreate api`
+3. Follow [docs/notion-setup.md](notion-setup.md) Part 4 — add a `Sync to Gmail` button to the Projects DB that POSTs to `https://hub.{your-domain}/webhooks/notion` with body `{"page_id": "{{page.id}}"}` and header `Authorization: Bearer <NOTION_WEBHOOK_SECRET>`.
+
+Clicking the button on any project (new or legacy) creates the Gmail label in every active mailbox; clicking again after a title edit renames it. Idempotent.
 
 ## 11. Seed users + bootstrap Gmail watches *(2 min)*
 
@@ -196,13 +193,7 @@ docker compose exec api python -m gb_automations.scripts.start_watches
 
 Should print one `historyId` + `expiration` per user. APScheduler will keep watches renewed automatically.
 
-Backfill the project ↔ Gmail-label mapping (lets future Notion project renames propagate into Gmail):
-
-```bash
-docker compose exec api python -m gb_automations.scripts.backfill_project_labels
-```
-
-This walks every project × every seeded user, finds the matching Gmail label by name, and stores the link by ID. Running it once after first deploy is enough — new projects created in Notion afterwards register themselves automatically when their `page.created` webhook fires.
+Project ↔ Gmail-label mapping is now driven by the **Sync to Gmail** button on each Projects DB row — see [docs/notion-setup.md](notion-setup.md) Part 4. For existing projects, open each one and click the button once; that creates the Gmail label across every active mailbox and records the mapping. New projects get one click on creation and renames are picked up by clicking the button again.
 
 ## 11b. Pull the local LLM model *(5–10 min, one-time)*
 
@@ -270,7 +261,7 @@ Both api + cloudflared are managed by compose with `restart: unless-stopped`, so
 | Gmail watches expired (>7 days outage) | `docker compose exec api python -m gb_automations.scripts.start_watches` |
 | Need to backfill a missed thread | `docker compose exec api python -m gb_automations.sync.sync_one --email USER --thread THREAD_ID` |
 | Want to re-sync from scratch (iterating on extraction / tagging / files) | Delete the relevant Notion rows yourself, then `docker compose exec api python -m gb_automations.scripts.reset_thread` (no args = wipe all threads + signature fingerprints; pass `--thread ID` for a single thread). Reapply the Gmail label to trigger a fresh sync. |
-| Project rename in Notion didn't update Gmail label | Run `docker compose exec api python -m gb_automations.scripts.backfill_project_labels`, then rename again — most likely the project was created before the rename feature shipped (no mapping row) |
+| Project rename in Notion didn't update Gmail label | Click the project's **Sync to Gmail** button — it's idempotent and reconciles renames + missing per-user mappings in one shot |
 | Email tagging stopped working | `curl https://hub.goldbox.no/debug/llm?prompt=test` — if it errors, `docker compose restart ollama`. If the response is `{"tags": []}` for everything, re-pull the model: `docker compose exec api python -m gb_automations.scripts.pull_llm_model` |
 | Attachments not uploading to Drive (`accessNotConfigured` / `Drive API has not been used in project`) | Enable the Drive API for the SA's GCP project: open the link in the error message (or https://console.cloud.google.com/apis/library/drive.googleapis.com → select the right project → Enable). Wait ~30s, retry. This is separate from DWD authorization — DWD lets the SA impersonate users for the scope; API enablement lets the project call the API at all. |
 | Attachments not uploading to Drive (other auth errors) | Check logs for `drive ←` lines. If absent or erroring on auth, the Drive scope is missing from DWD — go to admin.google.com → Domain-Wide Delegation → edit the client → ensure `https://www.googleapis.com/auth/drive` is in the scope list (comma-separated with Gmail), save, wait ~5 min for propagation, then re-sync. |

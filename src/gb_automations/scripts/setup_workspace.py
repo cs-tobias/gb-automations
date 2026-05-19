@@ -30,6 +30,7 @@ Prerequisites on the host (the installer checks and tells you if missing):
 
 from __future__ import annotations
 
+import secrets
 import shutil
 import subprocess
 import sys
@@ -598,9 +599,9 @@ def step_16_notion_dbs(s: dict[str, Any]) -> None:
         title = "".join(p.get("plain_text", "") for p in db.get("title", []))
         prompts.info(f"  {db['id']}  — {title or '(untitled)'}")
 
-    projects_id = notion.find_db_id_by_title(dbs, ["Project", "Projects"])
-    contacts_id = notion.find_db_id_by_title(dbs, ["Contact", "Contacts"])
-    companies_id = notion.find_db_id_by_title(dbs, ["Company", "Companies"])
+    projects_id = notion.find_db_id_by_title(dbs, ["Project", "Projects", "Prosjekt", "Prosjekter"])
+    contacts_id = notion.find_db_id_by_title(dbs, ["Contact", "Contacts", "Kontaktperson", "Kontaktpersoner"])
+    companies_id = notion.find_db_id_by_title(dbs, ["Company", "Companies", "Kunde", "Kunder"])
 
     if not projects_id:
         projects_id = prompts.ask("Could not auto-detect Projects DB; paste its ID")
@@ -632,135 +633,49 @@ def step_16_notion_dbs(s: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------- #
-# Step 17 — Notion webhook + verification token
+# Step 17 — Notion "Sync to Gmail" button
 # ---------------------------------------------------------------------------- #
 
 def step_17_notion_webhook(s: dict[str, Any]) -> None:
-    prompts.step(17, TOTAL_STEPS, "Register Notion webhook + capture verification token")
+    prompts.step(17, TOTAL_STEPS, "Add the Notion 'Sync to Gmail' button to the Projects DB")
 
     if s.get("notion_webhook_done"):
-        prompts.ok("Notion webhook already wired in prior run")
+        prompts.ok("Notion button already configured in prior run")
         return
 
+    # We need a bearer secret to put into the button's Authorization header.
+    # Generate one if .env doesn't have it yet so the operator has a value to paste.
+    env_path = _repo_root() / ".env"
+    current = env.load(env_path).get("NOTION_WEBHOOK_SECRET", "").strip()
+    if not current:
+        current = secrets.token_hex(32)
+        env.set_values(env_path, {"NOTION_WEBHOOK_SECRET": current})
+        _run_compose(["up", "-d", "--force-recreate", "api"], timeout=180)
+        prompts.ok("Generated NOTION_WEBHOOK_SECRET and recreated api")
+
     prompts.browser_stop(
-        title="Notion webhook",
-        url="https://www.notion.so/profile/integrations",
+        title="Notion 'Sync to Gmail' button",
+        url="https://www.notion.so",
         instructions=[
-            "Open the gb-automations integration → Webhooks → '+ Add subscription'.",
-            f"Endpoint: https://{s['hostname']}/webhooks/notion",
-            "Events: page.created AND page.properties_updated.",
-            "Save.  Notion sends a verification POST — we'll capture the token from logs.",
+            "Open the Projects database.",
+            "Add a Button property named 'Sync to Gmail'.",
+            "Edit automation → + Add step → Send webhook.",
+            f"URL: https://{s['hostname']}/webhooks/notion",
+            "Method: POST",
+            'Body (use the variable picker for {{page.id}}): {"page_id": "{{page.id}}"}',
+            "Headers:",
+            f"  Authorization: Bearer {current}",
+            "  Content-Type: application/json",
+            "Save. Click the button on one test row to verify it works.",
         ],
     )
 
-    prompts.info("Tailing api logs for the `Notion webhook verification` line…")
-    token = _tail_for_verification_token(_repo_root(), timeout_s=300.0)
-    if not token:
-        prompts.die(
-            "Didn't see a verification token in api logs within 5 min. Re-check:\n"
-            "  - The endpoint URL is exactly https://{hostname}/webhooks/notion\n"
-            "  - api logs: docker compose logs api | grep -i notion"
-        )
-    prompts.ok(f"Captured verification token ({token[:12]}…)")
-
-    prompts.info("Paste this token into Notion's 'Verification token' field, then confirm:")
-    print()
-    print(f"    {token}")
-    print()
-    prompts.press_enter("After pasting + confirming in Notion")
-
-    env.set_values(_repo_root() / ".env", {"NOTION_WEBHOOK_SECRET": token})
-    _run_compose(["up", "-d", "--force-recreate", "api"], timeout=180)
     s["notion_webhook_done"] = True
     state.save(_repo_root(), s)
 
 
-def _tail_for_verification_token(repo: Path, timeout_s: float) -> str | None:
-    """Stream `docker compose logs -f api` and pluck the `secret_…` token.
-
-    Notion's verification POST is logged once per registration. We start the
-    tail BEFORE the operator clicks Save in step 17 (well, technically we
-    start after — there's a small race, but `docker compose logs` reads from
-    container start by default with no --since flag, so we'd see it even if
-    it landed during the previous step).
-    """
-    cmd = ["docker", "compose", "logs", "--no-color", "--since=10m", "api"]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    deadline = time.monotonic() + timeout_s
-    needle = "Notion webhook verification token"
-    found: str | None = None
-    try:
-        assert proc.stdout is not None
-        # First pass: drain the existing buffer.
-        for line in proc.stdout:
-            if needle in line:
-                found = _extract_secret(line)
-                if found:
-                    return found
-            if time.monotonic() > deadline:
-                break
-        # If we drained without finding it, switch to follow mode.
-        proc.terminate()
-        proc.wait(timeout=5)
-        follow = subprocess.Popen(
-            ["docker", "compose", "logs", "-f", "--no-color", "--since=10m", "api"],
-            cwd=repo,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        try:
-            assert follow.stdout is not None
-            while time.monotonic() < deadline:
-                line = follow.stdout.readline()
-                if not line:
-                    time.sleep(0.5)
-                    continue
-                if needle in line:
-                    found = _extract_secret(line)
-                    if found:
-                        return found
-            return None
-        finally:
-            follow.terminate()
-            try:
-                follow.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                follow.kill()
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-    return found
-
-
-def _extract_secret(line: str) -> str | None:
-    """Find a `secret_…` token in a log line."""
-    idx = line.find("secret_")
-    if idx < 0:
-        return None
-    tail = line[idx:].strip()
-    # Token is alphanumeric + underscore, no spaces. Stop at first whitespace.
-    end = 0
-    while end < len(tail) and (tail[end].isalnum() or tail[end] == "_"):
-        end += 1
-    token = tail[:end]
-    return token if len(token) > len("secret_") + 8 else None
-
-
 # ---------------------------------------------------------------------------- #
-# Step 18 — seed users, start watches, backfill labels, pull LLM model
+# Step 18 — seed users, start watches, pull LLM model
 # ---------------------------------------------------------------------------- #
 
 def step_18_seed(s: dict[str, Any]) -> None:
@@ -775,7 +690,6 @@ def step_18_seed(s: dict[str, Any]) -> None:
 
     _exec_in_api(["python", "-m", "gb_automations.scripts.seed_users", *emails])
     _exec_in_api(["python", "-m", "gb_automations.scripts.start_watches"])
-    _exec_in_api(["python", "-m", "gb_automations.scripts.backfill_project_labels"])
 
     if prompts.confirm(
         "Pre-pull the ~5GB Ollama LLM model now with visible progress? "

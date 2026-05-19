@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from gb_automations.db import Base
@@ -141,6 +141,13 @@ class ProjectLabel(Base):
     current_name: Mapped[str] = mapped_column(String(255), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # PK is (notion_page_id, user_email) in that order, so single-column lookups
+    # by user_email can't use it. The Gmail webhook filters every push against
+    # `WHERE user_email = ?` — keep that hot path on a real index.
+    __table_args__ = (
+        Index("ix_project_labels_user_email", "user_email"),
     )
 
 

@@ -92,8 +92,8 @@ The installer prompts for this string in step 9. Save it in your password manage
 | 14 | Wait for `https://hub.{domain}/health` to return 200 | HTTP poll |
 | 15 | **BROWSER STOP** — Notion integration creation + DB sharing | poll `/v1/search` |
 | 16 | Auto-discover Notion DB IDs (Projects, Contacts, Emails parent page); write to `.env`; recreate api | API |
-| 17 | **BROWSER STOP** — Register Notion webhook; capture verification token from logs | log-tail |
-| 18 | Prompt for Workspace users to seed; run `seed_users`, `start_watches`, `backfill_project_labels`, `pull_llm_model` | container exec |
+| 17 | **BROWSER STOP** — Add the "Sync to Gmail" button to the Projects DB ([docs/notion-setup.md](notion-setup.md) Part 4) | manual |
+| 18 | Prompt for Workspace users to seed; run `seed_users`, `start_watches`, `pull_llm_model` | container exec |
 | 19 | Smoke test, print summary | HTTP |
 
 Total: typically ~15 minutes of clicks + ~5 minutes of background waiting (mostly Cloudflare zone activation and the LLM model pull).
@@ -158,7 +158,7 @@ Recovery commands (run on the host):
 | Gmail watches expired (>7 days outage) | `docker compose exec api python -m gb_automations.scripts.start_watches` |
 | Need to backfill a missed thread | `docker compose exec api python -m gb_automations.sync.sync_one --email USER --thread THREAD_ID` |
 | Want to re-sync from scratch | Delete the relevant Notion rows yourself, then `docker compose exec api python -m gb_automations.scripts.reset_thread`. Reapply the Gmail label to trigger a fresh sync. |
-| Project rename in Notion didn't update Gmail label | `docker compose exec api python -m gb_automations.scripts.backfill_project_labels`, then rename again |
+| Project rename in Notion didn't update Gmail label | Click the project's **Sync to Gmail** button again — it's idempotent and reconciles renames |
 | Email tagging stopped working | `docker compose restart ollama && docker compose restart api` (api auto-pulls the model on boot if missing); if still broken, re-pull manually: `docker compose exec api python -m gb_automations.scripts.pull_llm_model` |
 | Container won't pick up new `.env` | `docker compose up -d --force-recreate api` (not `restart`) |
 | Service account key compromised | Rotate: generate new JSON in GCP → swap `secrets/gcp-service-account.json` → restart api |
