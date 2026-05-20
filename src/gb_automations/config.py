@@ -142,31 +142,33 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-# Names of the properties on the Emails database. Change here if you renamed them
-# in Notion. Property types expected:
-#   subject       (title)
-#   thread_id     (rich_text)
-#   message_id    (rich_text)        ← dedup key
-#   project       (relation → Projects)
-#   from_contact  (relation → Contacts, single)   ← the sender
-#   to_contacts   (relation → Contacts, multi)    ← To recipients
-#   cc_contacts   (relation → Contacts, multi)    ← Cc recipients
-#   date          (date)
-#   tags          (multi_select)
-#   body          (rich_text)        ← full cleaned message body, chunked
-#   files         (files)            ← attachments uploaded to Drive, linked here
+# Names of the properties on the Emails database. Norwegian to match the other
+# Goldbox DBs (Kontaktpersoner, Kunder). Change here if you renamed them in
+# Notion. Property types expected:
+#   subject       Emne        (title)
+#   thread_id     Thread ID   (rich_text)
+#   message_id    Message ID  (rich_text)        ← dedup key
+#   project       Prosjekt    (relation → Projects)
+#   from_contact  Fra         (relation → Contacts, single)   ← the sender
+#   to_contacts   Til         (relation → Contacts, multi)    ← To recipients
+#   cc_contacts   Kopi        (relation → Contacts, multi)    ← Cc recipients
+#   date          Dato        (date)
+#   tags          Tagger      (multi_select)
+#   body          Melding     (rich_text)        ← full cleaned message body, chunked
+#   files         Vedlegg     (files)            ← attachments uploaded to Drive, linked here
 EMAILS_PROPS = {
-    "subject": "Subject",
+    "subject": "Emne",
+    # Technical Gmail IDs — kept in English; never surfaced to the team in views.
     "thread_id": "Thread ID",
     "message_id": "Message ID",
-    "project": "Project",
-    "from_contact": "From",
-    "to_contacts": "To",
-    "cc_contacts": "Cc",
-    "date": "Date",
-    "tags": "Tags",
-    "body": "Body",
-    "files": "Files",
+    "project": "Prosjekt",
+    "from_contact": "Fra",
+    "to_contacts": "Til",
+    "cc_contacts": "Kopi",
+    "date": "Dato",
+    "tags": "Tagger",
+    "body": "Melding",
+    "files": "Vedlegg",
 }
 
 # Property names match Goldbox's existing Kontaktpersoner DB. Change the

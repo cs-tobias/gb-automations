@@ -1,8 +1,8 @@
 """Year-partitioned Emails DB router.
 
-At Goldbox volume (~7k emails/year), a single Notion `Emails` database starts
+At Goldbox volume (~7k emails/year), a single Notion `E-post` database starts
 to feel slow past year 3 and gets actively painful by year 5+. This module
-partitions Emails by calendar year: `Emails 2024`, `Emails 2025`, `Emails 2026`,
+partitions Emails by calendar year: `E-post 2024`, `E-post 2025`, `E-post 2026`,
 etc., each with the same schema. Threads that span years stay linked via the
 `Thread ID` text property (same value across year DBs) so Notion linked-DB
 views can group them.
@@ -13,7 +13,7 @@ How the resolution works for `get_emails_db_for_year(2026)`:
   2. Postgres cache (`emails_db_cache` table) — populated by prior runs and
      by other workers. On hit, also fills the in-process cache.
   3. Notion search — list child databases under `EMAILS_PARENT_PAGE_ID` and
-     match by title `Emails YYYY`. On hit, persist to Postgres + in-process.
+     match by title `E-post YYYY`. On hit, persist to Postgres + in-process.
   4. Create — POST `/databases` with the canonical schema cloned from
      `build_emails_db_schema()`. Persist on success.
 
@@ -41,8 +41,14 @@ _IN_PROCESS_CACHE: dict[int, str] = {}
 
 
 def _emails_db_title(year: int) -> str:
-    """Canonical title for a year DB. Used for both search and create."""
-    return f"Emails {year}"
+    """Canonical title for a year DB. Used for both search and create.
+
+    Norwegian to match the other Goldbox DBs (Kontaktpersoner, Kunder). Note:
+    existing `Emails YYYY` DBs created before this rename won't be found by the
+    Notion-search fallback anymore, but the Postgres `emails_db_cache` keys by
+    year (not title), so already-resolved years keep working untouched.
+    """
+    return f"E-post {year}"
 
 
 def _normalize_id(notion_id: str) -> str:

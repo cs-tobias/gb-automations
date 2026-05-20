@@ -37,8 +37,8 @@ def _build(
 
 
 def test_emails_db_title_is_year_prefixed():
-    assert _emails_db_title(2024) == "Emails 2024"
-    assert _emails_db_title(2030) == "Emails 2030"
+    assert _emails_db_title(2024) == "E-post 2024"
+    assert _emails_db_title(2030) == "E-post 2030"
 
 
 def test_normalize_id_strips_dashes_and_lowercases():

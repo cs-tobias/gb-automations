@@ -23,9 +23,21 @@ Kontaktpersoner (relation → Kontaktpersoner).
 
 ---
 
-## Emails YYYY (Emails DB, year-partitioned)
+## E-post YYYY (Emails DB, year-partitioned)
 
-Auto-created by code
+Auto-created by code (title `E-post 2026`, one DB per year).
+
+Emne (title)
+Melding (rich_text)
+Fra (relation → Kontaktpersoner)
+Til (relation → Kontaktpersoner)
+Kopi (relation → Kontaktpersoner)
+Dato (date)
+Vedlegg (files)
+Tagger (multi_select)
+Prosjekt (relation → Projects)
+Thread ID (rich_text)
+Message ID (rich_text)
 
 ---
 
