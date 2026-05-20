@@ -11,6 +11,25 @@ class Settings(BaseSettings):
     workspace_domain: str = ""
     google_service_account_json: str = ""
 
+    # Mailboxes the backend syncs, comma-separated, e.g.
+    #   SYNCED_MAILBOXES=petter@goldbox.no,anna@goldbox.no
+    # This is the single source of truth for the `users` table: on startup the
+    # app reconciles users to exactly match this list (listed → active, any
+    # other previously-active user → inactive). Declarative so a fresh
+    # `docker compose up` self-seeds — no manual seed_users step. Edit the list
+    # in .env and `--force-recreate api` to add/remove a mailbox.
+    synced_mailboxes: str = ""
+
+    @property
+    def synced_mailbox_list(self) -> list[str]:
+        """Parsed, lowercased, de-duplicated mailbox emails (order preserved)."""
+        seen: dict[str, None] = {}
+        for raw in self.synced_mailboxes.split(","):
+            email = raw.strip().lower()
+            if email:
+                seen.setdefault(email, None)
+        return list(seen)
+
     # Notion integration
     notion_token: str = ""
     notion_api_version: str = "2022-06-28"

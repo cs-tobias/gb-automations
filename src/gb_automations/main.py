@@ -124,14 +124,63 @@ async def _ensure_model_present() -> None:
         log.warning("Auto-pull of Ollama model failed: %s", err)
 
 
+async def _seed_and_watch_mailboxes() -> None:
+    # Make a fresh `docker compose up` fully self-sufficient: reconcile the
+    # `users` table to SYNCED_MAILBOXES, then start their Gmail watches. Both
+    # are idempotent and best-effort — on an already-running box this just
+    # confirms the existing state. Without this, a brand-new DB volume (e.g. a
+    # freshly-cloned machine) has zero users and zero watches, so nothing
+    # syncs until someone runs the scripts by hand.
+    log = logging.getLogger(__name__)
+
+    from gb_automations.scripts.seed_users import reconcile_users
+
+    wanted = settings.synced_mailbox_list
+    if not wanted:
+        log.warning(
+            "SYNCED_MAILBOXES is empty — no mailboxes will be synced. "
+            "Set it in .env (comma-separated) and `--force-recreate api`."
+        )
+
+    try:
+        result = await reconcile_users(wanted)
+        log.info(
+            "Mailboxes reconciled: active=%s deactivated=%s",
+            result["active"] or "(none)",
+            result["deactivated"] or "(none)",
+        )
+    except Exception:
+        log.exception("Mailbox reconcile failed — sync may not work until fixed")
+        return
+
+    if not settings.pubsub_topic:
+        log.warning(
+            "PUBSUB_TOPIC not set — skipping Gmail watch startup. "
+            "No emails will push until Pub/Sub is configured (see google-setup.md)."
+        )
+        return
+
+    from gb_automations.sync.watches import renew_all_watches
+
+    try:
+        results = await renew_all_watches()
+        ok = [r["email"] for r in results if r.get("ok")]
+        failed = [r["email"] for r in results if not r.get("ok")]
+        log.info("Gmail watches started: ok=%s failed=%s", ok or "(none)", failed or "(none)")
+    except Exception:
+        log.exception("Starting Gmail watches failed — emails won't push until renewed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_scheduler()
     pull_task = asyncio.create_task(_ensure_model_present())
+    seed_task = asyncio.create_task(_seed_and_watch_mailboxes())
     try:
         yield
     finally:
         pull_task.cancel()
+        seed_task.cancel()
         shutdown_scheduler()
 
 
