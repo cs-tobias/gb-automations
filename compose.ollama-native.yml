@@ -1,0 +1,13 @@
+# Native-ollama override: the api talks to a host-native `ollama serve`
+# via host.docker.internal. No ollama container runs.
+#
+# Activated by setting in .env:
+#   COMPOSE_FILE=docker-compose.yml:compose.ollama-native.yml
+#
+# On the host (Mac), start ollama with:
+#   OLLAMA_HOST=0.0.0.0:11434 ollama serve
+
+services:
+  api:
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"

@@ -62,6 +62,10 @@ class GmailAttachment:
     # a SINGLE Gmail message means a signature decoration repeated per
     # quoted block (Outlook keeps the inline logo in every reply level).
     # Real photo attachments are referenced exactly once.
+    inline_data: str | None = None  # base64url body bytes for inline parts that
+    # Gmail returns with the data inline (in body.data) and NO attachmentId.
+    # When set, the upload path decodes these directly instead of calling
+    # messages.attachments.get (which needs an attachmentId we don't have).
 
 
 @dataclass
@@ -128,6 +132,19 @@ def get_attachment_bytes(user_email: str, message_id: str, attachment_id: str) -
     )
     data = response.get("data", "")
     return base64.urlsafe_b64decode(data) if data else b""
+
+
+def decode_inline_data(data: str) -> bytes:
+    """Decode the base64url `body.data` of an inline part into raw bytes.
+
+    Used for inline attachments Gmail returns with the bytes embedded (no
+    separate attachmentId to fetch). Tolerant of missing padding, mirroring
+    `_decode_base64url` for text bodies.
+    """
+    if not data:
+        return b""
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
 
 
 # ============================================================
@@ -384,26 +401,69 @@ def _extract_body_and_attachments(
     html_parts: list[str] = []
     attachments: list[GmailAttachment] = []
 
+    inline_counter = [0]  # mutable cell — bump when synthesizing a filename.
+
     def walk(part: dict[str, Any]) -> None:
         mime = part.get("mimeType", "")
         filename = part.get("filename") or ""
         body = part.get("body", {})
+        # Compute the Content-ID for EVERY part, not just named ones — Outlook
+        # inline images often arrive with a Content-ID header but an empty
+        # filename, and we need the cid both to log them and to capture them.
+        part_headers = _headers_dict(part.get("headers", []))
+        raw_cid = part_headers.get("Content-ID") or part_headers.get("Content-Id") or ""
+        content_id = _normalize_content_id(raw_cid)
+        attachment_id = body.get("attachmentId")
+        data = body.get("data")
 
-        if filename:
-            part_headers = _headers_dict(part.get("headers", []))
-            raw_cid = part_headers.get("Content-ID") or part_headers.get("Content-Id") or ""
+        logger.debug(
+            "MIME part: mime=%s filename=%r content_id=%r size=%s "
+            "has_attachment_id=%s has_inline_data=%s",
+            mime,
+            filename,
+            content_id,
+            body.get("size"),
+            bool(attachment_id),
+            bool(data),
+        )
+
+        # A part is a binary attachment if it carries a filename, OR it's an
+        # inline binary part identified by a Content-ID / attachmentId whose
+        # mime is neither a text body nor a multipart container. The second
+        # case is what we used to drop on the floor (filename-less Outlook
+        # inline images), losing real photos embedded in the body.
+        is_text_body = mime in ("text/plain", "text/html")
+        is_container = mime.startswith("multipart/")
+        is_inline_binary = (
+            not filename
+            and not is_text_body
+            and not is_container
+            and (content_id or attachment_id)
+        )
+        if filename or is_inline_binary:
+            resolved_name = filename
+            if not resolved_name:
+                # Synthesize a stable name so the upload path, dedup, and the
+                # `[image: NAME]` marker all agree. Prefer the cid stem; fall
+                # back to a per-message counter. Extension from the mime type.
+                inline_counter[0] += 1
+                resolved_name = _synthesize_inline_filename(
+                    content_id, mime, inline_counter[0]
+                )
             attachments.append(
                 GmailAttachment(
-                    filename=filename,
+                    filename=resolved_name,
                     mime_type=mime,
                     size=body.get("size", 0),
-                    attachment_id=body.get("attachmentId"),
-                    content_id=_normalize_content_id(raw_cid),
+                    attachment_id=attachment_id,
+                    content_id=content_id,
+                    # Keep the inline bytes when Gmail didn't give us a separate
+                    # attachmentId to fetch them with (small inline parts).
+                    inline_data=data if (data and not attachment_id) else None,
                 )
             )
 
-        data = body.get("data")
-        if data and not filename:
+        if data and not filename and is_text_body:
             decoded = _decode_base64url(data)
             if mime == "text/plain":
                 plain_parts.append(decoded)
@@ -414,6 +474,23 @@ def _extract_body_and_attachments(
             walk(child)
 
     walk(payload)
+
+    logger.debug(
+        "extracted %d attachment(s): %s",
+        len(attachments),
+        [
+            (
+                a.filename,
+                a.mime_type,
+                a.size,
+                a.attachment_id is not None,
+                a.inline_data is not None,
+                a.content_id,
+                a.inline_ref_count,
+            )
+            for a in attachments
+        ],
+    )
 
     # Count inline cid references against the joined HTML. The COUNT is the
     # signature signal (>=2 within a single Gmail message means signature
@@ -492,6 +569,44 @@ def _normalize_content_id(raw: str) -> str | None:
     return raw.strip().lstrip("<").rstrip(">").lower() or None
 
 
+# Common image/document mime types → file extension, for synthesizing a
+# filename on inline parts that arrive without one. Anything not listed falls
+# back to `.bin` — better a wrong-but-present extension than a lost image.
+_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "image/svg+xml": ".svg",
+    "application/pdf": ".pdf",
+}
+# Keep synthesized names to safe basename chars so Drive/Notion don't choke.
+_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _synthesize_inline_filename(content_id: str | None, mime: str, counter: int) -> str:
+    """Build a stable filename for an inline part Gmail gave us with none.
+
+    Prefers the Content-ID stem (the part before any `@host`) so the same
+    inline image gets the same name across runs; falls back to a per-message
+    counter when there's no usable cid. The extension comes from the mime type
+    so downstream consumers (Drive, Notion preview) treat it as an image.
+    """
+    ext = _MIME_EXTENSIONS.get(mime.lower(), ".bin")
+    stem = ""
+    if content_id:
+        stem = content_id.split("@", 1)[0]
+        stem = _UNSAFE_FILENAME_RE.sub("", stem)
+    if not stem:
+        stem = f"inline-image-{counter}"
+    if stem.lower().endswith(ext):
+        return stem
+    return f"{stem}{ext}"
+
+
 # Document-order pattern for inline images in HTML. Captures whatever's inside
 # the src="..." attribute on an <img> tag — Outlook/Word emit `cid:NAME@host`,
 # while some clients emit a bare filename or `data:` URL we just leave alone.
@@ -557,10 +672,20 @@ def _decode_base64url(data: str) -> str:
 
 
 def _strip_html(html: str) -> str:
-    """Crude HTML → text fallback for the rare message with no text/plain part."""
+    """Crude HTML → text fallback for the rare message with no text/plain part.
+
+    Only block-level tags that map cleanly to a line break (br/p/li/div/tr)
+    become newlines. We deliberately do NOT newline on inline-or-ambiguous tags
+    like <span>: they appear MID-LINE inside reply-attribution and forward
+    headers ("…skrev Rino Larsen <span>&lt;rino@x&gt;</span>:"), and splitting
+    those breaks boundary/header parsing (the email gets orphaned onto its own
+    line). A signature whose lines are <span>-wrapped therefore arrives as one
+    line here — that's fine: the signature is still parsed, and it's sliced out
+    of the row body downstream via the per-sender signature_first_line hint.
+    """
     # Drop scripts/styles entirely
     cleaned = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
-    # Convert <br>, <p>, <li> to newlines BEFORE stripping all tags
+    # Convert <br>, <p>, <li>, <div>, <tr> to newlines BEFORE stripping all tags
     cleaned = re.sub(r"</?(br|p|li|div|tr)\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
     # Strip all remaining tags
     cleaned = re.sub(r"<[^>]+>", "", cleaned)

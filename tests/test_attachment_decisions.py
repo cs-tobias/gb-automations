@@ -1,5 +1,11 @@
-"""Tests for sync_thread._partition_attachments — the position-based filter
-that decides which attachments are worth downloading + uploading to Drive.
+"""Tests for sync_thread._partition_attachments — the byte-free filter that
+decides which attachments are worth downloading + uploading to Drive.
+
+Only two signals run here: tiny-image (< 1 KB) and inline-repeated
+(`inline_ref_count >= 2`). The old position-based "marker sits below the
+signature line ⇒ decoration" rule was removed — it dropped real photos in
+short emails. Signature logos that slip past these two are caught later by the
+cross-message `_is_repeating_signature_image` check in the upload loop.
 
 Also covers `_attribute_attachments`, which assigns forwarded-thread
 attachments to whichever extracted historical email's body actually mentions
@@ -29,38 +35,29 @@ def _att(name: str, mime: str = "application/pdf", size: int = 100_000) -> Gmail
 
 
 def test_partition_no_attachments_returns_empty():
-    assert _partition_attachments("Body text", []) == []
+    assert _partition_attachments([]) == []
 
 
 def test_partition_normal_attachment_uploads():
-    body = "Hi,\nPlease see the attached PDF.\n\nMvh\nTobias"
-    decisions = _partition_attachments(body, [_att("Tilbud.pdf")])
+    decisions = _partition_attachments([_att("Tilbud.pdf")])
     assert len(decisions) == 1
     assert decisions[0].upload is True
     assert decisions[0].skip_reason == ""
 
 
-def test_partition_signature_region_image_is_skipped():
-    # Image referenced AFTER the signature marker → decoration.
-    body = (
-        "Hei,\nSe vedlagt PDF.\n\n"
-        "Mvh\nTobias\n"
-        "[image: logo.png]\n"  # below "Mvh" — signature region
-    )
-    decisions = _partition_attachments(body, [_att("logo.png", "image/png", 30_000)])
+def test_partition_image_near_signature_still_uploads():
+    # Regression: previously an image whose `[image:]` marker sat below the
+    # signature line was dropped as "signature-region". Real photos in short
+    # emails land there too, so we now upload it. Only size + inline-repeat
+    # decide here.
+    decisions = _partition_attachments([_att("logo.png", "image/png", 30_000)])
     assert len(decisions) == 1
-    assert decisions[0].upload is False
-    assert decisions[0].skip_reason == "signature-region"
+    assert decisions[0].upload is True
+    assert decisions[0].skip_reason == ""
 
 
 def test_partition_image_in_body_uploads():
-    # Image referenced BEFORE the signature → meaningful body content.
-    body = (
-        "Hei,\n"
-        "Se moodboard her:\n[image: moodboard.jpg]\n\n"
-        "Mvh\nTobias"
-    )
-    decisions = _partition_attachments(body, [_att("moodboard.jpg", "image/jpeg", 2_000_000)])
+    decisions = _partition_attachments([_att("moodboard.jpg", "image/jpeg", 2_000_000)])
     assert len(decisions) == 1
     assert decisions[0].upload is True
 
@@ -68,10 +65,7 @@ def test_partition_image_in_body_uploads():
 def test_partition_tiny_image_under_1kb_is_skipped():
     # Word's `~WRDxxxx.jpg` and other Office-generated signature thumbnails
     # consistently sit below 1 KB. Skip without needing to download bytes.
-    body = "Hei,\nVidereført innhold.\n\nMvh\nAnne"
-    decisions = _partition_attachments(
-        body, [_att("~WRD0002.jpg", "image/jpeg", 800)]
-    )
+    decisions = _partition_attachments([_att("~WRD0002.jpg", "image/jpeg", 800)])
     assert len(decisions) == 1
     assert decisions[0].upload is False
     assert decisions[0].skip_reason == "tiny-image"
@@ -80,10 +74,7 @@ def test_partition_tiny_image_under_1kb_is_skipped():
 def test_partition_small_but_real_image_still_uploads():
     # 4.6 KB is small enough to be a logo but well above the 1 KB threshold —
     # clients can legitimately send small brand assets as real attachments.
-    body = "Hei,\nSe vedlagte logo."
-    decisions = _partition_attachments(
-        body, [_att("brand-logo.png", "image/png", 4_600)]
-    )
+    decisions = _partition_attachments([_att("brand-logo.png", "image/png", 4_600)])
     assert len(decisions) == 1
     assert decisions[0].upload is True
 
@@ -100,7 +91,7 @@ def test_partition_inline_repeated_image_is_skipped():
         content_id="ii_x@host",
         inline_ref_count=3,
     )
-    decisions = _partition_attachments("Some body without markers.", [att])
+    decisions = _partition_attachments([att])
     assert len(decisions) == 1
     assert decisions[0].upload is False
     assert decisions[0].skip_reason == "inline-repeated"
@@ -116,7 +107,7 @@ def test_partition_single_inline_ref_uploads():
         content_id="ii_y@host",
         inline_ref_count=1,
     )
-    decisions = _partition_attachments("Body.", [att])
+    decisions = _partition_attachments([att])
     assert len(decisions) == 1
     assert decisions[0].upload is True
 
@@ -132,62 +123,34 @@ def test_partition_inline_repeated_only_applies_to_images():
         attachment_id="abc",
         inline_ref_count=5,  # would never happen, but guard against it
     )
-    decisions = _partition_attachments("Body.", [att])
+    decisions = _partition_attachments([att])
     assert decisions[0].upload is True
 
 
 def test_partition_tiny_non_image_is_not_skipped():
     # Only image/* gets the tiny-size skip. A tiny PDF or vCard is rare but
     # legitimate; don't skip those.
-    body = "Hei."
-    decisions = _partition_attachments(
-        body, [_att("contact.vcf", "text/vcard", 500)]
-    )
-    assert len(decisions) == 1
-    assert decisions[0].upload is True
-
-
-def test_partition_image_without_signature_marker_uploads():
-    # No signature marker at all → can't apply the position rule.
-    # The repetition check (run later, with bytes) decides; here we accept.
-    body = "Just a plain email body with no signature marker."
-    decisions = _partition_attachments(body, [_att("img.png", "image/png", 20_000)])
-    assert len(decisions) == 1
-    assert decisions[0].upload is True
-
-
-def test_partition_image_without_body_reference_uploads():
-    # Image attached but not referenced in body. Without a body reference,
-    # the position rule can't fire — fall through to upload (and let the
-    # repetition check sort signatures from real content later).
-    body = "Hi,\nFile attached.\n\nMvh\nTobias"
-    decisions = _partition_attachments(body, [_att("unreferenced.png", "image/png", 25_000)])
+    decisions = _partition_attachments([_att("contact.vcf", "text/vcard", 500)])
     assert len(decisions) == 1
     assert decisions[0].upload is True
 
 
 def test_partition_preserves_order_and_handles_mixed():
-    body = (
-        "Hei,\n"
-        "Se vedlagte filer og moodboard her:\n[image: moodboard.jpg]\n\n"
-        "Mvh\nTobias\n"
-        "[image: logo.png]\n"
-    )
     atts = [
-        _att("Tilbud.pdf"),                          # real attachment
-        _att("moodboard.jpg", "image/jpeg", 1_000_000),  # body-region image
-        _att("logo.png", "image/png", 25_000),        # signature-region image
+        _att("Tilbud.pdf"),                              # real attachment
+        _att("moodboard.jpg", "image/jpeg", 1_000_000),  # real photo
+        _att("~WRD0001.jpg", "image/jpeg", 600),         # tiny signature thumb
     ]
-    decisions = _partition_attachments(body, atts)
+    decisions = _partition_attachments(atts)
     assert [d.attachment.filename for d in decisions] == [
         "Tilbud.pdf",
         "moodboard.jpg",
-        "logo.png",
+        "~WRD0001.jpg",
     ]
     assert decisions[0].upload is True
     assert decisions[1].upload is True
     assert decisions[2].upload is False
-    assert decisions[2].skip_reason == "signature-region"
+    assert decisions[2].skip_reason == "tiny-image"
 
 
 # ============================================================
@@ -364,11 +327,10 @@ def test_attribute_real_marker_match_wins_over_fallback():
     assert list(by_synth.keys()) == [newer_synth]
 
 
-def test_attribute_signature_region_stays_on_forwarder():
-    # Forwarder's body has a logo BELOW their signature — that's their own
-    # signature decoration, not anything the historical sender authored.
-    # Even if an extracted email's body happens to contain "logo.png" as text,
-    # the position-based skip on the forwarder's body fires first.
+def test_attribute_uploadable_image_goes_to_mentioning_block():
+    # With the position-based signature-region skip removed, a >1 KB image
+    # referenced exactly once is uploadable. When an extracted email's body
+    # mentions the filename, ownership goes to that block — not the forwarder.
     parent = _msg(
         body="Videresender.\n\nMvh\nBob\n[image: logo.png]\n",
         attachments=[_att("logo.png", "image/png", 25_000)],
@@ -379,7 +341,7 @@ def test_attribute_signature_region_stays_on_forwarder():
         day=10,
     )
     forwarder, by_synth = _attribute_attachments(parent, [anne])
-    assert by_synth == {}
-    assert len(forwarder) == 1
-    assert forwarder[0].upload is False
-    assert forwarder[0].skip_reason == "signature-region"
+    anne_synth = synthetic_message_id(parent.message_id, anne.from_field, anne.body)
+    assert forwarder == []
+    assert list(by_synth.keys()) == [anne_synth]
+    assert by_synth[anne_synth][0].upload is True

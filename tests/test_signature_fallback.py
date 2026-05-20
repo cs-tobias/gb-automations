@@ -7,10 +7,10 @@ Pins the contract for:
    produce the exact string we feed `classify_signature`.
 3. `_find_line_index` — strict line-equality match (not substring) used to
    resolve an LLM-supplied signature_first_line into a body line index.
-4. `classify_signature` — 3-tuple return shape, schema parsing, graceful
-   degradation on every failure mode.
-5. `_partition_attachments` — when the regex sign-off marker is absent, the
-   `signature_first_line_hint` correctly drops signature-region images.
+4. `classify_signature` — `SignatureLocators` return shape, schema parsing,
+   graceful degradation on every failure mode.
+5. `_partition_attachments` — only tiny + inline-repeated images are dropped;
+   a normal image near the signature uploads (no position-based skip).
 """
 
 from __future__ import annotations
@@ -20,14 +20,16 @@ from unittest.mock import AsyncMock, patch
 
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import llm as llm_client
+from gb_automations.clients.llm import SignatureLocators
 from gb_automations.sync.sync_thread import (
     _find_line_index,
     _partition_attachments,
+    _resolve_located_line,
     _signature_input,
+    _slice_at_signature,
 )
 from gb_automations.utils.email_cleaning import body_before_quotes
 from gb_automations.utils.phone import extract_phone
-
 
 # Rino's actual email body — captured from the failing log. No sign-off
 # marker; signature region transitions straight from the attachment blurb
@@ -158,15 +160,16 @@ def test_find_line_index_handles_empty_inputs():
 
 
 # ============================================================
-# classify_signature — 3-tuple contract
+# classify_signature — SignatureLocators contract
 # ============================================================
 
 
 def test_classify_signature_parses_good_json():
-    """3-tuple return when Ollama returns all three fields populated."""
+    """SignatureLocators return when Ollama locates the lines. Address is NOT
+    located by the LLM — only title/phone/signature_first_line."""
     fake_response = (
-        '{"title": "Daglig leder | Digital rådgiver", '
-        '"phone": "90 60 94 41", '
+        '{"title_line": "Daglig leder | Digital rådgiver", '
+        '"phone_line": "90 60 94 41", '
         '"signature_first_line": "Rino Larsen"}',
         {"done": True},
     )
@@ -178,18 +181,44 @@ def test_classify_signature_parses_good_json():
         result = asyncio.run(
             llm_client.classify_signature("body…", sender_name="Rino Larsen")
         )
-    assert result == (
-        "Daglig leder | Digital rådgiver",
-        "90 60 94 41",
-        "Rino Larsen",
+    assert result == SignatureLocators(
+        title_line="Daglig leder | Digital rådgiver",
+        phone_line="90 60 94 41",
+        signature_first_line="Rino Larsen",
+    )
+
+
+def test_classify_signature_handles_no_signoff_name_line():
+    """A signature with NO sign-off line (Signature A): signature_first_line is
+    the sender's name, and the located lines keep their labels verbatim — the
+    downstream cleaners strip the 'm:' label and the company suffix."""
+    fake_response = (
+        '{"title_line": "Daglig leder| NIMREM", '
+        '"phone_line": "m: +47 93 88 32 01", '
+        '"signature_first_line": "Caspar Vinje Hagland"}',
+        {"done": True},
+    )
+    with patch.object(
+        llm_client,
+        "_chat_streaming",
+        new=AsyncMock(return_value=fake_response),
+    ):
+        result = asyncio.run(
+            llm_client.classify_signature("body…", sender_name="Caspar Vinje Hagland")
+        )
+    assert result == SignatureLocators(
+        title_line="Daglig leder| NIMREM",
+        phone_line="m: +47 93 88 32 01",
+        signature_first_line="Caspar Vinje Hagland",
     )
 
 
 def test_classify_signature_handles_null_fields():
-    """When Ollama legitimately reports no signature, all three fields come
-    back as None (the model returned JSON `null`)."""
+    """When Ollama legitimately reports no signature, every field comes back
+    as None (the model returned JSON `null`)."""
     fake_response = (
-        '{"title": null, "phone": null, "signature_first_line": null}',
+        '{"title_line": null, "phone_line": null, '
+        '"signature_first_line": null}',
         {"done": True},
     )
     with patch.object(
@@ -198,11 +227,11 @@ def test_classify_signature_handles_null_fields():
         new=AsyncMock(return_value=fake_response),
     ):
         result = asyncio.run(llm_client.classify_signature("body…"))
-    assert result == (None, None, None)
+    assert result == SignatureLocators(None, None, None)
 
 
 def test_classify_signature_degrades_on_chat_failure():
-    """A timeout or transport error must not raise — returns (None, None, None)
+    """A timeout or transport error must not raise — returns all-None locators
     so the contact row keeps whatever the regex backstops found."""
     with patch.object(
         llm_client,
@@ -210,7 +239,7 @@ def test_classify_signature_degrades_on_chat_failure():
         new=AsyncMock(side_effect=TimeoutError("read timeout")),
     ):
         result = asyncio.run(llm_client.classify_signature("body…"))
-    assert result == (None, None, None)
+    assert result == SignatureLocators(None, None, None)
 
 
 def test_classify_signature_degrades_on_malformed_json():
@@ -221,7 +250,7 @@ def test_classify_signature_degrades_on_malformed_json():
         new=AsyncMock(return_value=fake_response),
     ):
         result = asyncio.run(llm_client.classify_signature("body…"))
-    assert result == (None, None, None)
+    assert result == SignatureLocators(None, None, None)
 
 
 def test_classify_signature_returns_none_when_body_is_empty():
@@ -232,11 +261,38 @@ def test_classify_signature_returns_none_when_body_is_empty():
         new=AsyncMock(side_effect=AssertionError("should not be called")),
     ):
         result = asyncio.run(llm_client.classify_signature(""))
-    assert result == (None, None, None)
+    assert result == SignatureLocators(None, None, None)
 
 
 # ============================================================
-# _partition_attachments — signature_first_line_hint wiring
+# _resolve_located_line — verbatim → body line, with fallbacks
+# ============================================================
+
+
+def test_resolve_located_line_strict_match_returns_body_line():
+    body = "Hei\nCaspar Vinje Hagland\nDaglig leder| NIMREM\n"
+    assert _resolve_located_line(body, "Daglig leder| NIMREM") == "Daglig leder| NIMREM"
+
+
+def test_resolve_located_line_substring_fallback_on_near_miss():
+    """A near-miss (LLM dropped a trailing char) still resolves to the real
+    body line via the case-insensitive substring fallback."""
+    body = "Hei\nCaspar Vinje Hagland\nm: +47 93 88 32 01\n"
+    # LLM returned the value without the trailing digit.
+    assert _resolve_located_line(body, "m: +47 93 88 32 0") == "m: +47 93 88 32 01"
+
+
+def test_resolve_located_line_falls_back_to_raw_when_absent():
+    body = "Hei\nNoe helt annet\n"
+    assert _resolve_located_line(body, "Senterleder") == "Senterleder"
+
+
+def test_resolve_located_line_none_is_none():
+    assert _resolve_located_line("a\nb\n", None) is None
+
+
+# ============================================================
+# _partition_attachments — no position-based signature skip
 # ============================================================
 
 
@@ -250,39 +306,68 @@ def _attachment(filename: str, *, mime: str = "image/tiff", size: int = 6500) ->
     )
 
 
-def test_partition_drops_signature_region_image_with_llm_hint():
-    """Rino's body has no 'Mvh' sign-off marker — find_signature_start_line
-    returns -1 — so today the TIFF would upload. With the LLM-derived hint
-    ('Rino Larsen'), _partition_attachments locates the signature line and
-    drops the TIFF as signature-region."""
+def test_partition_uploads_image_in_signature_region():
+    """The position-based signature-region skip was removed: an image whose
+    marker sits in the signature region (and which isn't tiny or inline-
+    repeated) now uploads. Losing a real photo was worse than letting a stray
+    logo through; the cross-message repetition check still filters real
+    signature logos in the upload loop."""
     att = _attachment("PastedGraphic-7.tiff")
-    decisions = _partition_attachments(
-        RINO_BODY,
-        [att],
-        signature_first_line_hint="Rino Larsen",
-    )
-    assert len(decisions) == 1
-    assert decisions[0].upload is False
-    assert decisions[0].skip_reason == "signature-region"
-
-
-def test_partition_without_hint_uploads_unmarked_signature_image():
-    """Pre-fix behavior pinned: with no LLM hint and no regex marker, the
-    TIFF uploads. This documents the gap the hint closes."""
-    att = _attachment("PastedGraphic-7.tiff")
-    decisions = _partition_attachments(RINO_BODY, [att])
+    decisions = _partition_attachments([att])
     assert len(decisions) == 1
     assert decisions[0].upload is True
+    assert decisions[0].skip_reason == ""
 
 
-def test_partition_hint_with_no_matching_line_falls_back_safely():
-    """An LLM hint that doesn't actually appear in the body must not crash
-    or false-drop — we should fall back to today's regex-only behavior."""
-    att = _attachment("PastedGraphic-7.tiff")
-    decisions = _partition_attachments(
-        RINO_BODY,
-        [att],
-        signature_first_line_hint="Some Person Who Isn't In This Email",
+# ============================================================
+# _slice_at_signature — drop signature from row body
+# ============================================================
+
+
+def test_slice_drops_signature_block_from_rino_body():
+    """The whole signature region (name, title, blank, phone, image marker)
+    disappears from the body. Everything above stays."""
+    sliced = _slice_at_signature(RINO_BODY, "Rino Larsen")
+    # Pre-signature content survives
+    assert "Download full-resolution images" in sliced
+    assert "Aktiv SEO fra Klatre.pdf" in sliced
+    # Signature region is gone
+    assert "Rino Larsen" not in sliced
+    assert "Daglig leder | Digital rådgiver" not in sliced
+    assert "90 60 94 41" not in sliced
+    assert "PastedGraphic-7.tiff" not in sliced
+
+
+def test_slice_is_noop_when_hint_is_none():
+    assert _slice_at_signature(RINO_BODY, None) == RINO_BODY
+
+
+def test_slice_is_noop_when_hint_does_not_match():
+    """Hint not present in the body → body unchanged. Same safe-fallback
+    pattern as _partition_attachments."""
+    assert (
+        _slice_at_signature(RINO_BODY, "Someone Not In This Email") == RINO_BODY
     )
-    assert len(decisions) == 1
-    assert decisions[0].upload is True
+
+
+def test_slice_handles_empty_body():
+    assert _slice_at_signature("", "Rino Larsen") == ""
+
+
+def test_slice_cuts_signature_mushed_onto_one_line():
+    """When <span>-wrapped signature lines arrive mushed onto one line (no
+    sign-off marker), the hint (the sender's name) still marks the cut point —
+    everything from the name onward is dropped, the preceding text kept."""
+    body = "Supert :)Rino LarsenDaglig leder | Digital rådgiver90 60 94 41"
+    assert _slice_at_signature(body, "Rino Larsen") == "Supert :)"
+
+
+def test_slice_cuts_embedded_signature_keeps_preceding_lines():
+    body = "Takk!\nSnakkes.\nMvh Rino LarsenDaglig leder"
+    sliced = _slice_at_signature(body, "Rino Larsen")
+    assert sliced == "Takk!\nSnakkes.\nMvh"
+
+
+def test_slice_drops_whole_line_when_signature_is_at_start():
+    body = "Rino LarsenDaglig leder90 60 94 41"
+    assert _slice_at_signature(body, "Rino Larsen") == ""

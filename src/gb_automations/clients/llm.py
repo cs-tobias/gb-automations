@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -214,63 +215,134 @@ async def classify(
 
 
 # ============================================================
-# classify_signature — title + phone extraction when regex fails
+# classify_signature — locate signature lines (LLM picks WHICH line)
 # ============================================================
 
 
+@dataclass(frozen=True)
+class SignatureLocators:
+    """Verbatim signature lines the LLM located in the body.
+
+    Each field is the line the LLM judged to CONTAIN that piece, returned
+    EXACTLY as it appears (label and all) — not the extracted value.
+    Deterministic cleaners in `utils/signature_parsing.py` turn each line into
+    a stored value. `signature_first_line` is also a locator, used by the
+    attachment/body-slicing code; it is consumed raw (uncleaned).
+
+    Address is intentionally NOT located here: Norwegian addresses span two
+    lines (street, then postal+city) and a single-line locator always loses
+    half. The regex `parse_signature` handles addresses structurally instead.
+    """
+
+    title_line: str | None
+    phone_line: str | None
+    signature_first_line: str | None
+
+
 _CLASSIFY_SIGNATURE_SYSTEM_PROMPT = (
-    "You extract a sender's signature fields from an email body. Most "
-    "senders are Norwegian (titles like 'Daglig leder', 'Digital rådgiver'), "
-    "but English titles ('CEO', 'Project Manager') appear too.\n\n"
-    "Return JSON with exactly three fields:\n"
-    "  - title: the sender's job title. May combine multiple roles ('Daglig "
-    "leder | Digital rådgiver'). Use null if no clear title is present.\n"
-    "  - phone: the sender's phone number as it appears in the signature "
-    "('90 60 94 41', '+47 906 09 441'). If multiple phones are listed, "
-    "return the first. Use null if no phone is present.\n"
-    "  - signature_first_line: the verbatim text of the FIRST line of the "
-    "signature block (usually the sender's name line, e.g. 'Rino Larsen'). "
-    "Return the line EXACTLY as it appears in the body — preserve spaces, "
-    "punctuation, and capitalization. Downstream code matches this string "
-    "against body lines to locate the signature region, so even one extra "
-    "or missing character will cause the match to fail. Use null if there "
-    "is no recognizable signature block.\n\n"
+    "You locate lines in a sender's email signature. Most senders are Norwegian "
+    "(titles like 'Daglig leder', 'Digital rådgiver'), but English titles "
+    "('CEO', 'Project Manager') appear too.\n\n"
+    "WHAT A SIGNATURE IS:\n"
+    "A signature is the block at the END of the sender's own message where "
+    "they stop writing TO the reader and start stating WHO THEY ARE — their "
+    "name, role/title, and contact details (phone, email, company, address, "
+    "website). It MAY begin with a sign-off line ('Med vennlig hilsen', "
+    "'Mvh', 'Best regards', 'Hilsen'), but VERY OFTEN there is NO sign-off "
+    "at all — the message text just ends and the name line begins. The "
+    "absence of a sign-off does NOT mean there is no signature. Labelled "
+    "contact lines ('Tlf:', 'm:', 'Email:', a phone number, an email "
+    "address) are strong signs you are inside a signature.\n\n"
+    "WHERE THE SIGNATURE STARTS (this is `signature_first_line`):\n"
+    "  - If there is a sign-off line, the signature starts at that sign-off "
+    "line.\n"
+    "  - If there is NO sign-off line, the signature starts at the sender's "
+    "NAME line — the first line after the last sentence the sender wrote to "
+    "the reader.\n"
+    "Everything the sender wrote TO the reader (questions, statements, "
+    "greetings like 'Hei Petter,', sign-offs that are part of the message "
+    "like 'med vennlig hilsen' written mid-message) before the name is BODY.\n\n"
+    "YOUR JOB: do NOT extract or reformat values. For each field, return the "
+    "ONE existing line from the body that CONTAINS it, copied VERBATIM — "
+    "preserve spaces, punctuation, capitalization, and any 'm:'/'Tlf:' "
+    "label. Downstream code matches your string against the body lines and "
+    "does the cleanup, so one extra or missing character breaks the match. "
+    "Never combine two lines. Never invent a line that isn't present.\n\n"
+    "Return JSON with exactly three fields (any may be null):\n"
+    "  - title_line: the line containing the sender's JOB TITLE/role only "
+    "('Daglig leder', 'Interiørarkitekt MA'). This is NOT the person's name, "
+    "not a company, not a website, not an email. If the sender has no title "
+    "line, return null — do NOT fall back to the name line.\n"
+    "  - phone_line: the line containing the sender's phone number (keep the "
+    "label, e.g. 'm: +47 …'). If several, the first.\n"
+    "  - signature_first_line: the FIRST line of the signature block as "
+    "defined above.\n\n"
     "Rules:\n"
     "  - Look at the sender's own signature only. Ignore quoted history, "
     "reply headers, and other people's signatures.\n"
-    "  - Do not invent. If unsure, return null for that field.\n"
-    "  - Do not include the sender's name, email, company, or address in "
-    "the title field — title only.\n"
-    "  - Preserve the original wording. Do not translate."
+    "  - If a field isn't present, return null for it.\n\n"
+    "EXAMPLES:\n\n"
+    "Example 1 — NO real sign-off ('med vennlig hilsen' is part of the "
+    "message; the signature starts at the name line):\n"
+    "Body:\n"
+    "  Hei Petter,\n"
+    "  Se bilde to 🙂\n"
+    "  med vennlig hilsen\n"
+    "  Caspar Vinje Hagland\n"
+    "  Daglig leder| NIMREM\n"
+    "  m: +47 93 88 32 01\n"
+    "  e: cvh@nimrem.no\n"
+    "  a: Parkveien 37 | NO0258 Oslo | Norway\n"
+    "Answer:\n"
+    '  {"title_line": "Daglig leder| NIMREM", '
+    '"phone_line": "m: +47 93 88 32 01", '
+    '"signature_first_line": "Caspar Vinje Hagland"}\n\n'
+    "Example 2 — no title line (just name + phone). title_line is null — the "
+    "name is NOT a title:\n"
+    "Body:\n"
+    "  Umiddelbart synes jeg dette ble bedre.\n"
+    "  Charlotte Hagemoen\n"
+    "  +4741682942\n"
+    "Answer:\n"
+    '  {"title_line": null, "phone_line": "+4741682942", '
+    '"signature_first_line": "Charlotte Hagemoen"}\n\n'
+    "Example 3 — no signature at all:\n"
+    "Body:\n"
+    "  Ok, høres bra ut. Snakkes!\n"
+    "Answer:\n"
+    '  {"title_line": null, "phone_line": null, '
+    '"signature_first_line": null}'
 )
 
 
 async def classify_signature(
     body: str, sender_name: str | None = None
-) -> tuple[str | None, str | None, str | None]:
-    """Extract (title, phone, signature_first_line) from an email body via LLM.
+) -> SignatureLocators:
+    """Locate the title / phone / first lines of a signature via the LLM.
 
-    Best-effort: returns (None, None, None) on any failure (timeout, malformed
-    output, etc.) so callers can degrade gracefully.
+    Best-effort: returns an all-None `SignatureLocators` on any failure
+    (timeout, malformed output, etc.) so callers can degrade to the regex
+    backstop gracefully.
 
-    `signature_first_line` is the verbatim first line of the signature region
-    (usually the sender's name line). Downstream callers use it to locate the
-    signature in the body for tasks like dropping signature-region attachments.
+    Each returned line is VERBATIM (label included) — the model picks WHICH
+    line, deterministic cleaners turn it into a value. `signature_first_line`
+    locates the signature region for attachment/body slicing.
 
-    `sender_name` is passed to the model as a hint so it can disambiguate
-    when the body contains multiple signatures (quoted history, forwards).
+    `sender_name` is passed to the model as a hint so it can disambiguate when
+    the body contains multiple signatures (quoted history, forwards).
     """
+    none_result = SignatureLocators(None, None, None)
     if not body or not body.strip():
-        return (None, None, None)
+        return none_result
 
     schema = {
         "type": "object",
         "properties": {
-            "title": {"type": ["string", "null"]},
-            "phone": {"type": ["string", "null"]},
+            "title_line": {"type": ["string", "null"]},
+            "phone_line": {"type": ["string", "null"]},
             "signature_first_line": {"type": ["string", "null"]},
         },
-        "required": ["title", "phone", "signature_first_line"],
+        "required": ["title_line", "phone_line", "signature_first_line"],
     }
     sender_line = f"Sender name: {sender_name}\n\n" if sender_name else ""
     messages = [
@@ -297,11 +369,11 @@ async def classify_signature(
             type(err).__name__,
             err or "(no message)",
         )
-        return (None, None, None)
+        return none_result
 
     content = content.strip()
     if not content:
-        return (None, None, None)
+        return none_result
     logger.info(
         "LLM classify_signature done in %.1fs (output=%d chars)",
         time.monotonic() - start,
@@ -312,9 +384,9 @@ async def classify_signature(
         parsed = json.loads(content)
     except json.JSONDecodeError:
         logger.warning("LLM classify_signature returned non-JSON: %r", content[:300])
-        return (None, None, None)
+        return none_result
     if not isinstance(parsed, dict):
-        return (None, None, None)
+        return none_result
 
     def _clean(value: Any) -> str | None:
         if not isinstance(value, str):
@@ -322,10 +394,10 @@ async def classify_signature(
         stripped = value.strip()
         return stripped or None
 
-    return (
-        _clean(parsed.get("title")),
-        _clean(parsed.get("phone")),
-        _clean(parsed.get("signature_first_line")),
+    return SignatureLocators(
+        title_line=_clean(parsed.get("title_line")),
+        phone_line=_clean(parsed.get("phone_line")),
+        signature_first_line=_clean(parsed.get("signature_first_line")),
     )
 
 

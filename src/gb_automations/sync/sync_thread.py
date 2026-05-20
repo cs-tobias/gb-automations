@@ -40,8 +40,6 @@ from gb_automations.utils.email_cleaning import (
     body_before_quotes,
     clean_body,
     extract_signature_block,
-    find_attachment_reference_line,
-    find_signature_start_line,
     has_quoted_history_hint,
 )
 from gb_automations.utils.email_splitting import (
@@ -61,7 +59,11 @@ from gb_automations.utils.participants import (
     strict_email_or_empty,
 )
 from gb_automations.utils.phone import extract_phone
-from gb_automations.utils.signature_parsing import parse_signature
+from gb_automations.utils.signature_parsing import (
+    clean_phone_line,
+    clean_title_line,
+    parse_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,14 +122,15 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
 
     if not thread.messages:
         result.skipped_reason = "thread has no messages"
-        logger.info("🧵 sync start: <empty thread> for %s", user_email)
+        logger.info("🧵 sync start: <empty thread> %s for %s", thread_id, user_email)
         return result
 
     result.thread_subject = thread.messages[0].subject or "(no subject)"
     logger.info(
-        "🧵 sync start: %r (%d msg) for %s",
+        "🧵 sync start: %r (%d msg) thread=%s for %s",
         result.thread_subject,
         result.messages_seen,
+        thread_id,
         user_email,
     )
 
@@ -212,11 +215,12 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
 
     elapsed = time.monotonic() - started
     logger.info(
-        "🧵 sync done in %.1fs: +%d row(s), %d already present, %d contact(s)",
+        "🧵 sync done in %.1fs: +%d row(s), %d already present, %d contact(s) [thread=%s]",
         elapsed,
         result.rows_created,
         result.rows_already_present,
         result.contacts_upserted,
+        thread_id,
     )
     return result
 
@@ -397,6 +401,88 @@ def _signature_input(plain_body: str) -> str:
     return trimmed[-_SIG_INPUT_MAX_CHARS:]
 
 
+def _signature_complete(rec: dict[str, Any]) -> bool:
+    """True once we've filled the LLM-derived fields (title + phone) for a sender.
+
+    We stop the (expensive) LLM call for a sender as soon as title+phone are both
+    set — across their live messages and history segments. Dedup is on SUCCESS,
+    not attempt: a signature-only forward that yields nothing must not block
+    recovering the real signature from a later (history) segment. Address is NOT
+    in this gate: it comes from the cheap regex backstop, which runs on every
+    message regardless (some senders legitimately have no address — we'd never
+    reach "complete" and would re-call the LLM forever otherwise).
+    """
+    return all(rec[k] for k in ("title", "phone"))
+
+
+async def _enrich_sender_from_body(
+    sender_record: dict[str, Any],
+    *,
+    sender_email: str,
+    body: str,
+    sender_signature_lines: dict[str, str],
+) -> None:
+    """Fill empty title/phone/address on `sender_record` from one message body.
+
+    LLM locator path first (the model returns the verbatim line containing each
+    field; we resolve it against the body and run a deterministic cleaner),
+    regex backstop second. Additive — never overwrites a field already set, so
+    repeated calls across a sender's messages only fill gaps. Runs on any
+    message body: a live `GmailMessage.plain_body` or a history segment's
+    `ExtractedMessage.raw_body` — they're treated identically.
+
+    `parse_signature`'s title is intentionally NOT used as a backstop: its
+    line-adjacency rule is brittle on real signatures (Rino had a blank line
+    between name and title — the LLM handles that trivially).
+    """
+    # Skip the expensive LLM call once title+phone are in hand, but still fall
+    # through to the cheap regex backstop below (it may recover an address we
+    # don't have yet, and re-running it is idempotent/additive).
+    llm_input = _signature_input(body)
+    if llm_input and not _signature_complete(sender_record):
+        try:
+            loc = await llm_client.classify_signature(
+                llm_input, sender_name=sender_record["name"]
+            )
+        except Exception:
+            logger.exception(
+                "classify_signature failed for %s; leaving fields empty",
+                sender_email,
+            )
+            loc = llm_client.SignatureLocators(None, None, None)
+
+        known_company = company_from_domain(sender_email)
+        llm_title = clean_title_line(
+            _resolve_located_line(llm_input, loc.title_line),
+            known_company,
+            sender_name=sender_record["name"],
+        )
+        llm_phone = clean_phone_line(_resolve_located_line(llm_input, loc.phone_line))
+        if llm_title and not sender_record["title"]:
+            sender_record["title"] = llm_title
+        if llm_phone and not sender_record["phone"]:
+            sender_record["phone"] = llm_phone
+        # signature_first_line is used RAW (uncleaned) so the byte-exact
+        # slice/partition matching against body lines keeps working.
+        if loc.signature_first_line and sender_email not in sender_signature_lines:
+            sender_signature_lines[sender_email] = loc.signature_first_line
+
+    # Regex backstops on the signature-shaped slice (sign-off-marker block if
+    # present, otherwise the pre-quote body). Phone is a backstop (LLM-primary);
+    # address is the SOLE source (a Norwegian address spans two lines — street
+    # then postal+city — which `parse_signature` joins, but a single-line LLM
+    # locator can't). Title from parse_signature stays dropped — see above.
+    sig_source = extract_signature_block(body) or body_before_quotes(body)
+    if sig_source:
+        if not sender_record["phone"]:
+            phone = extract_phone(sig_source)
+            if phone:
+                sender_record["phone"] = phone
+        fields = parse_signature(sig_source, sender_name=sender_record["name"])
+        if fields.address and not sender_record["address"]:
+            sender_record["address"] = fields.address
+
+
 async def _upsert_thread_contacts(
     thread: gmail_client.GmailThread,
     splits: dict[str, list[ExtractedMessage]],
@@ -408,32 +494,31 @@ async def _upsert_thread_contacts(
       - `contact_ids`: {email: notion_page_id} for every successfully upserted
         contact.
       - `sender_signature_lines`: {sender_email: signature_first_line} cached
-        from the per-sender LLM call. Downstream attachment partitioning uses
-        these to drop signature-region images even when no "Mvh"-style sign-off
-        marker is present in the body.
+        from the per-sender LLM call. Used downstream by `_slice_at_signature`
+        to trim the signature region out of each row's body even when no
+        "Mvh"-style sign-off marker is present.
 
     Also enriches each sender's contact with fields from their signature
     block: phone, title, address, and a relation to a Company row
-    (auto-upserted by domain — see _upsert_company). Title + phone come from
-    the LLM; address + company from the regex `parse_signature`.
+    (auto-upserted by domain — see _upsert_company). Title, phone, and address
+    come from the LLM locator path (it returns the verbatim line containing
+    each field; deterministic cleaners turn the line into a value), with the
+    regex `parse_signature` / `extract_phone` as offline backstops. Company
+    names are NOT parsed from signatures (that heuristic produced garbage rows
+    like "Does this mail get added?") — they come from the email-domain stem.
 
     `splits` is the dict produced by `_presplit_forwarded_chains` — for any
     message that was LLM-split, we also extract participants from each inner
     forwarded message so the original (forwarded) senders/recipients get
     upserted as contacts instead of being lost.
     """
-    # email → {name, email, phone, title, address, signature_company}
-    # `signature_company` is the human-readable name pulled from the sender's
-    # signature ("Thon Eiendom"), used to title the Company row. Domain is
-    # always derivable from email, so we don't carry it here.
+    # email → {name, email, phone, title, address}
+    # Domain is always derivable from email, so we don't carry it here; the
+    # Company row is titled from the domain stem (see the company upsert below).
     seen: dict[str, dict[str, Any]] = {}
-    # Senders we've already called classify_signature for in this thread. The
-    # LLM call is per-sender (not per-message) — a 3-message thread from one
-    # sender pays for one signature extraction, not three.
-    signatures_attempted: set[str] = set()
     # email → signature first line (LLM-derived). Used downstream by
-    # _partition_attachments to drop signature-region images when no
-    # regex sign-off marker is present.
+    # _slice_at_signature to trim the signature region out of the row body
+    # when no regex sign-off marker is present.
     sender_signature_lines: dict[str, str] = {}
 
     def add_participant(raw: str) -> None:
@@ -452,7 +537,6 @@ async def _upsert_thread_contacts(
                 "phone": None,
                 "title": None,
                 "address": None,
-                "signature_company": None,
             }
         elif parsed.name and not seen[parsed.email]["name"]:
             seen[parsed.email]["name"] = parsed.name
@@ -475,91 +559,56 @@ async def _upsert_thread_contacts(
                 for raw in _split_addresses(inner.cc_field):
                     add_participant(raw)
 
-        # 2. Enrich the sender's record from their signature.
+        # 2. Enrich the sender's record from their signature. We run the SAME
+        # pipeline on the live message and on each forwarded history segment —
+        # a split-out history message is just another message by its sender.
+        # _enrich_sender_from_body is additive and stops once a sender's
+        # title+phone+address are all filled, so a signature-only forward that
+        # yields nothing doesn't block recovering the real signature from a
+        # later history segment.
         sender_email = find_sender_email(msg.from_field)
-        if not sender_email or sender_email not in seen:
-            continue
-        sender_record = seen[sender_email]
+        if sender_email and sender_email in seen:
+            await _enrich_sender_from_body(
+                seen[sender_email],
+                sender_email=sender_email,
+                body=msg.plain_body,
+                sender_signature_lines=sender_signature_lines,
+            )
 
-        # LLM-primary path for title + phone + signature_first_line. Runs
-        # once per sender per thread — subsequent messages from the same
-        # sender reuse the cached signature_first_line and skip the call.
-        # `parse_signature`'s title is intentionally NOT used: its line-
-        # adjacency rule is brittle on real signatures (Rino had a blank
-        # line between name and title — the LLM handles that trivially).
-        if sender_email not in signatures_attempted:
-            signatures_attempted.add(sender_email)
-            llm_input = _signature_input(msg.plain_body)
-            if llm_input:
-                try:
-                    llm_title, llm_phone, llm_first_line = (
-                        await llm_client.classify_signature(
-                            llm_input, sender_name=sender_record["name"]
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "classify_signature failed for %s; leaving fields empty",
-                        sender_email,
-                    )
-                    llm_title, llm_phone, llm_first_line = (None, None, None)
-                if llm_title and not sender_record["title"]:
-                    sender_record["title"] = llm_title
-                if llm_phone and not sender_record["phone"]:
-                    sender_record["phone"] = llm_phone
-                if llm_first_line and sender_email not in sender_signature_lines:
-                    sender_signature_lines[sender_email] = llm_first_line
-
-        # Regex backstops. Run on the existing sig_source (sign-off-marker
-        # block if present, otherwise the pre-quote body) so address/company
-        # extraction has tight, signature-shaped input. Title from
-        # parse_signature is dropped — see comment above.
-        sig_source = extract_signature_block(msg.plain_body) or body_before_quotes(
-            msg.plain_body
-        )
-        if sig_source:
-            # Phone backstop: only run regex if the LLM didn't already fill phone.
-            if not sender_record["phone"]:
-                phone = extract_phone(sig_source)
-                if phone:
-                    sender_record["phone"] = phone
-            fields = parse_signature(sig_source, sender_name=sender_record["name"])
-            if fields.address and not sender_record["address"]:
-                sender_record["address"] = fields.address
-            if fields.company and not sender_record["signature_company"]:
-                sender_record["signature_company"] = fields.company
+        for inner in splits.get(msg.message_id, []):
+            inner_sender = find_sender_email(inner.from_field)
+            if not inner_sender or inner_sender not in seen:
+                continue
+            # raw_body preserves the signature; .body has it stripped by clean_body.
+            inner_body = inner.raw_body or inner.body
+            if not inner_body:
+                continue
+            await _enrich_sender_from_body(
+                seen[inner_sender],
+                sender_email=inner_sender,
+                body=inner_body,
+                sender_signature_lines=sender_signature_lines,
+            )
 
     # 3. Upsert Companies (one per unique domain) before contacts, since each
-    # contact needs a company_page_id to populate the relation. Prefer the
-    # signature-derived company name — fall back to the capitalized domain
-    # stem so every company row has a sensible title even when no sender in
-    # the thread carries a full signature for that domain.
+    # contact needs a company_page_id to populate the relation. The company is
+    # titled from the email-domain stem (metropolis.no → "Metropolis"); Goldbox
+    # can rename the title freely since the dedup key is the domain, not the
+    # name (see COMPANIES_PROPS in config.py). We deliberately do NOT title
+    # from signature text — that heuristic created garbage rows like
+    # "Does this mail get added?" out of ordinary body lines.
     # Free-mail domains (gmail.com, outlook.com, …) represent individuals,
     # not companies — skip them entirely so the Companies DB doesn't get a
     # bogus "Gmail" row, and the contact's Company relation stays empty (the
     # truthful state: we don't know what company this person belongs to).
     domain_to_company_page: dict[str, str] = {}
-    domains_with_company: dict[str, str] = {}
-    for contact in seen.values():
-        domain = _domain_of(contact["email"])
-        if not domain or is_free_mail_domain(domain):
-            continue
-        sig_company = contact.get("signature_company")
-        # Prefer the longest/most descriptive name across multiple senders on
-        # the same domain — usually only one anyway.
-        if sig_company and (
-            domain not in domains_with_company
-            or len(sig_company) > len(domains_with_company[domain])
-        ):
-            domains_with_company[domain] = sig_company
-
     for contact in seen.values():
         domain = _domain_of(contact["email"])
         if not domain or domain in domain_to_company_page:
             continue
         if is_free_mail_domain(domain):
             continue
-        name = domains_with_company.get(domain) or company_from_domain(contact["email"])
+        name = company_from_domain(contact["email"])
         try:
             page_id = await _upsert_company(domain=domain, name=name, session=session)
             if page_id:
@@ -607,6 +656,12 @@ async def _upsert_contact(
     no Email yet) gets matched and has its Email filled additively, rather
     than producing a duplicate row. Name match is exact-string and one-result
     only — ambiguous matches fall through to create.
+
+    A name match is only honored when the existing row's Email is empty or
+    already equals the incoming address. If the row already has a *different*
+    email, the incoming address gets its OWN new row instead of being dropped
+    (the single-valued Notion Email field can't hold both, and silently
+    discarding the new address — the prior behavior — lost real contacts).
     """
     email = contact["email"]
     name = contact["name"] or contact["email"]
@@ -657,7 +712,16 @@ async def _upsert_contact(
     # name against a real human name would mis-attach.
     if contact["name"]:
         existing_by_name = await notion_client.find_contact_by_name_exact(contact["name"])
-        if existing_by_name:
+        # Only reuse the row when its Email is empty (the manual-row case) or
+        # already matches ours. A different existing email means this is a
+        # second address for the same name — create a new row rather than drop
+        # the incoming address against the single-valued Email field.
+        existing_email = (
+            notion_client.contact_email_value(existing_by_name.get("properties"))
+            if existing_by_name
+            else None
+        )
+        if existing_by_name and (existing_email is None or existing_email == email):
             page_id = existing_by_name["id"]
             await _cache_contact(session, email=email, page_id=page_id)
             try:
@@ -780,8 +844,8 @@ async def _sync_message(
     Returns `(rows_created, rows_already_present)`.
     """
     # Resolve the LLM-cached signature first line for this sender, if any.
-    # Used by _partition_attachments to drop signature-region images even
-    # when the regex sign-off-marker check finds nothing.
+    # Used by _slice_at_signature to trim the signature out of the row body
+    # even when the regex sign-off-marker check finds nothing.
     sender_hint: str | None = None
     if sender_signature_lines:
         sender_addr = _addr_to_email(msg.from_field).lower()
@@ -832,6 +896,7 @@ async def _sync_message(
             session=session,
             contact_ids=contact_ids,
             attachments_by_synth=by_synth,
+            sender_signature_lines=sender_signature_lines,
             thread_tracker=thread_tracker,
         )
         created += c
@@ -913,19 +978,21 @@ async def _sync_single_message(
     # inline signature logos. The valuable content is the extracted prior
     # messages (history reconstruction handles those).
     if attachment_decisions is None:
-        attachment_decisions = _partition_attachments(
-            msg.plain_body,
-            msg.attachments,
-            signature_first_line_hint=signature_first_line_hint,
-        )
+        attachment_decisions = _partition_attachments(msg.attachments)
     has_potential_attachments = any(d.upload for d in attachment_decisions)
+    # Drop the sender's signature from the row body. The LLM gave us the
+    # verbatim first line of the signature region; cut there. Contacts row
+    # already carries the structured fields (title, phone, address, company).
+    # No-op when the hint is missing or doesn't match — same fallback the
+    # attachment partitioner uses.
+    body_for_row = _slice_at_signature(msg.plain_body, signature_first_line_hint)
     # Keep `[image: NAME]` markers in the body for attachments we're actually
     # uploading — preserves the in-body anchor so Goldbox can see "the image
     # the sender referenced sits HERE in the paragraph." Skipped images
     # (signatures, tiny, inline-repeated) have their markers stripped so the
     # body doesn't reference files that aren't in the row.
     cleaned_body = clean_body(
-        msg.plain_body,
+        body_for_row,
         keep_image_markers=_owning_filenames(attachment_decisions),
     )
     if not cleaned_body and not has_potential_attachments:
@@ -1004,6 +1071,7 @@ async def _sync_forwarded_chain(
     session: AsyncSession,
     contact_ids: dict[str, str],
     attachments_by_synth: dict[str, list[AttachmentDecision]] | None = None,
+    sender_signature_lines: dict[str, str] | None = None,
     thread_tracker: ThreadAttachmentTracker | None = None,
 ) -> tuple[int, int]:
     """Create one Notion row per LLM-extracted message.
@@ -1017,11 +1085,16 @@ async def _sync_forwarded_chain(
     created = 0
     skipped = 0
     attachments_by_synth = attachments_by_synth or {}
+    sender_signature_lines = sender_signature_lines or {}
 
     for inner in extracted:
         synth_id = synthetic_message_id(
             parent_msg.message_id, inner.from_field, inner.body
         )
+        # This segment's sender may differ from the forwarder — resolve their
+        # own signature first line so the signature is sliced out of the body.
+        inner_sender = _addr_to_email(inner.from_field).lower()
+        inner_hint = sender_signature_lines.get(inner_sender)
         c, s = await _sync_extracted_message(
             parent_msg=parent_msg,
             inner=inner,
@@ -1032,6 +1105,7 @@ async def _sync_forwarded_chain(
             session=session,
             contact_ids=contact_ids,
             attachment_decisions=attachments_by_synth.get(synth_id, []),
+            signature_first_line_hint=inner_hint,
             thread_tracker=thread_tracker,
         )
         created += c
@@ -1051,6 +1125,7 @@ async def _sync_extracted_message(
     session: AsyncSession,
     contact_ids: dict[str, str],
     attachment_decisions: list[AttachmentDecision] | None = None,
+    signature_first_line_hint: str | None = None,
     thread_tracker: ThreadAttachmentTracker | None = None,
 ) -> tuple[int, int]:
     """Create a Notion row for one LLM-extracted sub-message.
@@ -1109,6 +1184,11 @@ async def _sync_extracted_message(
         display_body = clean_body(inner.raw_body, keep_image_markers=keep_filenames)
     else:
         display_body = inner.body
+    # Slice off the sender's signature. clean_body only cuts at a sign-off
+    # MARKER ("Mvh", …); a marker-less signature (e.g. Rino's) survives, so we
+    # also cut at the LLM-located signature first line — the same hint the live
+    # path uses. Safe no-op when the hint is absent or doesn't match.
+    display_body = _slice_at_signature(display_body, signature_first_line_hint)
 
     logger.info(
         "    📝 row (history): %s",
@@ -1522,12 +1602,12 @@ def _format_extraction_preview(from_field: str, subject: str, body: str) -> str:
 
 @dataclass
 class AttachmentDecision:
-    """Verdict for one Gmail attachment after position-based filtering.
+    """Verdict for one Gmail attachment after byte-free filtering.
 
     Used so the upload loop can log which attachments are being skipped and
-    why, without losing the original attachment metadata. The position check
-    runs synchronously (no bytes needed); the repetition check (which DOES
-    need bytes) happens later inside the upload loop.
+    why, without losing the original attachment metadata. The size/inline-
+    repeat checks run synchronously (no bytes needed); the cross-message
+    repetition check (which DOES need bytes) happens later in the upload loop.
     """
 
     attachment: gmail_client.GmailAttachment
@@ -1540,9 +1620,8 @@ def _owning_filenames(decisions: list[AttachmentDecision]) -> set[str]:
 
     Only attachments that will actually be uploaded (`upload=True`) qualify —
     keeping a marker for a skipped signature image would leave a dangling
-    reference to a file that isn't in the row. Tiny / inline-repeated /
-    signature-region decisions all have `upload=False` and so don't appear
-    in the keep set.
+    reference to a file that isn't in the row. Tiny / inline-repeated
+    decisions have `upload=False` and so don't appear in the keep set.
     """
     return {d.attachment.filename for d in decisions if d.upload and d.attachment.filename}
 
@@ -1584,21 +1663,80 @@ def _find_line_index(body: str, needle: str) -> int:
     return -1
 
 
+def _resolve_located_line(body: str, line: str | None) -> str | None:
+    """Resolve an LLM-located line to the actual body line it points at.
+
+    The LLM is asked for verbatim lines, but may return one that's slightly off
+    (a dropped char, a smart quote). We prefer the real body text:
+      1. strict line-equality match → that body line;
+      2. case-insensitive substring overlap → that body line;
+      3. last resort → the LLM's own string (the cleaners are robust enough to
+         still extract a value, which beats dropping the field).
+    """
+    if not line:
+        return None
+    idx = _find_line_index(body, line)
+    if idx >= 0:
+        return body.split("\n")[idx].strip()
+    needle = line.strip().lower()
+    if needle:
+        for body_line in body.split("\n"):
+            stripped = body_line.strip()
+            low = stripped.lower()
+            if low and (needle in low or low in needle):
+                return stripped
+    return line.strip()
+
+
+def _slice_at_signature(body: str, signature_first_line: str | None) -> str:
+    """Return `body` truncated to everything BEFORE the signature's first line.
+
+    The signature itself (name, title, phone, email, address, company,
+    inline-image markers below it) is already captured on the Contacts row,
+    so leaving it in the row body is just visual noise. When the hint doesn't
+    match (or no hint was provided), `body` comes back unchanged — same safe
+    no-op pattern as elsewhere.
+
+    Two-tier match on the hint (usually the sender's name, e.g. "Rino Larsen"):
+      1. A body LINE that equals the hint → cut from that line.
+      2. Otherwise, the first line that CONTAINS the hint → cut from there,
+         keeping any text before it on that line. Covers the marker-less
+         signature whose lines `_strip_html` left mushed onto one line
+         ("Supert :)Rino LarsenDaglig leder…"): we still trim from the name on.
+    """
+    if not signature_first_line:
+        return body
+    needle = signature_first_line.strip()
+    if not needle:
+        return body
+    lines = body.split("\n")
+    # Tier 1: exact line match.
+    idx = _find_line_index(body, signature_first_line)
+    if idx >= 0:
+        return "\n".join(lines[:idx])
+    # Tier 2: the hint is embedded inside a line — cut at its position, keeping
+    # the preceding text (and any fully-preceding lines).
+    for i, line in enumerate(lines):
+        pos = line.find(needle)
+        if pos >= 0:
+            head_lines = lines[:i]
+            prefix = line[:pos].rstrip()
+            if prefix:
+                head_lines.append(prefix)
+            return "\n".join(head_lines)
+    return body
+
+
 def _partition_attachments(
-    body: str,
     attachments: list[gmail_client.GmailAttachment],
-    signature_first_line_hint: str | None = None,
 ) -> list[AttachmentDecision]:
     """Decide which attachments are worth downloading + uploading.
 
     Skip rules (all fire without needing bytes, so the Gmail download is
     avoided entirely):
-      1. Position-based: if an attachment's `[image: name]` reference in the
-         plain-text body sits at or below the signature-start line, it's a
-         signature-region decoration.
-      2. Tiny-image: image/* attachments under 1 KB are Office-generated
+      1. Tiny-image: image/* attachments under 1 KB are Office-generated
          signature thumbnails (e.g. `~WRD0002.jpg`), never real content.
-      3. Inline-repeated: image/* attachments with `inline_ref_count >= 2`
+      2. Inline-repeated: image/* attachments with `inline_ref_count >= 2`
          are referenced multiple times in the SAME message's HTML — that
          only happens for signature logos carried in every quoted reply
          block of an Outlook thread. Real photo attachments are referenced
@@ -1606,24 +1744,22 @@ def _partition_attachments(
          Gmail keeping the bytes alive across replies and is handled by
          `ThreadAttachmentTracker`).
 
+    We deliberately do NOT use a position-based "marker sits at/below the
+    signature line ⇒ decoration" rule. It was too aggressive: real photos in
+    short emails ("Se bilde to 🙂") get their `[image:]` marker right next to
+    the sign-off and were silently dropped. Losing a real client image is far
+    worse than letting one stray logo through, so the size + inline-repeat
+    signals (plus the cross-message `_is_repeating_signature_image` check in
+    the upload loop) carry signature detection on their own now.
+
     Repetition across messages from the same sender (e.g. the same logo in
     many separate threads) is NOT detected here — it requires the bytes and
     runs in the upload loop via `_is_repeating_signature_image`.
-
-    `signature_first_line_hint` is the LLM-derived first line of the sender's
-    signature (cached per-thread). Used as a fallback when the regex marker
-    is absent — e.g. Rino's email has no "Mvh" line, so `find_signature_start_line`
-    returns -1, but the LLM identifies "Rino Larsen" as the first signature
-    line; we then find that line index in the body and use it as the cutoff.
 
     Returns one `AttachmentDecision` per input attachment, preserving order.
     """
     if not attachments:
         return []
-    signature_line = find_signature_start_line(body)
-    if signature_line < 0 and signature_first_line_hint:
-        # Regex marker missing — fall back to the LLM's answer.
-        signature_line = _find_line_index(body, signature_first_line_hint)
     out: list[AttachmentDecision] = []
     for att in attachments:
         if (
@@ -1631,21 +1767,21 @@ def _partition_attachments(
             and att.size > 0
             and att.size < _TINY_IMAGE_BYTES
         ):
-            out.append(AttachmentDecision(att, upload=False, skip_reason="tiny-image"))
-            continue
-        if att.mime_type.startswith("image/") and att.inline_ref_count >= 2:
-            out.append(
-                AttachmentDecision(att, upload=False, skip_reason="inline-repeated")
-            )
-            continue
-        if signature_line >= 0:
-            ref_line = find_attachment_reference_line(body, att.filename)
-            if ref_line >= 0 and ref_line >= signature_line:
-                out.append(
-                    AttachmentDecision(att, upload=False, skip_reason="signature-region")
-                )
-                continue
-        out.append(AttachmentDecision(att, upload=True))
+            decision = AttachmentDecision(att, upload=False, skip_reason="tiny-image")
+        elif att.mime_type.startswith("image/") and att.inline_ref_count >= 2:
+            decision = AttachmentDecision(att, upload=False, skip_reason="inline-repeated")
+        else:
+            decision = AttachmentDecision(att, upload=True)
+        logger.debug(
+            "partition: %r mime=%s size=%s inline_ref_count=%s → upload=%s skip=%s",
+            att.filename,
+            att.mime_type,
+            att.size,
+            att.inline_ref_count,
+            decision.upload,
+            decision.skip_reason,
+        )
+        out.append(decision)
     return out
 
 
@@ -1666,21 +1802,14 @@ def _attribute_attachments(
     Attribution rule: oldest extracted email with a body mention wins; if no
     extracted body mentions the file, it stays on the forwarder's row.
 
-    The position-based signature-region check still runs against the forwarder's
-    body — those skips are about decorations on the forwarder's own signature,
-    not about ownership.
-
     Returns `(forwarder_decisions, by_synthetic_id)`:
       - forwarder_decisions: AttachmentDecisions owned by the top-level Gmail
-        message (signature-region skips + everything not attributed elsewhere).
+        message (tiny/inline-repeated skips + everything not attributed
+        elsewhere).
       - by_synthetic_id: synthetic_id → list of AttachmentDecisions attributed
         to that extracted email.
     """
-    all_decisions = _partition_attachments(
-        parent_msg.plain_body,
-        parent_msg.attachments,
-        signature_first_line_hint=signature_first_line_hint,
-    )
+    all_decisions = _partition_attachments(parent_msg.attachments)
     if not extracted:
         return all_decisions, {}
 
@@ -1794,23 +1923,29 @@ SIZE_TOLERANCE_BYTES = 10 * 1024
 
 @dataclass
 class ThreadAttachmentTracker:
-    """Per-thread memory of attachments already uploaded, scoped by sender + filename.
+    """Per-thread memory of attachments already uploaded.
 
     Two failure modes this prevents:
-    1. Gmail re-carries attachments on every reply (quoted MIME tree). Without
-       this, the same PDF uploads once per reply that quoted it.
+    1. Gmail re-carries attachments on every reply (quoted MIME tree). Each
+       later reply has a DIFFERENT author, so the same image bytes show up
+       again attributed to a new sender. Without thread-wide content dedup the
+       same photo uploads once per reply that quoted it.
     2. A sender attaches the same signature image to multiple messages in the
-       thread, and Gmail re-wraps the bytes between messages so neither sha1
-       nor exact size match — but it's still the same image.
+       thread, and Gmail re-wraps the bytes between messages so the sha1
+       differs slightly — but it's still the same image.
 
-    Key: `(sender_lower, filename)`. Value: list of `(size, sha1)` recorded
-    for every successful upload of that key. A later attachment matches if
-    either (a) its sha1 equals a prior sha1 (exact re-carry from a quote) or
-    (b) its size is within ±SIZE_TOLERANCE_BYTES of a prior size (same image,
-    different MIME wrapping). Sender keying prevents false positives when two
-    thread participants legitimately share a filename like `screenshot.png`.
+    `sha1s` is a thread-wide set of content hashes already uploaded. An exact
+    sha1 match is sender-independent: identical bytes are the same image no
+    matter who the quoting message is from (two distinct real images won't
+    collide). This is what kills the re-carry duplicates.
+
+    `seen` keeps the fuzzy fallback: `(sender_lower, filename) → [(size, sha1)]`.
+    When the sha1 doesn't match (re-wrapped bytes) we accept a size-within-
+    tolerance match, but only within the same sender+filename so two
+    participants sharing `screenshot.png` aren't wrongly collapsed.
     """
 
+    sha1s: set[str] = field(default_factory=set)
     seen: dict[tuple[str, str], list[tuple[int, str]]] = field(default_factory=dict)
 
 
@@ -1867,24 +2002,29 @@ async def _upload_attachments(
                 "    ⏏  skip attachment %r: %s", d.attachment.filename, d.skip_reason
             )
             continue
-        if not d.attachment.attachment_id:
-            # Inline-embedded part (no separate attachment_id) — body MIME
-            # part carries the bytes but we don't currently extract them.
-            # Rare; usually cid-referenced signature images.
+        if d.attachment.attachment_id:
+            try:
+                content = await asyncio.to_thread(
+                    gmail_client.get_attachment_bytes,
+                    user_email,
+                    parent_msg.message_id,
+                    d.attachment.attachment_id,
+                )
+            except Exception:
+                logger.exception(
+                    "    ✗ Gmail attachment fetch failed for %r", d.attachment.filename
+                )
+                continue
+        elif d.attachment.inline_data:
+            # Inline-embedded part: Gmail returned the bytes in body.data with
+            # no attachmentId. Decode the bytes we already downloaded instead
+            # of making a (impossible) attachments.get call. This is the path
+            # Outlook inline photos take — without it they're silently lost.
+            content = gmail_client.decode_inline_data(d.attachment.inline_data)
+        else:
             logger.info(
-                "    ⏏  skip attachment %r: inline-embedded, no id", d.attachment.filename
-            )
-            continue
-        try:
-            content = await asyncio.to_thread(
-                gmail_client.get_attachment_bytes,
-                user_email,
-                parent_msg.message_id,
-                d.attachment.attachment_id,
-            )
-        except Exception:
-            logger.exception(
-                "    ✗ Gmail attachment fetch failed for %r", d.attachment.filename
+                "    ⏏  skip attachment %r: inline-embedded, no id and no data",
+                d.attachment.filename,
             )
             continue
         if not content:
@@ -1892,16 +2032,23 @@ async def _upload_attachments(
                 "    ⏏  skip attachment %r: empty content from Gmail", d.attachment.filename
             )
             continue
-        # Thread-level dedup. Scoped by (sender, filename) — see
-        # ThreadAttachmentTracker docstring for the rationale on why size
-        # equality alone wasn't enough.
+        # Thread-level dedup. First, an exact content match anywhere in the
+        # thread (sender-independent) — this is the common case: a reply quotes
+        # an earlier message and Gmail re-carries the identical bytes under the
+        # replier's name. Then a fuzzy (sender, filename, ±size) fallback for
+        # the same image re-wrapped by Gmail so its sha1 shifted.
         content_sha1 = hashlib.sha1(content).hexdigest()
         tracker_key = (sender, d.attachment.filename)
+        if content_sha1 in thread_tracker.sha1s:
+            logger.info(
+                "    ⏏  skip attachment %r: already uploaded earlier in this thread",
+                d.attachment.filename,
+            )
+            continue
         prior_entries = thread_tracker.seen.get(tracker_key, [])
         is_dup = any(
-            prior_sha1 == content_sha1
-            or abs(prior_size - d.attachment.size) <= SIZE_TOLERANCE_BYTES
-            for prior_size, prior_sha1 in prior_entries
+            abs(prior_size - d.attachment.size) <= SIZE_TOLERANCE_BYTES
+            for prior_size, _prior_sha1 in prior_entries
         )
         if is_dup:
             logger.info(
@@ -1952,6 +2099,7 @@ async def _upload_attachments(
             # Only mark seen if at least one project copy made it through —
             # otherwise a transient Drive failure would prevent a retry on
             # the next thread sync.
+            thread_tracker.sha1s.add(content_sha1)
             thread_tracker.seen.setdefault(tracker_key, []).append(
                 (d.attachment.size, content_sha1)
             )

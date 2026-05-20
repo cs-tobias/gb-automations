@@ -1,28 +1,38 @@
-"""Pull structured fields (title, address, company) out of an email signature.
+"""Signature field extraction: two roles in one module.
 
-Input is typically the output of `extract_signature_block()` in
-`utils/email_cleaning.py`, but the parser also tolerates a raw tail of body
-text (Petter's signature in the wild has no Mvh/sign-off line, so the
-signature extractor returns nothing — we still want title/address/company
-from those messages, and `_upsert_thread_contacts` will fall back to passing
-the message body tail directly).
+1. `clean_*_line` — turn a single VERBATIM line (the LLM's locator output, see
+   `clients/llm.py` `classify_signature`) into a clean value. The LLM is good
+   at picking *which* line holds the title / phone / address even in odd
+   formats; these helpers do the deterministic cleanup (strip the "m:"/"a:"
+   label, drop a trailing company off the title, etc.). This is the primary
+   path.
 
-No LLM. The structure of a Norwegian business signature is consistent enough
-that line-position + format heuristics work:
+2. `parse_signature` — the regex-only BACKSTOP used when the LLM is down or
+   returns nothing. It pulls title/address out of a whole signature region by
+   line-position heuristics. Input is typically `extract_signature_block()`
+   from `utils/email_cleaning.py`, but it also tolerates a raw body tail.
+
+Company name is intentionally NOT derived here: the "first non-contact text
+line is the company" heuristic grabbed arbitrary body sentences ("Does this
+mail get added?") and bare first names ("Tobias"). Company names come solely
+from the email-domain stem (`company_from_domain`) — which `clean_title_line`
+also uses to strip a company suffix off the title line.
+
+The backstop assumes a roughly canonical Norwegian business signature:
 
     [Med vennlig hilsen ...]   ← optional sign-off (already stripped sometimes)
     <Person Name>              ← matches sender name
     <Title>                    ← short text line, no digits/@/url
     <Phone(s)>                 ← lines containing digits and/or '+'
     <Email>                    ← line containing '@'
-    <Company>                  ← short capitalized line, no digits/@/url
-    <Street, postal city>      ← contains 4-digit postal code
+    <Street, postal city>      ← 4-digit postal code OR a known Norwegian city
     <URLs>                     ← .no/.com lines we ignore
 """
 
 import re
 from dataclasses import dataclass
 
+from gb_automations.utils.phone import extract_phone
 
 _PHONE_HINT_RE = re.compile(r"[\d+()]")
 _EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
@@ -31,6 +41,34 @@ _URL_RE = re.compile(r"^(https?://|www\.)|\.(no|com|org|net|io|co)(/|$)", re.IGN
 # capital letter (incl. ÆØÅ) is what distinguishes "0184 Oslo" from a random
 # digit run like "tlf 12345".
 _NORWEGIAN_POSTAL_RE = re.compile(r"\b\d{4}\s+[A-ZÆØÅ][A-Za-zÆØÅæøå\- ]+")
+# Address fallback for the regex backstop: a line naming a known Norwegian city
+# is treated as an address even when the postal-code regex misses (e.g. the
+# pipe-separated "NO0258 Oslo" form where "NO" prefixes the digits and breaks
+# \b\d{4}). Lowercased; matched on whole-word tokens. Not exhaustive — the
+# largest towns plus the ones we've actually seen in signatures.
+_NORWEGIAN_CITIES = frozenset(
+    {
+        "oslo", "bergen", "trondheim", "stavanger", "drammen", "fredrikstad",
+        "kristiansand", "sandnes", "tromsø", "sarpsborg", "skien", "ålesund",
+        "sandefjord", "haugesund", "tønsberg", "moss", "porsgrunn", "bodø",
+        "arendal", "hamar", "ytrebygda", "larvik", "halden", "harstad",
+        "lillehammer", "molde", "horten", "gjøvik", "askøy", "kongsberg",
+        "kristiansund", "rana", "mo i rana", "jessheim", "narvik", "ski",
+        "elverum", "leirvik", "nesoddtangen", "vennesla", "førde", "alta",
+        "kongsvinger", "lillestrøm", "drøbak", "grimstad", "bryne", "kvinnherad",
+        "stjørdal", "steinkjer", "namsos", "levanger", "verdal", "egersund",
+        "mandal", "notodden", "kragerø", "risør", "florø", "voss", "odda",
+        "lyngdal", "farsund", "flekkefjord", "ås", "vestby", "råde", "rygge",
+        "askim", "mysen", "spydeberg", "hokksund", "vikersund", "hønefoss",
+        "jaren", "raufoss", "brumunddal", "moelv", "tynset", "røros", "oppdal",
+        "orkanger", "brekstad", "melhus", "malvik", "stjordal", "sortland",
+        "svolvær", "leknes", "fauske", "mosjøen", "brønnøysund", "sandnessjøen",
+        "finnsnes", "bardufoss", "kirkenes", "vadsø", "hammerfest", "honningsvåg",
+        "kolbotn", "sandvika", "asker", "lysaker", "skøyen", "majorstuen",
+        "stabekk", "fornebu", "billingstad", "slependen", "heggedal",
+        "nydalen", "økern",
+    }
+)
 # Sign-off lines we always skip even if extract_signature_block didn't.
 _SIGNOFF_LINE_RE = re.compile(
     r"^(med\s+vennlig\s+hilsen|mvh\.?|vennlig\s+hilsen|vh|best\s+regards?|"
@@ -41,18 +79,78 @@ _SIGNOFF_LINE_RE = re.compile(
 # sit < 60 chars. We don't enforce these — they just help when scoring.
 
 _MAX_TITLE_LEN = 60
-_MAX_COMPANY_LEN = 60
+
+# Leading contact labels on a signature line: "a:", "Tlf:", "m:", "Mob.:",
+# "e:", "E-post:" etc. We strip these off a located line before storing the
+# value. Tolerates ':' or '.' as the separator.
+_LEADING_LABEL_RE = re.compile(
+    r"^\s*(a|adr|adresse|address|t|tlf|tel|telefon|m|mob|mobil|p|ph|phone"
+    r"|e|email|e-post|epost)\s*[:.]\s*",
+    re.IGNORECASE,
+)
+# Title lines often end with a company segment after a "|" or "/" separator
+# ("Daglig leder| NIMREM", "Senterleder / Goldbox"). We cut a trailing segment
+# when it matches the known company; the company itself comes from the domain.
+_TITLE_SPLIT_RE = re.compile(r"\s*[|/]\s*")
 
 
 @dataclass(frozen=True)
 class SignatureFields:
     title: str | None
     address: str | None
-    company: str | None
+
+
+def _strip_leading_label(line: str) -> str:
+    return _LEADING_LABEL_RE.sub("", line, count=1).strip()
+
+
+def clean_phone_line(line: str | None) -> str | None:
+    """Extract a normalized phone number from a single located line.
+
+    Delegates to `extract_phone`, which already strips "m:"/"Mob.:" labels and
+    normalizes separators. Returns None when the line holds no usable number.
+    """
+    if not line:
+        return None
+    return extract_phone(line)
+
+
+def clean_title_line(
+    line: str | None,
+    known_company: str | None = None,
+    sender_name: str | None = None,
+) -> str | None:
+    """Strip a leading label and a trailing company segment from a title line.
+
+    `Daglig leder| NIMREM` with known_company "Nimrem" → `Daglig leder`.
+    A trailing segment is only cut when it matches `known_company`
+    (case-insensitive), so genuine dual roles like `Partner / Daglig leder`
+    survive when the company doesn't appear.
+
+    Validation: the LLM sometimes points at the wrong line when a sender has no
+    title (it returns the NAME line) or at a URL/email. Reject those — a title
+    is never the sender's own name, a website, an email, or a phone number.
+    Returns None when the line is empty or fails validation.
+    """
+    if not line:
+        return None
+    cleaned = _strip_leading_label(line)
+    if known_company:
+        segments = _TITLE_SPLIT_RE.split(cleaned)
+        if len(segments) > 1 and segments[-1].strip().lower() == known_company.strip().lower():
+            cleaned = _TITLE_SPLIT_RE.split(cleaned)[:-1]
+            cleaned = " / ".join(s.strip() for s in cleaned).strip()
+    if not cleaned:
+        return None
+    if _is_url_line(cleaned) or _is_email_line(cleaned) or _is_phone_line(cleaned):
+        return None
+    if sender_name and cleaned.strip().lower() == sender_name.strip().lower():
+        return None
+    return cleaned
 
 
 def parse_signature(signature_block: str, sender_name: str | None = None) -> SignatureFields:
-    """Extract title / address / company from a signature region.
+    """Extract title / address from a signature region.
 
     `sender_name` is used to locate the anchor line ("the line that contains
     the sender's name"); the title line sits immediately below it. When the
@@ -60,18 +158,17 @@ def parse_signature(signature_block: str, sender_name: str | None = None) -> Sig
     to the line just above the first phone/email line.
     """
     if not signature_block:
-        return SignatureFields(None, None, None)
+        return SignatureFields(None, None)
 
     lines = _clean_lines(signature_block)
     if not lines:
-        return SignatureFields(None, None, None)
+        return SignatureFields(None, None)
 
     name_idx = _find_name_index(lines, sender_name)
     title = _extract_title(lines, name_idx)
     address = _extract_address(lines)
-    company = _extract_company(lines, name_idx=name_idx, title=title, address=address)
 
-    return SignatureFields(title=title, address=address, company=company)
+    return SignatureFields(title=title, address=address)
 
 
 def _clean_lines(block: str) -> list[str]:
@@ -111,7 +208,12 @@ def _is_url_line(line: str) -> bool:
 
 
 def _is_address_line(line: str) -> bool:
-    return bool(_NORWEGIAN_POSTAL_RE.search(line))
+    if _NORWEGIAN_POSTAL_RE.search(line):
+        return True
+    # Fallback: a known Norwegian city as a whole-word token. Catches forms the
+    # postal regex misses, e.g. "NO0258 Oslo" or pipe-separated address lines.
+    tokens = re.split(r"[^A-Za-zÆØÅæøå]+", line.lower())
+    return any(t in _NORWEGIAN_CITIES for t in tokens if t)
 
 
 def _find_name_index(lines: list[str], sender_name: str | None) -> int:
@@ -175,14 +277,18 @@ def _looks_like_title(line: str) -> bool:
 
 
 def _extract_address(lines: list[str]) -> str | None:
-    """Find the postal-code line; prepend the previous line if it looks like a street."""
+    """Find the postal-code/city line; prepend the previous line if it's a street.
+
+    A leading "a:"/"adr:" label is stripped off the result (some senders label
+    the address line, e.g. "a: Parkveien 37 | NO0258 Oslo | Norway").
+    """
     for i, line in enumerate(lines):
         if _is_address_line(line):
             if i > 0:
                 prev = lines[i - 1]
                 if _looks_like_street(prev):
-                    return f"{prev}, {line}"
-            return line
+                    return f"{_strip_leading_label(prev)}, {_strip_leading_label(line)}"
+            return _strip_leading_label(line)
     return None
 
 
@@ -192,61 +298,10 @@ def _looks_like_street(line: str) -> bool:
         return False
     if _is_email_line(line) or _is_url_line(line):
         return False
+    # A phone line ("Mob.: +47 90178028") has a digit + letters but is never a
+    # street — without this we'd prepend it to the postal line.
+    if _is_phone_line(line):
+        return False
     has_digit = any(c.isdigit() for c in line)
     has_alpha = any(c.isalpha() for c in line)
     return has_digit and has_alpha
-
-
-def _extract_company(
-    lines: list[str],
-    *,
-    name_idx: int,
-    title: str | None,
-    address: str | None,
-) -> str | None:
-    """Find a company-name line.
-
-    Strategy: scan lines, skipping name/title/phone/email/url/address lines.
-    The first remaining short text line wins. Capitalized first letter preferred
-    but not required (some companies render lowercase). When there's no
-    address, the company is often the last non-noise line of the signature
-    (e.g. "Petter Burhol / Daglig leder / +47.../ petter@goldbox.no /
-    www.goldbox.no" — no explicit company line; we then fall back to the URL
-    stem, e.g. "goldbox").
-    """
-    skip_lines = set()
-    if name_idx >= 0:
-        skip_lines.add(name_idx)
-
-    for i, line in enumerate(lines):
-        if i in skip_lines:
-            continue
-        if title and line == title:
-            continue
-        if address and (line in address or (", " in address and line == address.split(", ", 1)[0])):
-            continue
-        if _is_phone_line(line) or _is_email_line(line) or _is_url_line(line):
-            continue
-        if _is_address_line(line):
-            continue
-        if len(line) > _MAX_COMPANY_LEN:
-            continue
-        if not any(c.isalpha() for c in line):
-            continue
-        return line
-
-    # Fallback: derive from the first URL line (e.g. "www.goldbox.no" → "Goldbox").
-    for line in lines:
-        if _is_url_line(line):
-            stem = _company_from_url_line(line)
-            if stem:
-                return stem
-    return None
-
-
-def _company_from_url_line(line: str) -> str | None:
-    # Strip protocol + www, take the first label.
-    s = re.sub(r"^(https?://)?(www\.)?", "", line.strip(), flags=re.IGNORECASE)
-    label = s.split("/", 1)[0].split(".", 1)[0]
-    label = label.strip()
-    return label.capitalize() if label else None

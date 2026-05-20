@@ -540,8 +540,11 @@ def find_signature_start_line(text: str) -> int:
     """Index of the FINAL signature marker line in `text`, or -1 if none.
 
     Scans bottom-up so we find the signature of the message-as-received,
-    not a signature from a forwarded segment higher up. Used by attachment
-    handling to detect signature-region images (e.g. logo PNGs after Mvh).
+    not a signature from a forwarded segment higher up.
+
+    NOTE: no longer used by the attachment path — the position-based
+    signature-region skip was removed because it dropped real photos in short
+    emails. Kept as a general utility (and exercised by tests).
     """
     if not text:
         return -1
@@ -555,8 +558,8 @@ def find_signature_start_line(text: str) -> int:
 def find_attachment_reference_line(text: str, attachment_name: str) -> int:
     """Line index where `[image: attachment_name]` appears in `text`, or -1.
 
-    Used together with find_signature_start_line to detect signature-region
-    images that should not be treated as real attachments.
+    NOTE: no longer used by the attachment path (the position-based
+    signature-region skip was removed). Kept as a general utility.
     """
     if not text or not attachment_name:
         return -1

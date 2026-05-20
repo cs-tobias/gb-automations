@@ -549,6 +549,18 @@ def _has_email(prop: dict[str, Any] | None) -> bool:
     return bool(prop and prop.get("email"))
 
 
+def contact_email_value(props: dict[str, Any] | None) -> str | None:
+    """The Email value on a contact's `properties` dict, or None if unset.
+
+    Lets callers (sync_thread's name-match path) compare an existing row's
+    email against an incoming one without re-querying Notion.
+    """
+    if not props:
+        return None
+    email = (props.get(CONTACTS_PROPS["email"]) or {}).get("email")
+    return email or None
+
+
 def _has_phone(prop: dict[str, Any] | None) -> bool:
     return bool(prop and prop.get("phone_number"))
 

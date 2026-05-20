@@ -15,6 +15,8 @@ from gb_automations.clients.gmail import (
     _extract_body_and_attachments,
     _inject_inline_image_markers,
     _normalize_content_id,
+    _synthesize_inline_filename,
+    decode_inline_data,
 )
 
 
@@ -221,3 +223,95 @@ def test_extract_body_falls_back_to_plain_when_html_absent():
     body, _atts = _extract_body_and_attachments(payload)
     assert "Hei," in body
     assert "Mvh" in body
+
+
+# --- Inline image recovery (D1 + D2) ---------------------------------------
+# Regression: Outlook inline photos arrive either (D1) with a Content-ID but
+# NO filename, or (D2) with the bytes inline in body.data and NO attachmentId.
+# Both used to be silently dropped, losing real images.
+
+
+def test_synthesize_inline_filename_from_content_id():
+    # cid stem before @host, extension from mime.
+    assert _synthesize_inline_filename("abc123@host", "image/png", 1) == "abc123.png"
+    assert _synthesize_inline_filename("photo@01D", "image/jpeg", 1) == "photo.jpg"
+
+
+def test_synthesize_inline_filename_counter_fallback():
+    # No usable cid → per-message counter.
+    assert _synthesize_inline_filename(None, "image/png", 3) == "inline-image-3.png"
+    assert _synthesize_inline_filename("@host", "image/gif", 2) == "inline-image-2.gif"
+
+
+def test_synthesize_inline_filename_unknown_mime_falls_back_to_bin():
+    assert _synthesize_inline_filename("x@y", "application/octet-stream", 1) == "x.bin"
+
+
+def test_extract_captures_inline_image_without_filename():
+    """D1: an image part with a Content-ID but an empty filename is captured
+    (and given a synthesized filename) rather than dropped."""
+    payload = {
+        "mimeType": "multipart/related",
+        "parts": [
+            {
+                "mimeType": "text/html",
+                "body": {"data": _b64('<p>Se bildet</p><img src="cid:img7@host">')},
+            },
+            {
+                "mimeType": "image/png",
+                "filename": "",  # Outlook omits the filename on inline parts
+                "headers": [{"name": "Content-ID", "value": "<img7@host>"}],
+                "body": {"size": 8000, "attachmentId": "ATT_X"},
+            },
+        ],
+    }
+    body, atts = _extract_body_and_attachments(payload)
+    assert len(atts) == 1
+    assert atts[0].filename == "img7.png"
+    assert atts[0].content_id == "img7@host"
+    # The injected marker uses the synthesized filename, so attribution still works.
+    assert "[image: img7.png]" in body
+
+
+def test_extract_captures_inline_data_when_no_attachment_id():
+    """D2: an inline part carrying bytes in body.data with no attachmentId
+    keeps those bytes on inline_data so the upload path can decode them."""
+    raw = b"\x89PNG\r\n\x1a\n fake png bytes"
+    payload = {
+        "mimeType": "multipart/related",
+        "parts": [
+            {
+                "mimeType": "text/html",
+                "body": {"data": _b64('<img src="cid:inlinepic@h">')},
+            },
+            {
+                "mimeType": "image/png",
+                "filename": "",
+                "headers": [{"name": "Content-ID", "value": "<inlinepic@h>"}],
+                "body": {
+                    "size": len(raw),
+                    "data": base64.urlsafe_b64encode(raw).decode("ascii").rstrip("="),
+                    # no attachmentId
+                },
+            },
+        ],
+    }
+    _body, atts = _extract_body_and_attachments(payload)
+    assert len(atts) == 1
+    assert atts[0].attachment_id is None
+    assert atts[0].inline_data is not None
+    assert decode_inline_data(atts[0].inline_data) == raw
+
+
+def test_extract_does_not_capture_text_or_container_parts_as_attachments():
+    """Text bodies and multipart containers must never be mistaken for
+    inline attachments even though they lack a filename."""
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": _b64("hei")}},
+            {"mimeType": "text/html", "body": {"data": _b64("<p>hei</p>")}},
+        ],
+    }
+    _body, atts = _extract_body_and_attachments(payload)
+    assert atts == []

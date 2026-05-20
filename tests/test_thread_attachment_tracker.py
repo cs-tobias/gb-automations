@@ -1,9 +1,13 @@
 """Tests for the per-thread attachment dedup tracker.
 
-Pins the (sender, filename) + ±10 KB rule that catches Gmail re-wrapping
-signature images between messages — the bug where the same TIFF signature
-from one sender uploaded twice in a single thread because the byte size
-shifted by 100 bytes between messages.
+Two rules:
+1. Thread-wide exact sha1 — identical bytes anywhere in the thread are the
+   same image regardless of sender. This kills the re-carry duplicates:
+   each reply quotes earlier attachments under a DIFFERENT author, so the
+   sender-scoped rule alone re-uploaded the same photo once per reply.
+2. (sender, filename) + ±10 KB — the fuzzy fallback for the same image Gmail
+   re-wrapped between messages so its sha1 shifted; scoped to one sender so
+   two participants sharing `screenshot.png` aren't collapsed.
 """
 
 from __future__ import annotations
@@ -22,13 +26,14 @@ def _is_dup(
     size: int,
     sha1: str,
 ) -> bool:
-    # Mirrors the predicate in _upload_attachments. Kept here as a pure
-    # function so the test exercises the same key shape and tolerance check
-    # without needing to spin up the full async upload coroutine.
+    # Mirrors the predicate in _upload_attachments: global sha1 first, then
+    # the sender+filename ±size fallback. Kept as a pure function so the test
+    # exercises the same logic without the full async upload coroutine.
+    if sha1 in tracker.sha1s:
+        return True
     prior = tracker.seen.get((sender, filename), [])
     return any(
-        prior_sha1 == sha1 or abs(prior_size - size) <= SIZE_TOLERANCE_BYTES
-        for prior_size, prior_sha1 in prior
+        abs(prior_size - size) <= SIZE_TOLERANCE_BYTES for prior_size, _ in prior
     )
 
 
@@ -40,6 +45,7 @@ def _record(
     size: int,
     sha1: str,
 ) -> None:
+    tracker.sha1s.add(sha1)
     tracker.seen.setdefault((sender, filename), []).append((size, sha1))
 
 
@@ -82,9 +88,9 @@ def test_exact_byte_recarry_is_duplicate():
     )
 
 
-def test_different_sender_same_filename_is_not_duplicate():
-    # Two participants both happen to attach "screenshot.png" — these are
-    # legitimately different files and both should upload.
+def test_different_sender_same_filename_different_bytes_is_not_duplicate():
+    # Two participants both happen to attach "screenshot.png" — different
+    # bytes (different sha1), so both should upload.
     tracker = ThreadAttachmentTracker()
     _record(
         tracker,
@@ -102,7 +108,32 @@ def test_different_sender_same_filename_is_not_duplicate():
     )
 
 
+def test_recarry_across_senders_same_bytes_is_duplicate():
+    # The actual bug: a reply quotes the earlier message and Gmail re-carries
+    # the IDENTICAL image bytes under the replier's name. Same sha1, different
+    # sender (and even a different Gmail-renumbered filename) — must skip so
+    # the photo doesn't re-upload once per reply in the thread.
+    tracker = ThreadAttachmentTracker()
+    _record(
+        tracker,
+        sender="lasse@kongssenteret.no",
+        filename="IMG_2555.jpeg",
+        size=2_698_240,
+        sha1="photo-sha",
+    )
+    assert _is_dup(
+        tracker,
+        sender="hello@motionindex.io",  # different author, quoted reply
+        filename="IMG_2555.jpeg",
+        size=2_698_240,
+        sha1="photo-sha",  # identical bytes
+    )
+
+
 def test_same_sender_different_filename_is_not_duplicate():
+    # Two genuinely different attachments (distinct bytes) from one sender —
+    # both upload even though the size happens to match. Filename-scoping on
+    # the fuzzy rule keeps them apart.
     tracker = ThreadAttachmentTracker()
     _record(
         tracker,
@@ -116,7 +147,7 @@ def test_same_sender_different_filename_is_not_duplicate():
         sender="rino@klatredigital.no",
         filename="PastedGraphic-8.tiff",
         size=6451,
-        sha1="aaa",
+        sha1="bbb",  # different bytes — a different image
     )
 
 

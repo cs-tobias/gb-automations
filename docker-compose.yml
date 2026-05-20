@@ -1,3 +1,13 @@
+# Base stack. Whether ollama runs in-container or natively on the host is
+# controlled by which override file Compose layers on top of this one —
+# selected by COMPOSE_FILE in .env (the single OLLAMA_MODE switch).
+#
+#   compose.ollama-native.yml     → no ollama service; api → host.docker.internal:11434
+#   compose.ollama-container.yml  → ollama service runs;  api → ollama:11434
+#
+# Compose reads COMPOSE_FILE from .env automatically and treats it as
+# "-f <a> -f <b>" — so the user only edits one line in .env.
+
 services:
   api:
     build:
@@ -12,8 +22,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama:
-        condition: service_started
     restart: unless-stopped
 
   db:
@@ -46,38 +54,5 @@ services:
       - api
     restart: unless-stopped
 
-  # Local LLM (Ollama).
-  #
-  # Runs by default — `docker compose up -d` starts it alongside api/db. This
-  # is the cross-platform baseline: a Windows or Linux box only needs Docker.
-  # The api auto-pulls the configured model on first boot (see main.py
-  # lifespan), so no manual `pull_llm_model` step is required.
-  #
-  # On Windows with an NVIDIA GPU, layer the GPU override:
-  #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
-  # Verify with: docker compose exec ollama nvidia-smi
-  #
-  # Mac dev opt-out (for native Metal acceleration): set
-  # OLLAMA_BASE_URL=http://host.docker.internal:11434 in .env, run
-  # `OLLAMA_HOST=0.0.0.0:11434 ollama serve` natively, then stop the
-  # in-container service with `docker compose stop ollama` so it doesn't
-  # waste ~5GB of disk and idle RAM.
-  #
-  # Models persist in the named volume across rebuilds.
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    restart: unless-stopped
-
 volumes:
   db_data:
-  ollama_data:

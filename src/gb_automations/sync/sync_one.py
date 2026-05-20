@@ -29,11 +29,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sync one Gmail thread into Notion.")
     p.add_argument("--email", required=True, help="Workspace user to impersonate (DWD)")
     p.add_argument("--thread", required=True, help="Gmail thread ID to sync")
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Verbose DEBUG logging (MIME-part walk, attachment partitioning)",
+    )
     return p.parse_args()
 
 
 async def main() -> int:
     args = parse_args()
+    if args.debug:
+        logging.getLogger("gb_automations").setLevel(logging.DEBUG)
     result = await sync_thread(args.email, args.thread)
     print(json.dumps(asdict(result), indent=2))
     return 0 if not result.errors else 1
