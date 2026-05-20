@@ -14,16 +14,22 @@ Usage (inside the container):
     docker compose exec api python -m gb_automations.scripts.reset_thread \\
         --thread 19e166c93fdbc5c6
 
-A full reset clears: `email_rows`, `attachment_fingerprints` (signature-
-detection state), `emails_db_cache` (the year-partitioned Emails DB router's
-persistent lookup), `contact_cache` + `company_cache` (so contacts/companies
-get re-resolved against Notion on the next sync — required when you've
-manually deleted the Notion Contacts/Companies rows, otherwise stale Notion
-page IDs in the cache will cause Notion PATCH failures), and `project_labels`
-(the Notion project ↔ Gmail label mapping — wiped so re-clicking the Notion
-Sync-to-Gmail button re-mints rows pointing at whatever labels exist now).
-Pass `--keep-fingerprints`, `--keep-db-cache`, `--keep-contacts`, or
-`--keep-project-labels` to preserve any of them across the reset.
+A full reset clears: `email_rows`, `thread_attachments` (the durable per-thread
+Drive-upload dedup — wiped so the next sync re-uploads attachments and re-links
+them in Notion), `attachment_fingerprints` (signature-detection state),
+`emails_db_cache` (the year-partitioned Emails DB router's persistent lookup),
+`contact_cache` + `company_cache` (so contacts/companies get re-resolved against
+Notion on the next sync — required when you've manually deleted the Notion
+Contacts/Companies rows, otherwise stale Notion page IDs in the cache will cause
+Notion PATCH failures), and `project_labels` (the Notion project ↔ Gmail label
+mapping — wiped so re-clicking the Notion Sync-to-Gmail button re-mints rows
+pointing at whatever labels exist now). Pass `--keep-fingerprints`,
+`--keep-db-cache`, `--keep-contacts`, or `--keep-project-labels` to preserve any
+of them across the reset.
+
+`thread_attachments` is thread-scoped, so a per-thread reset clears it too (for
+that thread only) — that's what lets a single-thread re-sync re-upload its
+attachments.
 
 `sync_cursors` and `users` are left alone on full reset: cursors stay valid
 because Gmail itself isn't being touched, and the user-seed list is durable
@@ -59,6 +65,7 @@ from gb_automations.models import (
     EmailRow,
     EmailsDbCache,
     ProjectLabel,
+    ThreadAttachment,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
@@ -71,10 +78,11 @@ async def _reset(
     keep_db_cache: bool,
     keep_contacts: bool,
     keep_project_labels: bool,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int]:
     """Delete cached rows.
 
-    Returns (email_rows, fingerprints, db_cache, contacts, companies, project_labels).
+    Returns (email_rows, fingerprints, db_cache, contacts, companies,
+    project_labels, thread_attachments).
     """
     async with SessionLocal() as session:
         if thread_id:
@@ -83,6 +91,20 @@ async def _reset(
             email_stmt = delete(EmailRow)
         email_result = await session.execute(email_stmt)
         email_count = email_result.rowcount or 0
+
+        # thread_attachments is the durable per-thread Drive-upload dedup
+        # (content-sha1 keyed). Unlike the workspace-wide caches below, it's
+        # thread-scoped, so it's safe — and necessary — to clear in BOTH modes:
+        # without wiping it, a re-sync sees "already uploaded earlier in this
+        # thread" and skips re-uploading, so attachments never re-link in Notion.
+        if thread_id:
+            ta_stmt = delete(ThreadAttachment).where(
+                ThreadAttachment.gmail_thread_id == thread_id
+            )
+        else:
+            ta_stmt = delete(ThreadAttachment)
+        ta_result = await session.execute(ta_stmt)
+        thread_attachment_count = ta_result.rowcount or 0
 
         fp_count = 0
         db_cache_count = 0
@@ -123,6 +145,7 @@ async def _reset(
             contact_count,
             company_count,
             project_label_count,
+            thread_attachment_count,
         )
 
 
@@ -194,6 +217,7 @@ def main() -> None:
         contact_count,
         company_count,
         project_label_count,
+        thread_attachment_count,
     ) = asyncio.run(
         _reset(
             args.thread,
@@ -205,11 +229,12 @@ def main() -> None:
     )
 
     if args.thread:
-        if email_count:
+        if email_count or thread_attachment_count:
             logger.info(
-                "Cleared %d cache row(s) for thread %s. "
-                "Reapply the Gmail label to re-sync.",
+                "Cleared %d email_row(s) + %d thread_attachment(s) for thread %s. "
+                "Reapply the Gmail label to re-sync (attachments will re-upload).",
                 email_count,
+                thread_attachment_count,
                 args.thread,
             )
         else:
@@ -227,10 +252,13 @@ def main() -> None:
         and contact_count == 0
         and company_count == 0
         and project_label_count == 0
+        and thread_attachment_count == 0
     ):
         logger.warning("Nothing to clear — cache is already empty.")
         return
     parts = [f"{email_count} email_row(s)"]
+    if thread_attachment_count:
+        parts.append(f"{thread_attachment_count} thread_attachment(s)")
     if fp_count:
         parts.append(f"{fp_count} attachment_fingerprint(s)")
     elif args.keep_fingerprints:
