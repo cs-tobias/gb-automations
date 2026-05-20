@@ -1,12 +1,13 @@
-# Base stack. Whether ollama runs in-container or natively on the host is
-# controlled by which override file Compose layers on top of this one —
-# selected by COMPOSE_FILE in .env (the single OLLAMA_MODE switch).
-#
-#   compose.ollama-native.yml     → no ollama service; api → host.docker.internal:11434
-#   compose.ollama-container.yml  → ollama service runs;  api → ollama:11434
-#
-# Compose reads COMPOSE_FILE from .env automatically and treats it as
-# "-f <a> -f <b>" — so the user only edits one line in .env.
+# Single switch lives in .env: COMPOSE_PROFILES.
+#   COMPOSE_PROFILES=          (empty) → native: no ollama container; the api
+#                                        talks to a host-native `ollama serve`
+#                                        at host.docker.internal:11434.
+#   COMPOSE_PROFILES=container         → the ollama service below starts and
+#                                        the api talks to it at ollama:11434.
+# The api's OLLAMA_BASE_URL is derived from that one var via OLLAMA_HOST in
+# .env (self-interpolation), so there is nothing else to change. We avoid
+# COMPOSE_FILE for this because its list separator differs by OS (":" on
+# mac/linux, ";" on Windows) — COMPOSE_PROFILES is a portable comma-list.
 
 services:
   api:
@@ -15,6 +16,10 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      # OLLAMA_HOST defaults to host.docker.internal (native); .env sets it to
+      # "ollama" when COMPOSE_PROFILES=container. See .env for the derivation.
+      OLLAMA_BASE_URL: "http://${OLLAMA_HOST:-host.docker.internal}:11434"
     ports:
       - "8000:8000"
     volumes:
@@ -22,6 +27,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      ollama:
+        condition: service_started
+        required: false
     restart: unless-stopped
 
   db:
@@ -54,5 +62,28 @@ services:
       - api
     restart: unless-stopped
 
+  # Local LLM (Ollama) — only starts when COMPOSE_PROFILES=container.
+  # The api auto-pulls the configured model on first boot (see main.py
+  # lifespan). Models persist in the named volume across rebuilds.
+  #
+  # On Windows with an NVIDIA GPU, layer the GPU override:
+  #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+  # Verify with: docker compose exec ollama nvidia-smi
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["container"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
 volumes:
   db_data:
+  ollama_data:
