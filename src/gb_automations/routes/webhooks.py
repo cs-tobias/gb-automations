@@ -30,10 +30,11 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
+from gb_automations.clients import nas as nas_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import EmailRow, ProjectLabel, SyncCursor, User
+from gb_automations.models import EmailRow, ProjectFolder, ProjectLabel, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync.sync_thread import sync_thread
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
@@ -314,6 +315,65 @@ def _json(payload: dict[str, Any], status: int = 200) -> Response:
     )
 
 
+async def _sync_nas_folder_for_project(
+    notion_page_id: str, title: str, created_time: str | None
+) -> str:
+    """Create or rename the project's folder on the office NAS.
+
+    Best-effort and fully decoupled from the Gmail-label step: a down or
+    unmounted share (or any filesystem error) is logged and reported, never
+    raised — the team relies on label creation, so the NAS must not be able to
+    block it. Mirrors how Drive-upload failures are treated in the sync engine.
+
+    Returns one of: "created" | "renamed" | "unchanged" | "skipped" | "failed".
+    """
+    if not (settings.sync_nas_folders and settings.nas_projects_root):
+        return "skipped"
+
+    if not await asyncio.to_thread(nas_client.nas_available):
+        logger.warning(
+            "↳ NAS unavailable (root %r not a writable dir); skipping folder sync",
+            settings.nas_projects_root,
+        )
+        return "failed"
+
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(ProjectFolder, notion_page_id)
+
+            if row is None:
+                target = await asyncio.to_thread(
+                    nas_client.ensure_project_folders, title, created_time
+                )
+                outcome = "created"
+            elif row.current_name != title:
+                target = await asyncio.to_thread(
+                    nas_client.rename_project_folder, row.current_name, title, created_time
+                )
+                outcome = "renamed"
+            else:
+                # Unchanged name — still ensure the folder exists, so a folder a
+                # user deleted by hand gets healed on the next click.
+                target = await asyncio.to_thread(
+                    nas_client.ensure_project_folders, title, created_time
+                )
+                outcome = "unchanged"
+
+            await session.merge(
+                ProjectFolder(
+                    notion_page_id=notion_page_id,
+                    current_path=str(target),
+                    current_name=title,
+                )
+            )
+            await session.commit()
+        logger.info("↳ NAS folder %s: %s", outcome, target)
+        return outcome
+    except Exception:
+        logger.exception("↳ NAS folder sync failed for project %r", title)
+        return "failed"
+
+
 @router.post("/notion")
 async def notion_webhook(request: Request) -> Response:
     """Notion "Sync to Gmail" button receiver.
@@ -385,55 +445,83 @@ async def _notion_webhook_impl(request: Request) -> Response:
     # Year segment of the label path comes from Notion's immutable created_time,
     # so renames only change the leaf — the year stays pinned to the project's
     # creation year even if the title is edited across a year boundary.
-    label_name = project_label_path(title, page.get("created_time"))
+    created_time = page.get("created_time")
+    label_name = project_label_path(title, created_time)
 
-    # Two operations on every click, in this order:
-    #   1. Reconcile existing rows: compare each user's live Gmail label name
-    #      against `label_name` and patch any drift (whether the drift came
-    #      from a Notion rename or a Gmail-side rename).
-    #   2. Top up missing rows: create the label for any active user who
-    #      doesn't yet have a project_labels row (new workspace user, or a
-    #      first-ever sync of this project — same code path either way).
-    # Order matters: step 1 is a no-op when there are no rows yet (first sync),
-    # and step 2's create is idempotent so it doesn't re-create labels users
-    # already have.
-    reconcile = await _reconcile_label_for_all_users(page_id, label_name)
-    topup = await _create_label_for_all_users(page_id, label_name)
-
-    if reconcile.get("no_mapping"):
-        action = "created"
-    elif reconcile["patched"] or reconcile["healed"]:
-        action = "synced"
-    else:
-        action = "unchanged"
-
-    failed = list({*reconcile["failed"], *topup["failed"]})
-
-    # Build a plain-English summary of what actually happened. The reconcile
-    # phase already emits a "↳ drift detected for X: live=A expected=B" log
-    # when it patches, so the summary here just needs to confirm the outcome
-    # and report any genuine side effects (new label minted, healed, failed).
+    # Fan out to every enabled target. Each is independently togglable via
+    # config (see Settings.sync_*) so we can decouple while building — e.g. run
+    # the NAS step alone during testing with SYNC_GMAIL_LABELS=false.
     parts: list[str] = []
-    if action == "created":
-        parts.append(f"created label {label_name!r} in {len(topup['created'])} mailbox(es)")
-    elif reconcile["patched"]:
-        parts.append(f"renamed label to {label_name!r} in {len(reconcile['patched'])} mailbox(es)")
-        if topup["created"]:
-            parts.append(f"also created in {len(topup['created'])} new mailbox(es)")
-    elif reconcile["healed"]:
-        parts.append(
-            f"re-created missing label {label_name!r} in {len(reconcile['healed'])} mailbox(es)"
-        )
-    elif topup["created"]:
-        # Reconcile said nothing changed for existing rows, but top-up minted
-        # the label somewhere new (e.g. a new active user was added since the
-        # last sync of this project).
-        parts.append(f"created label {label_name!r} in {len(topup['created'])} new mailbox(es)")
-    else:
-        parts.append(f"label {label_name!r} already up to date everywhere")
 
-    if failed:
-        parts.append(f"FAILED in {len(failed)} mailbox(es): {', '.join(failed)}")
+    # --- Gmail label target ---
+    if settings.sync_gmail_labels:
+        # Two operations on every click, in this order:
+        #   1. Reconcile existing rows: compare each user's live Gmail label name
+        #      against `label_name` and patch any drift (whether the drift came
+        #      from a Notion rename or a Gmail-side rename).
+        #   2. Top up missing rows: create the label for any active user who
+        #      doesn't yet have a project_labels row (new workspace user, or a
+        #      first-ever sync of this project — same code path either way).
+        # Order matters: step 1 is a no-op when there are no rows yet (first
+        # sync), and step 2's create is idempotent so it doesn't re-create
+        # labels users already have.
+        reconcile = await _reconcile_label_for_all_users(page_id, label_name)
+        topup = await _create_label_for_all_users(page_id, label_name)
+
+        if reconcile.get("no_mapping"):
+            gmail_action = "created"
+        elif reconcile["patched"] or reconcile["healed"]:
+            gmail_action = "synced"
+        else:
+            gmail_action = "unchanged"
+
+        gmail_failed = list({*reconcile["failed"], *topup["failed"]})
+
+        # The reconcile phase already emits a "↳ drift detected" log when it
+        # patches, so the summary here just confirms the outcome and reports any
+        # genuine side effect (new label minted, healed, failed).
+        if gmail_action == "created":
+            parts.append(f"created label {label_name!r} in {len(topup['created'])} mailbox(es)")
+        elif reconcile["patched"]:
+            parts.append(
+                f"renamed label to {label_name!r} in {len(reconcile['patched'])} mailbox(es)"
+            )
+            if topup["created"]:
+                parts.append(f"also created in {len(topup['created'])} new mailbox(es)")
+        elif reconcile["healed"]:
+            parts.append(
+                f"re-created missing label {label_name!r} in {len(reconcile['healed'])} mailbox(es)"
+            )
+        elif topup["created"]:
+            # Reconcile said nothing changed for existing rows, but top-up minted
+            # the label somewhere new (e.g. a new active user was added since the
+            # last sync of this project).
+            parts.append(
+                f"created label {label_name!r} in {len(topup['created'])} new mailbox(es)"
+            )
+        else:
+            parts.append(f"label {label_name!r} already up to date everywhere")
+
+        if gmail_failed:
+            parts.append(f"label FAILED in {len(gmail_failed)} mailbox(es): {', '.join(gmail_failed)}")
+        label_block = {
+            "action": gmail_action,
+            "patched": reconcile["patched"],
+            "healed": reconcile["healed"],
+            "unchanged": reconcile["unchanged"],
+            "created": topup["created"],
+            "already_present": topup["already_present"],
+            "failed": gmail_failed,
+        }
+    else:
+        gmail_action = "skipped"
+        parts.append("gmail label skipped (SYNC_GMAIL_LABELS=false)")
+        label_block = {"action": "skipped"}
+
+    # --- NAS folder target ---
+    nas_action = await _sync_nas_folder_for_project(page_id, title, created_time)
+    if nas_action != "skipped":
+        parts.append(f"NAS folder {nas_action}")
 
     logger.info("↳ done — %s", "; ".join(parts))
 
@@ -441,13 +529,12 @@ async def _notion_webhook_impl(request: Request) -> Response:
         {
             "page_id": page_id,
             "label": label_name,
-            "action": action,
-            "patched": reconcile["patched"],
-            "healed": reconcile["healed"],
-            "unchanged": reconcile["unchanged"],
-            "created": topup["created"],
-            "already_present": topup["already_present"],
-            "failed": failed,
+            # Top-level `action` reflects the Gmail target for backward compat
+            # with the existing Notion button feedback. Per-target detail lives
+            # under `gmail` and `nas`.
+            "action": gmail_action,
+            "gmail": label_block,
+            "nas": nas_action,
         }
     )
 

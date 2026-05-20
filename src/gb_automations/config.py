@@ -113,6 +113,27 @@ class Settings(BaseSettings):
     # "anyone with link can view" permission so Notion-rendered links work.
     attachments_folder_name: str = "Notion Email Attachments"
 
+    # Project-provisioning fan-out toggles. One Notion button → one webhook
+    # (/webhooks/notion) provisions a project across every relevant target;
+    # each target is independently switchable so we can decouple while building.
+    #   sync_gmail_labels — create/rename the Gmail label in every mailbox.
+    #     Turn OFF while testing the NAS step so button clicks don't churn labels.
+    #   sync_nas_folders — create/rename the project folder on the office NAS.
+    #     OFF by default until the mount is configured on the office host.
+    sync_gmail_labels: bool = True
+    sync_nas_folders: bool = False
+
+    # Office NAS (the shared `W:` drive). The Docker host is an office
+    # workstation on the same LAN as the NAS, so the share is mounted into the
+    # container and these are plain filesystem paths — no SMB client needed.
+    # nas_projects_root: mounted root that maps to W:\Prosjekt, e.g.
+    #   "/mnt/nas/Prosjekt". The NAS step is inert unless this is set AND
+    #   sync_nas_folders is true.
+    # nas_received_subfolder: subfolder created inside each project for incoming
+    #   client/email files. Goldbox calls it "Mottatt" (Received).
+    nas_projects_root: str = ""
+    nas_received_subfolder: str = "Mottatt"
+
     # Frame.io V4 (OAuth Web App via Adobe IMS).
     # Goldbox is non-Enterprise, so Adobe's clean S2S credential isn't
     # available — we use OAuth Web App with offline_access scope and store a

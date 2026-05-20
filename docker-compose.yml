@@ -14,6 +14,11 @@ services:
       - "8000:8000"
     volumes:
       - ./secrets:/app/secrets:ro
+      # Office NAS (the shared W: drive). The host must mount the share at
+      # NAS_HOST_PATH first; the container sees it at /mnt/nas, and
+      # NAS_PROJECTS_ROOT in .env points inside it (e.g. /mnt/nas/Prosjekt).
+      # Defaults to a throwaway dir so a fresh clone without a NAS still boots.
+      - ${NAS_HOST_PATH:-./.nas-stub}:/mnt/nas:rw
     depends_on:
       db:
         condition: service_healthy

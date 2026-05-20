@@ -24,10 +24,36 @@ def _year_from_created_time(created_time: str | None) -> str:
     return "unknown"
 
 
+# Characters that are illegal in Windows/SMB path components. A NAS folder leaf
+# must avoid all of these; Gmail only cares about `/`, but we sanitize the same
+# way everywhere so the project's leaf is byte-identical across label and folder
+# (the team relies on "the name is this everywhere"). Goldbox's `_` and spaces
+# are fine and deliberately preserved.
+_ILLEGAL_LEAF_CHARS = '\\/:*?"<>|'
+
+
 def _sanitize_leaf(name: str) -> str:
-    # A literal `/` in the leaf would silently create an extra nesting level
-    # in Gmail. Replace with `-` so the project shows up as a single leaf.
-    return name.replace("/", "-").strip()
+    # A literal `/` in the leaf would silently create an extra nesting level in
+    # Gmail; the other chars would make the NAS mkdir fail on a Windows share.
+    # Replace each with `-` so the project shows up as a single leaf everywhere.
+    out = name
+    for ch in _ILLEGAL_LEAF_CHARS:
+        out = out.replace(ch, "-")
+    return out.strip()
+
+
+def project_path_parts(project_name: str, created_time: str | None) -> tuple[str, str]:
+    """Return the `(year, leaf)` parts shared by the Gmail label and NAS folder.
+
+    Single source of truth for the `<year>/<project-name>` scheme so the label
+    leaf and the NAS folder leaf are guaranteed identical.
+
+    >>> project_path_parts("Acme", "2026-05-18T10:30:00.000Z")
+    ('2026', 'Acme')
+    >>> project_path_parts("Foo/Bar", None)
+    ('unknown', 'Foo-Bar')
+    """
+    return _year_from_created_time(created_time), _sanitize_leaf(project_name)
 
 
 def project_label_path(project_name: str, created_time: str | None) -> str:
@@ -40,6 +66,5 @@ def project_label_path(project_name: str, created_time: str | None) -> str:
     >>> project_label_path("Acme", None)
     'Projects/unknown/Acme'
     """
-    year = _year_from_created_time(created_time)
-    leaf = _sanitize_leaf(project_name)
+    year, leaf = project_path_parts(project_name, created_time)
     return f"{PROJECTS_LABEL_PREFIX}/{year}/{leaf}"

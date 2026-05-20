@@ -21,4 +21,5 @@ On the **Public Hostnames** step, click **Add a public hostname**:
 6. https://www.notion.so/profile/integrations -> new integration -> "Copy the **Internal Integration Secret** (starts with `ntn_…`) → paste into `.env` as `NOTION_TOKEN`"
 7. Set `NOTION_WEBHOOK_SECRET` in `.env` to a long random string (`openssl rand -hex 32`); reload api.
 8. Add the **Sync to Gmail** button to the Projects DB per [docs/notion-setup.md](notion-setup.md) Part 4 — it POSTs to `/webhooks/notion` with that secret as a bearer token on each click.
+9. (Optional) Office NAS project folders: mount the shared `W:` drive into the container and set `SYNC_NAS_FOLDERS=true` per [docs/misc/nas-setup.md](misc/nas-setup.md). Leave `SYNC_NAS_FOLDERS=false` to skip.
 

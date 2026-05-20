@@ -175,6 +175,24 @@ class ProjectLabel(Base):
     )
 
 
+class ProjectFolder(Base):
+    """Notion project page ↔ folder on the office NAS, one row per project.
+
+    Analogous to ProjectLabel, but the host filesystem is single (not per-user),
+    so the project page ID alone is the key. Stores the last-written path/name
+    so a Notion rename can move the folder in place instead of orphaning it.
+    """
+
+    __tablename__ = "project_folders"
+
+    notion_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    current_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    current_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class EmailsDbCache(Base):
     """Year → Notion DB ID for the year-partitioned Emails databases.
 

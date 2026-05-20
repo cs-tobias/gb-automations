@@ -172,7 +172,30 @@ async def _seed_and_watch_mailboxes() -> None:
 
 
 @asynccontextmanager
+def _check_nas_mount() -> None:
+    # Non-fatal: a misconfigured/unmounted NAS share must never block boot (the
+    # Gmail side is the team's hard dependency). But surface it loudly at startup
+    # so a wrong mount path / CIFS uid mismatch (see gotchas.md) is visible
+    # before the first project click silently reports nas:failed.
+    if not settings.sync_nas_folders:
+        return
+    from gb_automations.clients import nas as nas_client
+
+    log = logging.getLogger(__name__)
+    if not settings.nas_projects_root:
+        log.warning("SYNC_NAS_FOLDERS=true but NAS_PROJECTS_ROOT is empty — NAS step inert")
+    elif not nas_client.nas_available():
+        log.warning(
+            "NAS root %r is not a writable directory — project-folder sync will report "
+            "nas:failed until the share is mounted (see docs/nas-setup.md)",
+            settings.nas_projects_root,
+        )
+    else:
+        log.info("NAS project root %r is mounted and writable", settings.nas_projects_root)
+
+
 async def lifespan(app: FastAPI):
+    _check_nas_mount()
     start_scheduler()
     pull_task = asyncio.create_task(_ensure_model_present())
     seed_task = asyncio.create_task(_seed_and_watch_mailboxes())

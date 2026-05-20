@@ -276,6 +276,20 @@ Gmail filter rules don't save us either — they only run on incoming messages, 
 
 ---
 
+## 15. NAS project folders work locally but the container can't write to the mounted `W:` share
+
+**Symptom:** project-folder creation works fine in dev (a local `/tmp` root), but on the office host every project click reports `nas:failed` — or you see the "NAS root … is not a writable directory" warning at startup — even though the share is clearly mounted and you can write to it from a host shell.
+
+**Why:** the share is mounted **on the host**, but the container writes as its own user. Two distinct failure modes:
+
+1. *Bind-mount path mismatch.* The container only sees the share if the host's mount point is passed through as a volume. We bind `${NAS_HOST_PATH}:/mnt/nas` and set `NAS_PROJECTS_ROOT=/mnt/nas/Prosjekt`. If `NAS_HOST_PATH` doesn't point at the actually-mounted directory (e.g. the share wasn't mounted yet when `docker compose up` ran), the container gets the empty fallback stub dir instead — silently.
+
+2. *CIFS uid/gid ownership.* A CIFS/SMB mount maps **all** files to a single `uid`/`gid` fixed at mount time (`uid=`/`gid=` mount options) — in-container POSIX permissions don't behave like a local disk. If that uid doesn't match the container's process uid, `os.access(root, W_OK)` returns False and `nas_available()` reports the share unwritable. On a Windows Docker Desktop host the WSL2 ↔ Windows-share translation adds its own quirks.
+
+**Fix:** mount the share with options that grant the container's user write access (Linux: `mount -t cifs … -o uid=<container-uid>,gid=<container-gid>,file_mode=0664,dir_mode=0775`), and confirm `NAS_HOST_PATH` resolves to the live mount **before** bringing the stack up. The startup line `NAS project root … is mounted and writable` in the api logs is the green light — if you see the warning instead, fix the mount before expecting any folder to appear. Full setup in [docs/nas-setup.md](nas-setup.md).
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.
