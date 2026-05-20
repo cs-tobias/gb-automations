@@ -33,7 +33,7 @@ from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import ProjectLabel, SyncCursor, User
+from gb_automations.models import EmailRow, ProjectLabel, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync.sync_thread import sync_thread
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
@@ -506,33 +506,62 @@ async def _save_history_cursor(email: str, history_id: str) -> None:
         await session.commit()
 
 
+async def _known_project_thread_ids(thread_ids: set[str]) -> set[str]:
+    """Of the given Gmail thread IDs, return those we've already synced at
+    least one message from.
+
+    A new (or SENT) message landing on an already-labeled thread does NOT
+    carry the thread's project label in its own labelIds — Gmail labels are
+    per-message, and replies/sent mail only get system labels (INBOX/SENT).
+    So those threads fall out of the labelIds intersection in
+    `_collect_project_thread_ids`. We recover them here: if we've ever synced
+    a message from a thread, it's a known project thread and the new message
+    belongs in Notion too. Indexed lookup on `EmailRow.gmail_thread_id`; no
+    Gmail API call.
+    """
+    if not thread_ids:
+        return set()
+    async with SessionLocal() as session:
+        rows = await session.execute(
+            select(EmailRow.gmail_thread_id).where(
+                EmailRow.gmail_thread_id.in_(thread_ids)
+            )
+        )
+        return {row[0] for row in rows}
+
+
 def _collect_project_thread_ids(
     history_response: dict[str, Any], project_label_ids: set[str]
-) -> set[str]:
-    """Extract Gmail thread IDs touched by history entries that involve a
-    project label.
+) -> tuple[set[str], set[str]]:
+    """Bucket Gmail history entries into (definite, candidates) thread IDs.
 
     We re-sync at the thread level (cheap, idempotent via dedup) but only
-    when the event involves a label we care about. The rules per event type:
+    when the event involves a project we care about. Two buckets come out:
 
-    - messagesAdded — keep the thread if the message's `labelIds` contains a
-      project label. (A new email landing on a project-labeled thread; or a
-      labeled message landing fresh in the mailbox.)
-    - labelsAdded — keep the thread if the entry's `labelIds` (the labels
-      just added) intersect our project labels. This is the "user just filed
-      this email into a project" case.
-    - labelsRemoved — keep the thread if the entry's `labelIds` (the labels
-      just removed) intersect our project labels. Catches "user moved this
-      email from project A to project B": the add-side fires on B, the
-      remove-side fires on A, and sync_thread's reconciliation re-points
-      existing rows. Without it, swap-only events (where the same user
-      action toggles both labels but the add isn't routed to us) would
-      silently leave Notion rows pointing at the old project.
+    `definite` — threads we can confirm belong to a project from the history
+    payload alone, no DB needed:
+    - messagesAdded whose `labelIds` contains a project label (a labeled
+      message landing fresh in the mailbox).
+    - labelsAdded whose added `labelIds` intersect our project labels — the
+      "user just filed this email into a project" case.
+    - labelsRemoved whose removed `labelIds` intersect our project labels.
+      Catches "user moved this email from project A to project B": the add
+      fires on B, the remove on A, and sync_thread's reconciliation re-points
+      existing rows. Without it, swap-only events would silently leave Notion
+      rows pointing at the old project.
 
-    Non-project label noise — UNREAD toggles, CATEGORY_UPDATES, user-private
-    labels — gets dropped here so the rest of the pipeline never sees it.
+    `candidates` — threads from messagesAdded whose own `labelIds` did NOT
+    match a project label. Gmail labels are per-message: a new reply (or a
+    SENT message we ourselves sent) on an already-labeled thread only carries
+    system labels (INBOX/SENT/UNREAD), never inheriting the thread's project
+    label. We can't tell from the payload whether these belong to a project,
+    so the caller resolves them against the local EmailRow cache
+    (`_known_project_thread_ids`). Non-project noise (UNREAD toggles on
+    unknown threads, CATEGORY_UPDATES, etc.) ends up here and gets dropped by
+    that lookup.
     """
-    thread_ids: set[str] = set()
+    definite: set[str] = set()
+    candidates: set[str] = set()
     for entry in history_response.get("history", []) or []:
         for change in entry.get("messagesAdded", []) or []:
             msg = change.get("message") or {}
@@ -540,7 +569,9 @@ def _collect_project_thread_ids(
             if not tid:
                 continue
             if project_label_ids.intersection(msg.get("labelIds", []) or []):
-                thread_ids.add(tid)
+                definite.add(tid)
+            else:
+                candidates.add(tid)
         for change_type in ("labelsAdded", "labelsRemoved"):
             for change in entry.get(change_type, []) or []:
                 msg = change.get("message") or {}
@@ -548,8 +579,8 @@ def _collect_project_thread_ids(
                 if not tid:
                     continue
                 if project_label_ids.intersection(change.get("labelIds", []) or []):
-                    thread_ids.add(tid)
-    return thread_ids
+                    definite.add(tid)
+    return definite, candidates
 
 
 def _history_has_any_changes(history_response: dict[str, Any]) -> bool:
@@ -641,7 +672,14 @@ async def _gmail_webhook_impl(request: Request) -> Response:
     # Non-project activity gets silently acked here, with the cursor still
     # advancing so we don't reprocess the same irrelevant history next time.
     project_label_ids = await fetch_project_label_ids_for_user(email)
-    thread_ids = _collect_project_thread_ids(history, project_label_ids)
+    definite, candidates = _collect_project_thread_ids(history, project_label_ids)
+    # `candidates` are messagesAdded threads whose new message lacked a project
+    # label — typically a reply or our own SENT mail on an already-labeled
+    # thread. Recover the ones we've synced before from the local cache; the
+    # rest is non-project noise and falls away.
+    candidates -= definite
+    known = await _known_project_thread_ids(candidates)
+    thread_ids = definite | known
     if not thread_ids:
         await _save_history_cursor(email, new_history_id)
         if _history_has_any_changes(history):

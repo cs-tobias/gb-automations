@@ -125,6 +125,30 @@ class AttachmentFingerprint(Base):
     )
 
 
+class ThreadAttachment(Base):
+    """Content hashes already uploaded to Drive for a thread — durable across syncs.
+
+    `ThreadAttachmentTracker` dedups attachments within a single sync, but a new
+    reply re-carries the whole quoted MIME tree, so without a persisted record
+    every reply re-uploads the same bytes to Drive under the new replier's name.
+    Keyed by (thread, content_sha1): identical bytes are the same image no matter
+    which message now carries them, so an exact-hash hit anywhere in the thread
+    means "already on Drive, skip". Seeded into the per-sync tracker at sync start
+    and written back on every successful upload.
+    """
+
+    __tablename__ = "thread_attachments"
+
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    content_sha1: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # First filename we saw these bytes under — debugging hint only; Gmail
+    # renumbers inline image names across messages even for identical bytes.
+    first_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class ProjectLabel(Base):
     """Notion project page ↔ Gmail label, one row per (project, user).
 

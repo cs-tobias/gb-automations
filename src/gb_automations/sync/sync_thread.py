@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,7 +35,13 @@ from gb_automations.clients import notion as notion_client
 from gb_automations.clients import notion_emails_db
 from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import AttachmentFingerprint, CompanyCache, ContactCache, EmailRow
+from gb_automations.models import (
+    AttachmentFingerprint,
+    CompanyCache,
+    ContactCache,
+    EmailRow,
+    ThreadAttachment,
+)
 from gb_automations.utils.email_cleaning import (
     body_before_quotes,
     clean_body,
@@ -187,8 +193,17 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
 
             # One tracker per thread — replies re-carry attachments from earlier
             # messages, and we only want to upload each unique-byte attachment
-            # once (to the original sender's row).
+            # once (to the original sender's row). Seed its content-hash set from
+            # the durable ThreadAttachment record so dedup survives across syncs:
+            # a later reply that re-carries a quoted attachment won't re-upload
+            # bytes a previous push already sent to Drive.
             thread_tracker = ThreadAttachmentTracker()
+            prior_sha1s = await session.scalars(
+                select(ThreadAttachment.content_sha1).where(
+                    ThreadAttachment.gmail_thread_id == thread_id
+                )
+            )
+            thread_tracker.sha1s.update(prior_sha1s)
             for msg in thread.messages:
                 try:
                     created_count, skipped_count = await _sync_message(
@@ -483,6 +498,18 @@ async def _enrich_sender_from_body(
             sender_record["address"] = fields.address
 
 
+async def _row_exists(session: AsyncSession, message_id: str) -> bool:
+    """True iff this (real or synthetic) message id is already cached as a row.
+
+    Local-cache only — a hit means we've created the Notion row for this message
+    on a prior sync, so its signature enrichment is already persisted and the LLM
+    call can be skipped. A miss falls through to the full pipeline (which still
+    does its own Notion-side dedup before creating the row), so a stale/cold cache
+    only costs the LLM call we'd have made anyway, never a duplicate.
+    """
+    return await session.get(EmailRow, message_id) is not None
+
+
 async def _upsert_thread_contacts(
     thread: gmail_client.GmailThread,
     splits: dict[str, list[ExtractedMessage]],
@@ -566,8 +593,17 @@ async def _upsert_thread_contacts(
         # title+phone+address are all filled, so a signature-only forward that
         # yields nothing doesn't block recovering the real signature from a
         # later history segment.
+        #
+        # Skip the (expensive, ~seconds-per-call) classify_signature LLM for any
+        # message whose row already exists locally: its enrichment was done on
+        # the sync that first created the row and is already persisted in Notion,
+        # so re-running it on every reply is pure waste. Participants are still
+        # collected above (header walk) so contact relations on the new row stay
+        # correct — only the signature LLM is gated.
         sender_email = find_sender_email(msg.from_field)
-        if sender_email and sender_email in seen:
+        if sender_email and sender_email in seen and not await _row_exists(
+            session, msg.message_id
+        ):
             await _enrich_sender_from_body(
                 seen[sender_email],
                 sender_email=sender_email,
@@ -582,6 +618,10 @@ async def _upsert_thread_contacts(
             # raw_body preserves the signature; .body has it stripped by clean_body.
             inner_body = inner.raw_body or inner.body
             if not inner_body:
+                continue
+            # Same gate, keyed by the synthetic id the history row is stored under.
+            synth_id = synthetic_message_id(msg.message_id, inner.from_field, inner.body)
+            if await _row_exists(session, synth_id):
                 continue
             await _enrich_sender_from_body(
                 seen[inner_sender],
@@ -2102,6 +2142,21 @@ async def _upload_attachments(
             thread_tracker.sha1s.add(content_sha1)
             thread_tracker.seen.setdefault(tracker_key, []).append(
                 (d.attachment.size, content_sha1)
+            )
+            # Persist the hash so the next sync of this thread (a reply that
+            # re-carries the same bytes) skips the re-upload. on_conflict_do_nothing
+            # keeps the first-seen filename and is safe under the concurrent-sync
+            # races the thread lock already guards against.
+            await session.execute(
+                insert(ThreadAttachment)
+                .values(
+                    gmail_thread_id=parent_msg.thread_id,
+                    content_sha1=content_sha1,
+                    first_filename=(d.attachment.filename or "")[:255],
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["gmail_thread_id", "content_sha1"]
+                )
             )
     return uploaded
 
