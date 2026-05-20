@@ -1,6 +1,8 @@
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Index, Integer, String, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from gb_automations.db import Base
@@ -135,6 +137,13 @@ class ThreadAttachment(Base):
     which message now carries them, so an exact-hash hit anywhere in the thread
     means "already on Drive, skip". Seeded into the per-sync tracker at sync start
     and written back on every successful upload.
+
+    `drive_links` carries the Drive `{name, url}` entries the bytes uploaded to
+    (one per matched project subfolder). It exists so a re-sync — which skips the
+    *upload* because the sha1 is already known — can still set the Notion row's
+    Files property: "already on Drive" must not mean "can't re-link". Without it
+    the upload-dedup silently doubled as a link-suppressor, leaving rows file-less
+    while the bytes sat in Drive.
     """
 
     __tablename__ = "thread_attachments"
@@ -144,6 +153,12 @@ class ThreadAttachment(Base):
     # First filename we saw these bytes under — debugging hint only; Gmail
     # renumbers inline image names across messages even for identical bytes.
     first_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    # List of {"name", "url"} dicts — the Drive links this content uploaded to,
+    # one per matched project subfolder. Nullable for rows written before the
+    # column existed; treated as "no known links" when absent.
+    drive_links: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

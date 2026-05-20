@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +36,6 @@ from gb_automations.clients import notion_emails_db
 from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import (
-    AttachmentFingerprint,
     CompanyCache,
     ContactCache,
     EmailRow,
@@ -193,17 +192,19 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
 
             # One tracker per thread — replies re-carry attachments from earlier
             # messages, and we only want to upload each unique-byte attachment
-            # once (to the original sender's row). Seed its content-hash set from
-            # the durable ThreadAttachment record so dedup survives across syncs:
-            # a later reply that re-carries a quoted attachment won't re-upload
-            # bytes a previous push already sent to Drive.
+            # once (to the original sender's row). Seed it from the durable
+            # ThreadAttachment record (sha1 → Drive links) so dedup survives
+            # across syncs: a later reply that re-carries a quoted attachment
+            # won't re-upload bytes a previous push already sent to Drive, but
+            # the stored links still let us set the new row's Files property.
             thread_tracker = ThreadAttachmentTracker()
-            prior_sha1s = await session.scalars(
-                select(ThreadAttachment.content_sha1).where(
-                    ThreadAttachment.gmail_thread_id == thread_id
-                )
+            prior = await session.execute(
+                select(
+                    ThreadAttachment.content_sha1, ThreadAttachment.drive_links
+                ).where(ThreadAttachment.gmail_thread_id == thread_id)
             )
-            thread_tracker.sha1s.update(prior_sha1s)
+            for content_sha1, drive_links in prior:
+                thread_tracker.links_by_sha1[content_sha1] = drive_links or []
             for msg in thread.messages:
                 try:
                     created_count, skipped_count = await _sync_message(
@@ -970,10 +971,20 @@ async def _sync_single_message(
 
     Returns `(1, 0)` if a new row was created, `(0, 1)` if it was already there.
     """
+    # Attachments attributed to THIS message's row, used by both the create
+    # path and the dedup-hit re-link below. For a non-forwarded message `msg`
+    # itself carries the bytes, so it's also the parent_msg.
+    if attachment_decisions is None:
+        attachment_decisions = _partition_attachments(msg.attachments)
+    attributed_sender = _addr_to_email(msg.from_field) or user_email
+    tracker = thread_tracker or ThreadAttachmentTracker()
+
     # 1. Local cache hit? Re-PATCH the Project relation in case the user has
     # swapped labels since the row was created (mis-labeled → corrected). The
     # PATCH is idempotent so we can do this unconditionally; the Notion-side
-    # feedback-loop filter swallows the resulting webhook echo.
+    # feedback-loop filter swallows the resulting webhook echo. Also re-link the
+    # Files property — a row created in a sync where the upload was deduped (or
+    # by an older build) never got its files; this self-heals it.
     cached = await session.get(EmailRow, msg.message_id)
     if cached:
         logger.debug("    dedup hit (local cache) for msg %s", msg.message_id)
@@ -985,6 +996,18 @@ async def _sync_single_message(
             logger.exception(
                 "    project reconciliation failed for msg %s", msg.message_id
             )
+        _db_id, emails_db_props = await _resolve_db_for_date(msg.date)
+        await _relink_existing_row_files(
+            parent_msg=msg,
+            decisions=attachment_decisions,
+            attributed_sender=attributed_sender,
+            row_id=cached.notion_page_id,
+            user_email=user_email,
+            session=session,
+            emails_db_props=emails_db_props,
+            thread_tracker=tracker,
+            project_label_paths=project_label_paths or [],
+        )
         return (0, 1)
 
     db_id, emails_db_props = await _resolve_db_for_date(msg.date)
@@ -1002,6 +1025,17 @@ async def _sync_single_message(
             logger.exception(
                 "    project reconciliation failed for msg %s", msg.message_id
             )
+        await _relink_existing_row_files(
+            parent_msg=msg,
+            decisions=attachment_decisions,
+            attributed_sender=attributed_sender,
+            row_id=existing["id"],
+            user_email=user_email,
+            session=session,
+            emails_db_props=emails_db_props,
+            thread_tracker=tracker,
+            project_label_paths=project_label_paths or [],
+        )
         await _cache_email_row(
             session,
             message_id=msg.message_id,
@@ -1017,8 +1051,6 @@ async def _sync_single_message(
     # divider (both stripped by clean_body), and the only "attachments" are
     # inline signature logos. The valuable content is the extracted prior
     # messages (history reconstruction handles those).
-    if attachment_decisions is None:
-        attachment_decisions = _partition_attachments(msg.attachments)
     has_potential_attachments = any(d.upload for d in attachment_decisions)
     # Drop the sender's signature from the row body. The LLM gave us the
     # verbatim first line of the signature region; cut there. Contacts row
@@ -1029,7 +1061,7 @@ async def _sync_single_message(
     # Keep `[image: NAME]` markers in the body for attachments we're actually
     # uploading — preserves the in-body anchor so Goldbox can see "the image
     # the sender referenced sits HERE in the paragraph." Skipped images
-    # (signatures, tiny, inline-repeated) have their markers stripped so the
+    # (tiny signature/tracking thumbnails) have their markers stripped so the
     # body doesn't reference files that aren't in the row.
     cleaned_body = clean_body(
         body_for_row,
@@ -1069,10 +1101,10 @@ async def _sync_single_message(
         uploaded = await _upload_attachments(
             parent_msg=msg,
             decisions=attachment_decisions,
-            attributed_sender=_addr_to_email(msg.from_field) or user_email,
+            attributed_sender=attributed_sender,
             user_email=user_email,
             session=session,
-            thread_tracker=thread_tracker or ThreadAttachmentTracker(),
+            thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
         )
         if uploaded:
@@ -1180,6 +1212,12 @@ async def _sync_extracted_message(
 
     Returns `(1, 0)` if created, `(0, 1)` if already present (dedup by synthetic_id).
     """
+    decisions = attachment_decisions or []
+    inner_sender = _addr_to_email(inner.from_field) or _addr_to_email(
+        parent_msg.from_field
+    ) or user_email
+    tracker = thread_tracker or ThreadAttachmentTracker()
+
     cached = await session.get(EmailRow, synthetic_id)
     if cached:
         logger.debug("    dedup hit (local cache) for extracted %s", synthetic_id)
@@ -1191,6 +1229,18 @@ async def _sync_extracted_message(
             logger.exception(
                 "    project reconciliation failed for extracted %s", synthetic_id
             )
+        _db_id, emails_db_props = await _resolve_db_for_date(inner.date)
+        await _relink_existing_row_files(
+            parent_msg=parent_msg,
+            decisions=decisions,
+            attributed_sender=inner_sender,
+            row_id=cached.notion_page_id,
+            user_email=user_email,
+            session=session,
+            emails_db_props=emails_db_props,
+            thread_tracker=tracker,
+            project_label_paths=project_label_paths or [],
+        )
         return (0, 1)
 
     db_id, emails_db_props = await _resolve_db_for_date(inner.date)
@@ -1206,6 +1256,17 @@ async def _sync_extracted_message(
             logger.exception(
                 "    project reconciliation failed for extracted %s", synthetic_id
             )
+        await _relink_existing_row_files(
+            parent_msg=parent_msg,
+            decisions=decisions,
+            attributed_sender=inner_sender,
+            row_id=existing["id"],
+            user_email=user_email,
+            session=session,
+            emails_db_props=emails_db_props,
+            thread_tracker=tracker,
+            project_label_paths=project_label_paths or [],
+        )
         await _cache_email_row(
             session,
             message_id=synthetic_id,
@@ -1219,7 +1280,7 @@ async def _sync_extracted_message(
     # control which `[image: NAME]` markers survive (the ones for attachments
     # actually attributed to this row). Fall back to inner.body for callers
     # that didn't populate raw_body (older tests, future producers).
-    keep_filenames = _owning_filenames(attachment_decisions or [])
+    keep_filenames = _owning_filenames(decisions)
     if inner.raw_body:
         display_body = clean_body(inner.raw_body, keep_image_markers=keep_filenames)
     else:
@@ -1249,21 +1310,17 @@ async def _sync_extracted_message(
     row_id = notion_page["id"]
 
     # Upload any attachments attributed to THIS historical email. Bytes live
-    # on parent_msg (the forwarder's Gmail message); fingerprint check runs
-    # against inner.from_field so a repeating signature gets counted against
-    # the original sender, not the forwarder.
-    has_uploadable = any(d.upload for d in (attachment_decisions or []))
+    # on parent_msg (the forwarder's Gmail message); dedup runs against
+    # inner.from_field so the original sender, not the forwarder, owns them.
+    has_uploadable = any(d.upload for d in decisions)
     if has_uploadable and EMAILS_PROPS.get("files") in emails_db_props:
-        inner_sender = _addr_to_email(inner.from_field) or _addr_to_email(
-            parent_msg.from_field
-        ) or user_email
         uploaded = await _upload_attachments(
             parent_msg=parent_msg,
-            decisions=attachment_decisions or [],
+            decisions=decisions,
             attributed_sender=inner_sender,
             user_email=user_email,
             session=session,
-            thread_tracker=thread_tracker or ThreadAttachmentTracker(),
+            thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
         )
         if uploaded:
@@ -1660,8 +1717,8 @@ def _owning_filenames(decisions: list[AttachmentDecision]) -> set[str]:
 
     Only attachments that will actually be uploaded (`upload=True`) qualify —
     keeping a marker for a skipped signature image would leave a dangling
-    reference to a file that isn't in the row. Tiny / inline-repeated
-    decisions have `upload=False` and so don't appear in the keep set.
+    reference to a file that isn't in the row. Tiny-image (sub-1KB) decisions
+    have `upload=False` and so don't appear in the keep set.
     """
     return {d.attachment.filename for d in decisions if d.upload and d.attachment.filename}
 
@@ -1772,29 +1829,23 @@ def _partition_attachments(
 ) -> list[AttachmentDecision]:
     """Decide which attachments are worth downloading + uploading.
 
-    Skip rules (all fire without needing bytes, so the Gmail download is
-    avoided entirely):
-      1. Tiny-image: image/* attachments under 1 KB are Office-generated
-         signature thumbnails (e.g. `~WRD0002.jpg`), never real content.
-      2. Inline-repeated: image/* attachments with `inline_ref_count >= 2`
-         are referenced multiple times in the SAME message's HTML — that
-         only happens for signature logos carried in every quoted reply
-         block of an Outlook thread. Real photo attachments are referenced
-         exactly once. Distinct from cross-message re-carry (which is just
-         Gmail keeping the bytes alive across replies and is handled by
-         `ThreadAttachmentTracker`).
+    Only ONE skip rule survives — and it's the single most false-positive-safe
+    one we have:
+      - Tiny-image: image/* attachments under 1 KB are Office-generated
+        signature thumbnails / tracking pixels (e.g. `~WRD0002.jpg`, a 1×1 gif),
+        never real content. No real photo, logo, or document is under 1 KB, so
+        this drops zero real files while keeping the Notion rows free of the
+        tracking-pixel flood every Outlook email carries.
 
-    We deliberately do NOT use a position-based "marker sits at/below the
-    signature line ⇒ decoration" rule. It was too aggressive: real photos in
-    short emails ("Se bilde to 🙂") get their `[image:]` marker right next to
-    the sign-off and were silently dropped. Losing a real client image is far
-    worse than letting one stray logo through, so the size + inline-repeat
-    signals (plus the cross-message `_is_repeating_signature_image` check in
-    the upload loop) carry signature detection on their own now.
-
-    Repetition across messages from the same sender (e.g. the same logo in
-    many separate threads) is NOT detected here — it requires the bytes and
-    runs in the upload loop via `_is_repeating_signature_image`.
+    Every other heuristic was REMOVED on purpose. The earlier rules
+    (inline-repeated, fuzzy ±size same-name, repeating-signature) were guesses
+    that could drop a *real* distinct file — a revised CAD/PDF re-sent under the
+    same name, a recurring legitimate attachment from a frequent sender. The
+    operating rule now is the client's: if a file is sent, it must appear in
+    Notion. Byte-identical re-carries (Gmail quoting an attachment on every
+    reply) are still de-duplicated for *upload* by content sha1 in the upload
+    loop (`ThreadAttachmentTracker`) — but that dedup re-links the row instead
+    of dropping the file, so nothing real is ever lost.
 
     Returns one `AttachmentDecision` per input attachment, preserving order.
     """
@@ -1808,16 +1859,13 @@ def _partition_attachments(
             and att.size < _TINY_IMAGE_BYTES
         ):
             decision = AttachmentDecision(att, upload=False, skip_reason="tiny-image")
-        elif att.mime_type.startswith("image/") and att.inline_ref_count >= 2:
-            decision = AttachmentDecision(att, upload=False, skip_reason="inline-repeated")
         else:
             decision = AttachmentDecision(att, upload=True)
         logger.debug(
-            "partition: %r mime=%s size=%s inline_ref_count=%s → upload=%s skip=%s",
+            "partition: %r mime=%s size=%s → upload=%s skip=%s",
             att.filename,
             att.mime_type,
             att.size,
-            att.inline_ref_count,
             decision.upload,
             decision.skip_reason,
         )
@@ -1844,8 +1892,7 @@ def _attribute_attachments(
 
     Returns `(forwarder_decisions, by_synthetic_id)`:
       - forwarder_decisions: AttachmentDecisions owned by the top-level Gmail
-        message (tiny/inline-repeated skips + everything not attributed
-        elsewhere).
+        message (tiny-image skips + everything not attributed elsewhere).
       - by_synthetic_id: synthetic_id → list of AttachmentDecisions attributed
         to that extracted email.
     """
@@ -1903,90 +1950,30 @@ def _attribute_attachments(
     return forwarder, by_synth
 
 
-async def _is_repeating_signature_image(
-    sender_email: str,
-    filename: str,
-    content: bytes,
-    session: AsyncSession,
-) -> bool:
-    """True iff this exact image has been seen 2+ times from this sender.
-
-    Implemented as an upsert so concurrent inserts for the same
-    (sender_email, content_sha1) can't crash on UniqueViolation — the second
-    insert collapses into an UPDATE that bumps seen_count. Mirrors the upsert
-    pattern used by ContactCache and EmailRow elsewhere in this module.
-
-    Content hash is sha1 of the bytes. Stable across emails even when Gmail
-    renumbers inline image filenames (`image001.png` → `image004.png`).
-
-    Sender-scoped (not global) on purpose: forwards naturally cause the same
-    bytes to be re-attributed across senders (forwarder + original sender),
-    so a global sha1 rule would false-positive every forwarded real
-    attachment. Repeated bytes from the SAME sender are the actual signature
-    signal — that pattern doesn't occur for legitimate one-off attachments.
-    """
-    sha1 = hashlib.sha1(content).hexdigest()
-    sender_key = sender_email.lower()
-    stmt = (
-        insert(AttachmentFingerprint)
-        .values(
-            sender_email=sender_key,
-            content_sha1=sha1,
-            seen_count=1,
-            first_filename=(filename or "")[:255],
-        )
-        .on_conflict_do_update(
-            index_elements=["sender_email", "content_sha1"],
-            # func.least caps the counter at 10 — no need to grow forever.
-            # Explicit updated_at because on_conflict_do_update doesn't trigger
-            # SQLAlchemy's ORM-level onupdate hook.
-            set_={
-                "seen_count": func.least(AttachmentFingerprint.seen_count + 1, 10),
-                "updated_at": func.now(),
-            },
-        )
-        .returning(AttachmentFingerprint.seen_count)
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one() >= 2
-
-
-# Same sender + same filename + sizes within this window → treated as a
-# duplicate of the earlier upload in the thread. Gmail re-wraps inline
-# signature images between messages (TIFF metadata, MIME transfer encoding
-# normalization), so a pixel-identical signature can shift by ~100 B
-# between messages. ±10 KB is comfortably above that noise floor while
-# still far below the size of a real re-sent document — a designer
-# sending revisjon-3.pdf with material changes will swing more than 10 KB.
-SIZE_TOLERANCE_BYTES = 10 * 1024
-
-
 @dataclass
 class ThreadAttachmentTracker:
-    """Per-thread memory of attachments already uploaded.
+    """Per-thread memory of attachments already uploaded, and where to.
 
-    Two failure modes this prevents:
-    1. Gmail re-carries attachments on every reply (quoted MIME tree). Each
-       later reply has a DIFFERENT author, so the same image bytes show up
-       again attributed to a new sender. Without thread-wide content dedup the
-       same photo uploads once per reply that quoted it.
-    2. A sender attaches the same signature image to multiple messages in the
-       thread, and Gmail re-wraps the bytes between messages so the sha1
-       differs slightly — but it's still the same image.
+    Gmail re-carries attachments on every reply (quoted MIME tree). Each later
+    reply has a DIFFERENT author, so the same bytes show up again attributed to
+    a new sender. Without thread-wide content dedup the same file uploads once
+    per reply that quoted it.
 
-    `sha1s` is a thread-wide set of content hashes already uploaded. An exact
-    sha1 match is sender-independent: identical bytes are the same image no
-    matter who the quoting message is from (two distinct real images won't
-    collide). This is what kills the re-carry duplicates.
-
-    `seen` keeps the fuzzy fallback: `(sender_lower, filename) → [(size, sha1)]`.
-    When the sha1 doesn't match (re-wrapped bytes) we accept a size-within-
-    tolerance match, but only within the same sender+filename so two
-    participants sharing `screenshot.png` aren't wrongly collapsed.
+    `links_by_sha1` maps content sha1 → the Drive `{name, url}` entries those
+    bytes were uploaded to (one per matched project subfolder). An exact sha1
+    match is sender-independent: identical bytes are the same file no matter who
+    the quoting message is from (two distinct real files won't collide). That
+    kills the re-carry *upload* duplicates — but crucially we still hand the
+    stored links back so the row that quoted the file can be linked to it. A
+    skip must suppress the upload, never the link.
     """
 
-    sha1s: set[str] = field(default_factory=set)
-    seen: dict[tuple[str, str], list[tuple[int, str]]] = field(default_factory=dict)
+    links_by_sha1: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+
+    @property
+    def sha1s(self) -> set[str]:
+        """Content hashes already uploaded in this thread (read-only view)."""
+        return set(self.links_by_sha1)
 
 
 async def _upload_attachments(
@@ -2009,7 +1996,9 @@ async def _upload_attachments(
     forwarder.
     `thread_tracker` carries forward attachment-bytes memory across all
     messages in the same thread so we don't re-upload bytes that a reply
-    quoted from an earlier message.
+    quoted from an earlier message. A re-carried (sha1-known) attachment is NOT
+    re-uploaded, but its stored Drive links ARE returned, so the quoting row
+    still gets linked — "already on Drive" must never mean "drop from the row".
     `project_label_paths` is the list of Gmail-label paths matched for this
     thread (e.g. `["Projects/2026/Acme", "Projects/2026/Beta"]`). Each
     attachment uploads once per project into
@@ -2072,43 +2061,34 @@ async def _upload_attachments(
                 "    ⏏  skip attachment %r: empty content from Gmail", d.attachment.filename
             )
             continue
-        # Thread-level dedup. First, an exact content match anywhere in the
-        # thread (sender-independent) — this is the common case: a reply quotes
-        # an earlier message and Gmail re-carries the identical bytes under the
-        # replier's name. Then a fuzzy (sender, filename, ±size) fallback for
-        # the same image re-wrapped by Gmail so its sha1 shifted.
+        # Thread-level dedup: an exact content match anywhere in the thread
+        # (sender-independent). The common case is a reply quoting an earlier
+        # message — Gmail re-carries the identical bytes under the replier's
+        # name. We skip the *upload* but still return the stored Drive links
+        # (renamed to this attachment's filename) so the quoting row links to
+        # the file that's already on Drive.
         content_sha1 = hashlib.sha1(content).hexdigest()
-        tracker_key = (sender, d.attachment.filename)
-        if content_sha1 in thread_tracker.sha1s:
+        known_links = thread_tracker.links_by_sha1.get(content_sha1)
+        if known_links is not None:
+            relinked = [
+                {"name": d.attachment.filename or link.get("name") or "attachment",
+                 "url": link["url"]}
+                for link in known_links
+                if link.get("url")
+            ]
+            uploaded.extend(relinked)
             logger.info(
-                "    ⏏  skip attachment %r: already uploaded earlier in this thread",
+                "    ⏏  skip attachment %r: already uploaded earlier in this thread "
+                "(re-linked %d)",
                 d.attachment.filename,
-            )
-            continue
-        prior_entries = thread_tracker.seen.get(tracker_key, [])
-        is_dup = any(
-            abs(prior_size - d.attachment.size) <= SIZE_TOLERANCE_BYTES
-            for prior_size, _prior_sha1 in prior_entries
-        )
-        if is_dup:
-            logger.info(
-                "    ⏏  skip attachment %r: same sender %s already attached this file in thread",
-                d.attachment.filename,
-                sender,
-            )
-            continue
-        if await _is_repeating_signature_image(sender, d.attachment.filename, content, session):
-            logger.info(
-                "    ⏏  skip attachment %r: repeating signature image (sender=%s)",
-                d.attachment.filename,
-                sender,
+                len(relinked),
             )
             continue
         # Upload once per matched project subfolder. Each project's folder
         # becomes self-contained (good for archival/export), at the cost of N
         # Drive files for an N-project email — the team chose this trade-off
         # deliberately.
-        any_uploaded = False
+        att_links: list[dict[str, str]] = []
         for folder_path in folder_paths:
             try:
                 url = await asyncio.to_thread(
@@ -2126,8 +2106,7 @@ async def _upload_attachments(
                     "/".join(folder_path),
                 )
                 continue
-            uploaded.append({"name": d.attachment.filename, "url": url})
-            any_uploaded = True
+            att_links.append({"name": d.attachment.filename, "url": url})
             logger.info(
                 "    📎 uploaded %r (%.1f KB) from %s → %s",
                 d.attachment.filename,
@@ -2135,30 +2114,80 @@ async def _upload_attachments(
                 sender,
                 "/".join(folder_path),
             )
-        if any_uploaded:
-            # Only mark seen if at least one project copy made it through —
+        if att_links:
+            uploaded.extend(att_links)
+            # Only record once at least one project copy made it through —
             # otherwise a transient Drive failure would prevent a retry on
-            # the next thread sync.
-            thread_tracker.sha1s.add(content_sha1)
-            thread_tracker.seen.setdefault(tracker_key, []).append(
-                (d.attachment.size, content_sha1)
-            )
-            # Persist the hash so the next sync of this thread (a reply that
-            # re-carries the same bytes) skips the re-upload. on_conflict_do_nothing
-            # keeps the first-seen filename and is safe under the concurrent-sync
-            # races the thread lock already guards against.
+            # the next thread sync. Storing the links (not just the sha1) is
+            # what lets a later re-carry — which skips the upload — still link
+            # its row to the file already on Drive.
+            thread_tracker.links_by_sha1[content_sha1] = att_links
+            # Persist sha1 + links so the next sync of this thread (a reply that
+            # re-carries the same bytes) skips the re-upload yet can still link.
+            # on_conflict_do_update refreshes the links if a prior row had none
+            # (e.g. written before the column existed); safe under the
+            # concurrent-sync races the thread lock already guards against.
             await session.execute(
                 insert(ThreadAttachment)
                 .values(
                     gmail_thread_id=parent_msg.thread_id,
                     content_sha1=content_sha1,
                     first_filename=(d.attachment.filename or "")[:255],
+                    drive_links=att_links,
                 )
-                .on_conflict_do_nothing(
-                    index_elements=["gmail_thread_id", "content_sha1"]
+                .on_conflict_do_update(
+                    index_elements=["gmail_thread_id", "content_sha1"],
+                    set_={"drive_links": att_links},
                 )
             )
     return uploaded
+
+
+async def _relink_existing_row_files(
+    *,
+    parent_msg: gmail_client.GmailMessage,
+    decisions: list[AttachmentDecision],
+    attributed_sender: str,
+    row_id: str,
+    user_email: str,
+    session: AsyncSession,
+    emails_db_props: dict[str, Any],
+    thread_tracker: ThreadAttachmentTracker,
+    project_label_paths: list[str],
+) -> None:
+    """Re-set the Files property on an ALREADY-EXISTING row (dedup-hit path).
+
+    The row's existence is cached, so the create path (which is the only place
+    that historically set Files) is skipped. Without this, a row whose files
+    were never linked — e.g. created in a sync where the upload was already
+    deduped, or by an older build — stays file-less forever, because the sha1
+    dedup that prevents a duplicate Drive upload also prevented the re-link.
+
+    Calling `_upload_attachments` here is safe and cheap: re-carried bytes are
+    sha1-known and re-linked (no Drive upload), genuinely-new bytes upload once.
+    `patch_email_row_files` overwrites the property wholesale, so repeating it
+    every sync is idempotent. No-op when this message carries no uploadable
+    attachments or the DB has no Files property.
+    """
+    if EMAILS_PROPS.get("files") not in emails_db_props:
+        return
+    if not any(d.upload for d in decisions):
+        return
+    uploaded = await _upload_attachments(
+        parent_msg=parent_msg,
+        decisions=decisions,
+        attributed_sender=attributed_sender,
+        user_email=user_email,
+        session=session,
+        thread_tracker=thread_tracker,
+        project_label_paths=project_label_paths,
+    )
+    if not uploaded:
+        return
+    try:
+        await notion_client.patch_email_row_files(row_id, uploaded)
+    except Exception:
+        logger.exception("Failed to re-link Files on existing row %s", row_id)
 
 
 # ============================================================

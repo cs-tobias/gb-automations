@@ -1,20 +1,18 @@
 """Tests for sync_thread._partition_attachments — the byte-free filter that
 decides which attachments are worth downloading + uploading to Drive.
 
-Only two signals run here: tiny-image (< 1 KB) and inline-repeated
-(`inline_ref_count >= 2`). The old position-based "marker sits below the
-signature line ⇒ decoration" rule was removed — it dropped real photos in
-short emails. Signature logos that slip past these two are caught later by the
-cross-message `_is_repeating_signature_image` check in the upload loop.
+Exactly ONE signal survives: tiny-image (< 1 KB image/*), which only catches
+Office-generated signature thumbnails / tracking pixels and drops zero real
+files. Every other heuristic (inline-repeated, fuzzy ±size same-name,
+repeating-signature) was removed because it could drop a real distinct file —
+the operating rule is now "if a file is sent, it must appear in Notion".
+Byte-identical re-carries are still de-duplicated for upload by content sha1 in
+the upload loop, but that re-links the row instead of dropping the file.
 
 Also covers `_attribute_attachments`, which assigns forwarded-thread
 attachments to whichever extracted historical email's body actually mentions
 the filename (so the file lands on the original sender's row, not the
 forwarder's).
-
-The repetition-based signature detection (_is_repeating_signature_image) is
-not tested here because it requires a database session. End-to-end verification
-covers that path against a real Postgres in the integration setup.
 """
 
 from datetime import UTC, datetime
@@ -48,8 +46,8 @@ def test_partition_normal_attachment_uploads():
 def test_partition_image_near_signature_still_uploads():
     # Regression: previously an image whose `[image:]` marker sat below the
     # signature line was dropped as "signature-region". Real photos in short
-    # emails land there too, so we now upload it. Only size + inline-repeat
-    # decide here.
+    # emails land there too, so we now upload it. Only the sub-1KB tiny-image
+    # rule can skip now.
     decisions = _partition_attachments([_att("logo.png", "image/png", 30_000)])
     assert len(decisions) == 1
     assert decisions[0].upload is True
@@ -79,10 +77,11 @@ def test_partition_small_but_real_image_still_uploads():
     assert decisions[0].upload is True
 
 
-def test_partition_inline_repeated_image_is_skipped():
-    """An image referenced 2+ times in the same Gmail message's HTML is
-    almost always a signature logo carried in every quoted reply block
-    of an Outlook thread. Skip without needing the bytes."""
+def test_partition_inline_repeated_image_now_uploads():
+    """The old inline-repeated heuristic (inline_ref_count >= 2 ⇒ signature
+    logo) was removed: it could drop a real image a sender embedded twice.
+    A >1KB image now always uploads regardless of inline_ref_count; the
+    byte-identical re-carry is de-duped (and re-linked) later by sha1."""
     att = GmailAttachment(
         filename="image001.png",
         mime_type="image/png",
@@ -93,38 +92,8 @@ def test_partition_inline_repeated_image_is_skipped():
     )
     decisions = _partition_attachments([att])
     assert len(decisions) == 1
-    assert decisions[0].upload is False
-    assert decisions[0].skip_reason == "inline-repeated"
-
-
-def test_partition_single_inline_ref_uploads():
-    """One reference = real attachment, not a signature."""
-    att = GmailAttachment(
-        filename="moodboard.jpg",
-        mime_type="image/jpeg",
-        size=500_000,
-        attachment_id="abc",
-        content_id="ii_y@host",
-        inline_ref_count=1,
-    )
-    decisions = _partition_attachments([att])
-    assert len(decisions) == 1
     assert decisions[0].upload is True
-
-
-def test_partition_inline_repeated_only_applies_to_images():
-    """inline_ref_count is computed from `<img>` tags only, so non-image
-    types should never have it elevated. Sanity-check the guard explicitly
-    requires image/* so a hypothetical bug elsewhere can't skip a PDF."""
-    att = GmailAttachment(
-        filename="contract.pdf",
-        mime_type="application/pdf",
-        size=100_000,
-        attachment_id="abc",
-        inline_ref_count=5,  # would never happen, but guard against it
-    )
-    decisions = _partition_attachments([att])
-    assert decisions[0].upload is True
+    assert decisions[0].skip_reason == ""
 
 
 def test_partition_tiny_non_image_is_not_skipped():

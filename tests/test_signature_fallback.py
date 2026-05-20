@@ -9,8 +9,8 @@ Pins the contract for:
    resolve an LLM-supplied signature_first_line into a body line index.
 4. `classify_signature` — `SignatureLocators` return shape, schema parsing,
    graceful degradation on every failure mode.
-5. `_partition_attachments` — only tiny + inline-repeated images are dropped;
-   a normal image near the signature uploads (no position-based skip).
+5. `_partition_attachments` — only sub-1KB tiny images are dropped; a normal
+   image near the signature uploads (no position-based skip).
 """
 
 from __future__ import annotations
