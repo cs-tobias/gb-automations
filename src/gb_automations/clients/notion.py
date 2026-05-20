@@ -383,6 +383,23 @@ async def patch_email_row_project(page_id: str, project_page_ids: list[str]) -> 
         _raise_for_status(response)
 
 
+async def archive_page(page_id: str) -> None:
+    """Archive (trash) a Notion page. Idempotent — re-archiving is a no-op.
+
+    Used by the project resync to take down stale email rows before re-creating
+    them. `{"archived": true}` moves the page to Notion's trash (recoverable for
+    ~30 days), which is enough for our dedup readers — `find_email_row_by_message_id`
+    and `has_any_row_for_thread` both filter out `archived`/`in_trash` pages, so
+    the row becomes invisible and re-sync recreates it fresh.
+    """
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(f"/pages/{page_id}", json={"archived": True}),
+            op_name=f"PATCH /pages/{page_id} archive",
+        )
+        _raise_for_status(response)
+
+
 # ============================================================
 # Contacts DB
 # ============================================================

@@ -292,17 +292,45 @@ def add_label_to_thread(user_email: str, thread_id: str, label_name: str) -> Non
 
 
 def list_threads_with_label(
-    user_email: str, label_name: str, max_results: int = 30
+    user_email: str,
+    label_name: str,
+    max_results: int = 30,
+    *,
+    paginate: bool = False,
 ) -> list[dict[str, str]]:
-    """Return a list of {id, snippet, historyId} for threads carrying the given label."""
+    """Return a list of {id, snippet, historyId} for threads carrying the given label.
+
+    Default behavior is a single page capped at `max_results` (back-compat for
+    the existing button preview). Pass `paginate=True` to walk every page via
+    `nextPageToken` and return ALL matching threads — needed by the project
+    resync, which must enumerate the full history of a label (often hundreds of
+    threads). With `paginate=True`, `max_results` is the per-page size, not a
+    total cap.
+    """
     service = gmail_for(user_email)
-    response = (
-        service.users()
-        .threads()
-        .list(userId="me", q=f'label:"{label_name}"', maxResults=max_results)
-        .execute()
-    )
-    return response.get("threads", [])
+    q = f'label:"{label_name}"'
+    if not paginate:
+        response = (
+            service.users()
+            .threads()
+            .list(userId="me", q=q, maxResults=max_results)
+            .execute()
+        )
+        return response.get("threads", [])
+
+    threads: list[dict[str, str]] = []
+    page_token: str | None = None
+    while True:
+        response = (
+            service.users()
+            .threads()
+            .list(userId="me", q=q, maxResults=max_results, pageToken=page_token)
+            .execute()
+        )
+        threads.extend(response.get("threads", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return threads
 
 
 # ============================================================
