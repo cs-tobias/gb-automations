@@ -77,7 +77,10 @@ class Settings(BaseSettings):
     # Local LLM (Ollama). Used only for tagging today — see clients/llm.py.
     # Splitting/extraction is now regex-based (utils/history_extraction.py)
     # so we don't need the heavyweight long-output budgets the LLM splitter had.
-    ollama_base_url: str = "http://ollama:11434"
+    # Overridden by docker-compose.yml to host.docker.internal (Ollama runs
+    # natively on the host, not in a container). This default is for running
+    # the app outside Docker (e.g. `uv run`), where localhost reaches Ollama.
+    ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b-instruct-q4_K_M"
     # Tagging is ~10 output tokens, normally < 5s. We pad to 5 minutes because
     # the host machine can be slow (a dev laptop or a shared box) — under that

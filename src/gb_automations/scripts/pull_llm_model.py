@@ -52,8 +52,8 @@ async def pull() -> int:
         except httpx.HTTPError as err:
             print(f"\nFailed to reach Ollama at {url}: {err}", file=sys.stderr)
             print(
-                "Hint: is the `ollama` compose service running? "
-                "`docker compose ps ollama`",
+                "Hint: Ollama runs natively on the host, not in Docker. "
+                "Is `ollama serve` running on the host (port 11434)?",
                 file=sys.stderr,
             )
             return 1

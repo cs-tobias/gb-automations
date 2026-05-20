@@ -79,9 +79,9 @@ _validate_required_settings()
 async def _ensure_model_present() -> None:
     # Auto-pull the configured Ollama model on startup so a fresh `docker
     # compose up` is sufficient — no one needs to remember a manual step. Best
-    # effort: if Ollama is unreachable (e.g. Mac dev opted out and the native
-    # process isn't running), log and move on. The tagging client already
-    # treats Ollama failures as `[]` per project convention.
+    # effort: if the host's native Ollama isn't running yet, log and move on.
+    # The tagging client already treats Ollama failures as `[]` per project
+    # convention.
     base = settings.ollama_base_url.rstrip("/")
     want = settings.ollama_model
     log = logging.getLogger(__name__)
