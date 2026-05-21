@@ -389,7 +389,7 @@ def _pick_projects(
     """Find EVERY thread-label whose name matches a Notion project's label path.
 
     `project_map` keys are full nested Gmail label paths (e.g.
-    "Projects/2026/Acme"), produced by `notion_client.get_project_pages()`.
+    "Prosjekt/2026/Acme"), produced by `notion_client.get_project_pages()`.
     Gmail thread labels carry the same nested name, so set intersection works
     without rebuilding paths here.
 
@@ -2095,7 +2095,7 @@ async def _upload_attachments(
     re-uploaded, but its stored Drive links ARE returned, so the quoting row
     still gets linked — "already on Drive" must never mean "drop from the row".
     `project_label_paths` is the list of Gmail-label paths matched for this
-    thread (e.g. `["Projects/2026/Acme", "Projects/2026/Beta"]`). Each
+    thread (e.g. `["Prosjekt/2026/Acme", "Prosjekt/2026/Beta"]`). Each
     attachment uploads once per project into
     `<attachments_folder_name>/<label-path-segments>/`. The row's `Files`
     property is set to the union of returned URLs — Notion shows every link
@@ -2109,7 +2109,7 @@ async def _upload_attachments(
     sender = (attributed_sender or "").lower() or user_email.lower()
     # Pre-compute one folder path tuple per matched project. The root segment
     # (`settings.attachments_folder_name`) keeps everything under a single
-    # top-level container in My Drive, with `Projects/<year>/<name>` nested
+    # top-level container in My Drive, with `Prosjekt/<year>/<name>` nested
     # below — matching the Gmail label hierarchy 1:1.
     root = settings.attachments_folder_name
     folder_paths: list[tuple[str, ...]] = [

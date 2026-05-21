@@ -135,10 +135,10 @@ def test_enqueue_missing_skips_covered_threads(monkeypatch):
     enqueued: list[tuple[str, list[str]]] = []
 
     async def fake_list_projects():
-        return [rp.ProjectRef(page_id="p1", name="Projects/2026/Acme")]
+        return [rp.ProjectRef(page_id="p1", name="Prosjekt/2026/Acme")]
 
     async def fake_resolve(page_id, only_user):
-        return [("alice@x.no", "Projects/2026/Acme")]
+        return [("alice@x.no", "Prosjekt/2026/Acme")]
 
     async def fake_enumerate(labels):
         # three threads under the label; t1 already synced, t2 terminally failed

@@ -187,7 +187,7 @@ async def debug_emails_schema() -> dict[str, Any]:
 async def debug_projects() -> dict[str, Any]:
     """Gmail label path → {id, title, created_time} for every Notion project.
 
-    Keys are the nested label paths ("Projects/<year>/<title>") used in Gmail.
+    Keys are the nested label paths ("Prosjekt/<year>/<title>") used in Gmail.
     """
     try:
         projects = await notion_client.get_project_pages()

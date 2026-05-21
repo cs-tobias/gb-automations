@@ -56,7 +56,7 @@ def _ensure_folder_path(user_email: str, path_segments: tuple[str, ...]) -> str:
 
     Walks `path_segments` left→right; at each level scopes the lookup by
     `parent in parents` so two folders sharing a name in different subtrees
-    (e.g. "Projects/2026/Acme" vs "Projects/2025/Acme") don't collide.
+    (e.g. "Prosjekt/2026/Acme" vs "Prosjekt/2025/Acme") don't collide.
 
     Cached per (user, full path) so repeated uploads inside a sync only hit
     Drive once per unique folder. Cache survives for the process lifetime; a
@@ -110,7 +110,7 @@ def upload_attachment(
     """Upload `content` to the nested folder path in `user_email`'s Drive.
 
     `folder_path` is a tuple of segment names from My Drive root to the leaf
-    (e.g. `("Notion Email Attachments", "Projects", "2026", "Acme")`). Missing
+    (e.g. `("Notion Email Attachments", "Prosjekt", "2026", "Acme")`). Missing
     segments are created on first use.
 
     Returns a `https://drive.google.com/file/d/<id>/view` URL that anyone with

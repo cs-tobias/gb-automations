@@ -284,13 +284,17 @@ PROJECT_SYNC_OPTION = {
 
 
 # Top-level Gmail label namespace for project labels. The full path we create
-# per project is "Projects/<year>/<project-name>" — Gmail uses `/` as the
-# hierarchy separator and auto-creates parent labels on demand.
+# per project is "Prosjekt/<year>/<project-name>" — Gmail uses `/` as the
+# hierarchy separator and auto-creates parent labels on demand. Norwegian
+# "Prosjekt" (singular) to match the Goldbox Windows server's folder naming, so
+# the Gmail labels, the Drive attachment folders (derived from this same path),
+# and the on-prem server all share one namespace.
 # Hardcoded (not env-configurable) on purpose: changing it after labels exist
 # would orphan every nested label in every mailbox (the ProjectLabel table
 # keys by Gmail label ID, so renames-by-ID still work, but the backfill script
-# looks up labels by full name and would no longer find them).
-PROJECTS_LABEL_PREFIX = "Projects"
+# looks up labels by full name and would no longer find them) — so a change here
+# means re-syncing to mint labels at the new prefix.
+PROJECTS_LABEL_PREFIX = "Prosjekt"
 
 
 # Notion's multi-select API supports exactly these 10 colors. "default" is the

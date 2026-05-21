@@ -82,7 +82,7 @@ Skip this section on a fresh install. If you previously registered an automatic 
 2. Tail logs: `docker compose logs -f api | grep -v "GET /health"`
    - First click: `action: created` and one `creating Gmail label …` line per active user
    - Click again: `action: unchanged`
-3. Open one mailbox in Gmail — confirm the nested label appears under `Projects/<year>/`
+3. Open one mailbox in Gmail — confirm the nested label appears under `Prosjekt/<year>/`
 4. Rename the project title in Notion, click the button → `action: renamed`, label renamed in every mailbox
 
 ### 4d — Onboard existing projects

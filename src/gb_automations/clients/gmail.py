@@ -208,10 +208,10 @@ def create_label(user_email: str, name: str) -> dict[str, Any]:
 
     Gmail uses `/` as the hierarchy separator in label names, BUT
     `users.labels.create` does NOT auto-create parent labels — if you POST
-    "Projects/2026/Acme" without "Projects" and "Projects/2026" existing
+    "Prosjekt/2026/Acme" without "Prosjekt" and "Prosjekt/2026" existing
     first, Gmail creates a single flat label whose literal name contains the
     `/` characters. We walk the path top-down and create each missing prefix.
-    See docs/gotchas.md.
+    See docs/misc/gotchas.md.
     """
     logger.debug("gmail → labels.create(user=%s, name=%r)", user_email, name)
 
@@ -260,7 +260,7 @@ def update_label_name(user_email: str, label_id: str, new_name: str) -> dict[str
     Used when a Notion project is renamed — we patch the label rather than
     create-new + delete-old so existing threads keep their label without churn.
 
-    If `new_name` is a nested path ("Projects/2026/Acme") and any parent
+    If `new_name` is a nested path ("Prosjekt/2026/Acme") and any parent
     doesn't exist yet, pre-create it. Same gotcha as create_label: Gmail
     would otherwise rename the label to a flat name with literal slashes.
     """

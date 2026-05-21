@@ -45,7 +45,7 @@ class ProjectRef:
     """A resolved project: its Notion page id and the label name we know it by."""
 
     page_id: str
-    name: str  # ProjectLabel.current_name, e.g. "Projects/2026/1232_Eiendomsspar_KJ8"
+    name: str  # ProjectLabel.current_name, e.g. "Prosjekt/2026/1232_Eiendomsspar_KJ8"
 
 
 async def list_projects() -> list[ProjectRef]:

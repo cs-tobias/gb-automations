@@ -17,11 +17,11 @@ from gb_automations.sync.sync_thread import _assemble_row_props, _pick_projects
 
 def test_pick_projects_returns_all_matches_sorted():
     project_map = {
-        "Projects/2026/Bravo": {"id": "page-b", "title": "Bravo", "created_time": ""},
-        "Projects/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
-        "Projects/2026/Other": {"id": "page-o", "title": "Other", "created_time": ""},
+        "Prosjekt/2026/Bravo": {"id": "page-b", "title": "Bravo", "created_time": ""},
+        "Prosjekt/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
+        "Prosjekt/2026/Other": {"id": "page-o", "title": "Other", "created_time": ""},
     }
-    labels = {"INBOX", "Projects/2026/Bravo", "Projects/2026/Alpha"}
+    labels = {"INBOX", "Prosjekt/2026/Bravo", "Prosjekt/2026/Alpha"}
 
     titles, ids, label_paths = _pick_projects(labels, project_map)
 
@@ -29,14 +29,14 @@ def test_pick_projects_returns_all_matches_sorted():
     # when Gmail returns labels in a different order.
     assert titles == ["Alpha", "Bravo"]
     assert ids == ["page-a", "page-b"]
-    assert label_paths == ["Projects/2026/Alpha", "Projects/2026/Bravo"]
+    assert label_paths == ["Prosjekt/2026/Alpha", "Prosjekt/2026/Bravo"]
 
 
 def test_pick_projects_returns_empty_when_no_label_matches():
     project_map = {
-        "Projects/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
+        "Prosjekt/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
     }
-    labels = {"INBOX", "SENT", "Projects/2025/Bravo"}  # different year, no match
+    labels = {"INBOX", "SENT", "Prosjekt/2025/Bravo"}  # different year, no match
 
     titles, ids, label_paths = _pick_projects(labels, project_map)
 
@@ -47,16 +47,16 @@ def test_pick_projects_returns_empty_when_no_label_matches():
 
 def test_pick_projects_single_match_returns_one_element_list():
     project_map = {
-        "Projects/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
-        "Projects/2026/Bravo": {"id": "page-b", "title": "Bravo", "created_time": ""},
+        "Prosjekt/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
+        "Prosjekt/2026/Bravo": {"id": "page-b", "title": "Bravo", "created_time": ""},
     }
-    labels = {"Projects/2026/Alpha"}
+    labels = {"Prosjekt/2026/Alpha"}
 
     titles, ids, label_paths = _pick_projects(labels, project_map)
 
     assert titles == ["Alpha"]
     assert ids == ["page-a"]
-    assert label_paths == ["Projects/2026/Alpha"]
+    assert label_paths == ["Prosjekt/2026/Alpha"]
 
 
 def test_assemble_row_props_writes_multi_target_project_relation():

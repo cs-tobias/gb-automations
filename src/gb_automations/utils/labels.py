@@ -1,9 +1,9 @@
 """Gmail label naming for Notion projects.
 
-Single source of truth for the `Projects/<year>/<project-name>` scheme.
+Single source of truth for the `Prosjekt/<year>/<project-name>` scheme.
 Gmail uses `/` as the hierarchy separator in label names and auto-creates
 parent labels when a nested name is sent to labels.create — no special API
-needed.
+needed. The top segment ("Prosjekt") comes from PROJECTS_LABEL_PREFIX.
 """
 from __future__ import annotations
 
@@ -60,11 +60,11 @@ def project_label_path(project_name: str, created_time: str | None) -> str:
     """Return the full nested Gmail label name for a Notion project.
 
     >>> project_label_path("Acme", "2026-05-18T10:30:00.000Z")
-    'Projects/2026/Acme'
+    'Prosjekt/2026/Acme'
     >>> project_label_path("Foo/Bar", "2026-05-18T10:30:00.000Z")
-    'Projects/2026/Foo-Bar'
+    'Prosjekt/2026/Foo-Bar'
     >>> project_label_path("Acme", None)
-    'Projects/unknown/Acme'
+    'Prosjekt/unknown/Acme'
     """
     year, leaf = project_path_parts(project_name, created_time)
     return f"{PROJECTS_LABEL_PREFIX}/{year}/{leaf}"

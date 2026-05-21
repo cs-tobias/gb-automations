@@ -234,9 +234,9 @@ The `index=True` flag in the SQLAlchemy *model* (in `models.py`) is fine — tha
 
 ## 12. Gmail's `labels.create` does NOT auto-create parents for nested labels
 
-**Symptom:** you POST a label named `Projects/2026/Acme` to `users.labels.create` expecting Gmail to render it as a nested label in the sidebar. Instead, Gmail creates a single flat label whose literal name is `Projects/2026/Acme` — the `/` characters show up as text, not as hierarchy separators.
+**Symptom:** you POST a label named `Prosjekt/2026/Acme` to `users.labels.create` expecting Gmail to render it as a nested label in the sidebar. Instead, Gmail creates a single flat label whose literal name is `Prosjekt/2026/Acme` — the `/` characters show up as text, not as hierarchy separators.
 
-**Why:** Gmail uses `/` as the sidebar nesting separator at *render* time only. The `name` field on the Label resource is treated as an opaque string by the API. For Gmail to render `Projects/2026/Acme` as nested, each prefix (`Projects`, then `Projects/2026`) must already exist as its own label first. If any prefix is missing, Gmail just shows the slashes literally.
+**Why:** Gmail uses `/` as the sidebar nesting separator at *render* time only. The `name` field on the Label resource is treated as an opaque string by the API. For Gmail to render `Prosjekt/2026/Acme` as nested, each prefix (`Prosjekt`, then `Prosjekt/2026`) must already exist as its own label first. If any prefix is missing, Gmail just shows the slashes literally.
 
 **Fix:** before creating a leaf, walk the path top-down and pre-create each missing prefix. See [src/gb_automations/clients/gmail.py](../src/gb_automations/clients/gmail.py) `create_label` — it splits on `/`, snapshots the label list once, and calls `labels.create` for each prefix that isn't already present. Treat `409 Conflict` as success (concurrent webhook race).
 
@@ -258,15 +258,15 @@ The `index=True` flag in the SQLAlchemy *model* (in `models.py`) is fine — tha
 
 ---
 
-## 14. Gmail's `users.watch()` filter can't be tightened to `Projects/*` — filtering happens in our code
+## 14. Gmail's `users.watch()` filter can't be tightened to `Prosjekt/*` — filtering happens in our code
 
-**Symptom:** you'd expect Gmail to only push us activity on threads tagged with a `Projects/*` label, but the watch is configured with `labelIds: ["INBOX", "SENT"]` and we get pushes for *every* inbox change (promo mail, UNREAD toggles, CATEGORY_UPDATES). Looks wrong at first glance.
+**Symptom:** you'd expect Gmail to only push us activity on threads tagged with a `Prosjekt/*` label, but the watch is configured with `labelIds: ["INBOX", "SENT"]` and we get pushes for *every* inbox change (promo mail, UNREAD toggles, CATEGORY_UPDATES). Looks wrong at first glance.
 
 **Why two upstream options don't work:**
 
 1. *Pass project label IDs to `users.watch()`.* Gmail documents a ~50-label cap per watch; Goldbox does ~200 projects/year. Even rotating year-buckets blows past it eventually, and re-registering the watch on every project create adds operational fragility.
 
-2. *Watch the parent label (`Projects` or `Projects/2026`).* Gmail's hierarchy is a UI convention — every label is flat in the API. Verified live: a thread tagged `Projects/2026/Acme` carries only that leaf in its message `labelIds`, never the parent. `threads.list(labelIds=['<Projects/2026 ID>'])` returns zero results even when child-labeled threads exist. So a parent-label watch would receive *nothing*.
+2. *Watch the parent label (`Prosjekt` or `Prosjekt/2026`).* Gmail's hierarchy is a UI convention — every label is flat in the API. Verified live: a thread tagged `Prosjekt/2026/Acme` carries only that leaf in its message `labelIds`, never the parent. `threads.list(labelIds=['<Prosjekt/2026 ID>'])` returns zero results even when child-labeled threads exist. So a parent-label watch would receive *nothing*.
 
 Gmail filter rules don't save us either — they only run on incoming messages, not when the team manually files an existing email into a project.
 

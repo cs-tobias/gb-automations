@@ -20,7 +20,7 @@ Usage (inside the container):
 
 `--project` accepts EITHER a Notion page id (the UUID from the project page URL)
 OR a case-insensitive substring of the project's label name (e.g. "KJ8" matches
-"Projects/2026/1232_Eiendomsspar_KJ8"). If the substring matches more than one
+"Prosjekt/2026/1232_Eiendomsspar_KJ8"). If the substring matches more than one
 project, the command lists the matches and exits so you can be more specific.
 Run `--list` to see every resyncable project.
 

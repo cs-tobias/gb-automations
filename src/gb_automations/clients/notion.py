@@ -227,7 +227,7 @@ def read_rich_text_prop(page: dict[str, Any], prop_name: str) -> str | None:
 async def get_project_pages() -> dict[str, dict[str, str]]:
     """Full Gmail-label path → {id, title, created_time}, for every Notion project page.
 
-    The key is the *nested Gmail label name* (e.g. "Projects/2026/Acme") so it
+    The key is the *nested Gmail label name* (e.g. "Prosjekt/2026/Acme") so it
     matches the actual label names on synced Gmail threads — the
     sync_thread → _pick_projects intersection works directly without callers
     having to rebuild paths on each lookup.

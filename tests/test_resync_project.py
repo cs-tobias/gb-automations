@@ -29,7 +29,7 @@ def test_enumerate_threads_dedupes_to_one_owner(monkeypatch):
 
     monkeypatch.setattr(rp.gmail_client, "list_threads_with_label", fake_list)
 
-    labels = [("bob@x.no", "Projects/2026/Acme"), ("alice@x.no", "Projects/2026/Acme")]
+    labels = [("bob@x.no", "Prosjekt/2026/Acme"), ("alice@x.no", "Prosjekt/2026/Acme")]
     owner = asyncio.run(rp._enumerate_threads(labels))
 
     assert owner == {"t1": "alice@x.no", "t2": "alice@x.no", "t3": "bob@x.no"}
@@ -40,7 +40,7 @@ def test_dry_run_mutates_nothing(monkeypatch):
     cleared: list[str] = []
 
     async def fake_resolve(project_page_id, only_user):
-        return [("alice@x.no", "Projects/2026/Acme")]
+        return [("alice@x.no", "Prosjekt/2026/Acme")]
 
     async def fake_enumerate(labels):
         return {"t1": "alice@x.no", "t2": "alice@x.no"}
@@ -84,9 +84,9 @@ def test_dry_run_mutates_nothing(monkeypatch):
 
 def _projects():
     return [
-        rp.ProjectRef(page_id="id-kj8", name="Projects/2026/1232_Eiendomsspar_KJ8"),
-        rp.ProjectRef(page_id="id-toi", name="Projects/2026/1234_fredriksborg_Toeihuset"),
-        rp.ProjectRef(page_id="id-kj9", name="Projects/2026/1240_Eiendomsspar_KJ9"),
+        rp.ProjectRef(page_id="id-kj8", name="Prosjekt/2026/1232_Eiendomsspar_KJ8"),
+        rp.ProjectRef(page_id="id-toi", name="Prosjekt/2026/1234_fredriksborg_Toeihuset"),
+        rp.ProjectRef(page_id="id-kj9", name="Prosjekt/2026/1240_Eiendomsspar_KJ9"),
     ]
 
 
