@@ -2051,6 +2051,14 @@ class ThreadAttachmentTracker:
     """
 
     links_by_sha1: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    # Content hashes that have already been ATTACHED to a row during THIS sync
+    # pass. Distinct from `links_by_sha1` (which is also pre-seeded from the
+    # durable ThreadAttachment table across syncs, so it can't tell "first
+    # message" from "re-sync"). `attached_this_pass` starts empty every sync, so
+    # the message that FIRST carries a file this pass attaches it, and only the
+    # later messages that re-carry the same bytes skip it. This is what stops
+    # every reply row from getting the whole thread's attachments.
+    attached_this_pass: set[str] = field(default_factory=set)
 
     @property
     def sha1s(self) -> set[str]:
@@ -2143,15 +2151,28 @@ async def _upload_attachments(
                 "    ⏏  skip attachment %r: empty content from Gmail", d.attachment.filename
             )
             continue
-        # Thread-level dedup: an exact content match anywhere in the thread
-        # (sender-independent). The common case is a reply quoting an earlier
-        # message — Gmail re-carries the identical bytes under the replier's
-        # name. We skip the *upload* but still return the stored Drive links
-        # (renamed to this attachment's filename) so the quoting row links to
-        # the file that's already on Drive.
         content_sha1 = hashlib.sha1(content).hexdigest()
+
+        # Row-attribution: Gmail/Outlook re-carries identical bytes on every
+        # reply's MIME tree, so the same file reappears under each later author.
+        # The file belongs to the message that FIRST carried it THIS pass; a
+        # reply only quoted it. If we've already attached these bytes to an
+        # earlier row this pass, drop them from this row entirely. (Using a
+        # per-pass set, not links_by_sha1, so a re-sync still attaches the first
+        # message's files — links_by_sha1 is pre-seeded across syncs.)
+        if content_sha1 in thread_tracker.attached_this_pass:
+            logger.info(
+                "    ⏏  skip attachment %r: already attached to an earlier message "
+                "in this thread (re-carried quote)",
+                d.attachment.filename,
+            )
+            continue
+
+        # Upload-dedup: if these exact bytes were already sent to Drive (this
+        # thread, possibly a previous sync), reuse the stored links instead of
+        # re-uploading — but DO attach them to this (first-this-pass) row.
         known_links = thread_tracker.links_by_sha1.get(content_sha1)
-        if known_links is not None:
+        if known_links:
             relinked = [
                 {"name": d.attachment.filename or link.get("name") or "attachment",
                  "url": link["url"]}
@@ -2159,13 +2180,13 @@ async def _upload_attachments(
                 if link.get("url")
             ]
             uploaded.extend(relinked)
+            thread_tracker.attached_this_pass.add(content_sha1)
             logger.info(
-                "    ⏏  skip attachment %r: already uploaded earlier in this thread "
-                "(re-linked %d)",
+                "    📎 linked %r from Drive (already uploaded earlier)",
                 d.attachment.filename,
-                len(relinked),
             )
             continue
+
         # Upload once per matched project subfolder. Each project's folder
         # becomes self-contained (good for archival/export), at the cost of N
         # Drive files for an N-project email — the team chose this trade-off
@@ -2198,6 +2219,7 @@ async def _upload_attachments(
             )
         if att_links:
             uploaded.extend(att_links)
+            thread_tracker.attached_this_pass.add(content_sha1)
             # Only record once at least one project copy made it through —
             # otherwise a transient Drive failure would prevent a retry on
             # the next thread sync. Storing the links (not just the sha1) is

@@ -258,14 +258,17 @@ SYNC_QUEUE_STATUS_PROCESSING = "Processing"
 SYNC_QUEUE_STATUS_FAILED = "Failed"
 
 
-# At-a-glance sync status dot on the Projects DB. A single Select property whose
-# option NAMES are the emoji+label below — so the chip itself shows the dot.
+# At-a-glance sync status on the Projects DB. A single Select property whose
+# option NAMES are icon-only — the chip shows just a status icon, no word, so it
+# reads as a sync indicator rather than a project-lifecycle "Active/Idle". Notion
+# Select can't be truly nameless, so the icon IS the name. Legend:
+#   🔄 syncing now · ⚠️ failed once, retrying · 🛑 failed (needs attention) · ✅ synced/idle
 # The property name lives here; edit it to match the column you add in Notion.
 PROJECTS_SYNC_PROP = "Sync"
-PROJECT_SYNC_ACTIVE = "🟢 Active"
-PROJECT_SYNC_RETRYING = "🟠 Retrying"
-PROJECT_SYNC_FAILED = "🔴 Failed"
-PROJECT_SYNC_IDLE = "⚪ Idle"
+PROJECT_SYNC_ACTIVE = "🔄"
+PROJECT_SYNC_RETRYING = "⚠️"
+PROJECT_SYNC_FAILED = "🛑"
+PROJECT_SYNC_IDLE = "✅"
 
 # Maps the queue's internal state strings (project_sync_state) to the Notion
 # select option. Notion auto-creates an option the first time we write it, so
