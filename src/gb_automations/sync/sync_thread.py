@@ -177,6 +177,13 @@ async def sync_thread(
             f"no Notion project matches any thread label "
             f"(thread labels: {sorted(thread_label_names)})"
         )
+        logger.warning(
+            "🧵 sync skip: %r thread=%s for %s — %s",
+            result.thread_subject,
+            thread_id,
+            user_email,
+            result.skipped_reason,
+        )
         return result
     logger.info(
         "  • matched %d project(s): %s",

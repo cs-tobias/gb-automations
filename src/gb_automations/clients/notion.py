@@ -168,26 +168,46 @@ def _client() -> httpx.AsyncClient:
 # ============================================================
 
 
+async def _search_all(object_type: str, page_size: int) -> list[dict[str, Any]]:
+    """Return EVERY /search result of the given object type, paginating fully.
+
+    Notion's /search caps each response at page_size (max 100) and signals more
+    via has_more + next_cursor. We MUST loop: a workspace with >100 visible
+    objects (every synced Email/Contact row counts toward the page cap) would
+    otherwise silently drop project pages past the first page, so
+    get_project_pages couldn't match a thread to its project and sync_thread
+    wrote nothing.
+    """
+    results: list[dict[str, Any]] = []
+    start_cursor: str | None = None
+    async with _client() as client:
+        while True:
+            body: dict[str, Any] = {
+                "filter": {"value": object_type, "property": "object"},
+                "page_size": page_size,
+            }
+            if start_cursor:
+                body["start_cursor"] = start_cursor
+            response = await client.post("/search", json=body)
+            _raise_for_status(response)
+            payload = response.json()
+            results.extend(payload.get("results", []))
+            if not payload.get("has_more"):
+                break
+            start_cursor = payload.get("next_cursor")
+            if not start_cursor:  # defensive: has_more true but no cursor
+                break
+    return results
+
+
 async def search_pages(page_size: int = 100) -> list[dict[str, Any]]:
     """Return every page the integration can see (top-level + DB rows)."""
-    async with _client() as client:
-        response = await client.post(
-            "/search",
-            json={"filter": {"value": "page", "property": "object"}, "page_size": page_size},
-        )
-        _raise_for_status(response)
-        return response.json().get("results", [])
+    return await _search_all("page", page_size)
 
 
 async def search_databases(page_size: int = 100) -> list[dict[str, Any]]:
     """Return every database the integration can see. Use to discover DB IDs."""
-    async with _client() as client:
-        response = await client.post(
-            "/search",
-            json={"filter": {"value": "database", "property": "object"}, "page_size": page_size},
-        )
-        _raise_for_status(response)
-        return response.json().get("results", [])
+    return await _search_all("database", page_size)
 
 
 def extract_page_title(page: dict[str, Any]) -> str | None:
