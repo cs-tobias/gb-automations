@@ -8,7 +8,13 @@
   first time, renames it on later clicks if the project title changed, and
   reconciles per-user rows that drifted.
 
-/webhooks/gmail handles the inbound side (Pub/Sub push from Gmail history).
+- /webhooks/gmail — inbound side (Gmail Pub/Sub push). Does NOT sync inline: it
+  ENQUEUES a durable `sync_tasks` row and advances the history cursor in one
+  transaction, then acks. A background worker (jobs/queue_worker.py, started in
+  main.py's lifespan) drains the queue and runs sync_thread with retry/backoff.
+- /webhooks/notion/resync-thread — per-email "Re-sync" button on the Emails DB:
+  enqueues a REBUILD of that thread (archive its rows + recreate under current
+  code). Same queue, same worker.
 """
 
 from __future__ import annotations

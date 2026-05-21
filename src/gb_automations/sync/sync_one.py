@@ -1,5 +1,11 @@
 """One-shot CLI: sync a single Gmail thread into Notion.
 
+For manual testing / debugging only. The normal path is queue-driven (the Gmail
+webhook enqueues; the worker syncs). This calls sync_thread directly, bypassing
+the queue — handy for iterating on the engine, but it won't show up in
+/debug/queue. To re-run through the queue instead, use the per-email "Re-sync"
+button or POST /debug/queue/retry-failed.
+
 Usage (inside the api container):
     docker compose exec api python -m gb_automations.sync.sync_one \
         --email tobias@tobiaseek.com \

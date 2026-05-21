@@ -2,7 +2,12 @@
 
 Public entrypoint: `sync_thread(user_email, thread_id)`. Returns a SyncResult
 describing what happened. Idempotent: re-running on the same thread is safe
-(messages already in Notion are skipped via dedup).
+(messages already in Notion are skipped via dedup, stale cache ids self-heal).
+
+NORMALLY CALLED BY THE QUEUE WORKER, not directly: the Gmail webhook enqueues a
+`sync_tasks` row and jobs/queue_worker.py calls this. Direct callers are the CLI
+(scripts/sync_one.py) and resync_project.rebuild_thread. Because the worker
+retries on failure, this must stay idempotent — never assume it runs once.
 
 Flow per thread:
   1. Fetch thread + per-user labels from Gmail.
