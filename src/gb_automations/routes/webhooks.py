@@ -34,9 +34,11 @@ from gb_automations.clients import nas as nas_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
+from gb_automations.jobs import queue_worker
 from gb_automations.models import EmailRow, ProjectFolder, ProjectLabel, SyncCursor, User
 from gb_automations.obs import request_scope
-from gb_automations.sync.sync_thread import sync_thread
+from gb_automations.sync import queue_mirror
+from gb_automations.sync.queue import enqueue_threads
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
 from gb_automations.utils.labels import project_label_path
 
@@ -580,17 +582,29 @@ async def _load_history_cursor(email: str) -> str | None:
         return cur.cursor_value if cur else None
 
 
+def _save_history_cursor_stmt(email: str, history_id: str):
+    return (
+        pg_insert(SyncCursor)
+        .values(source=cursor_source_for(email), cursor_value=str(history_id))
+        .on_conflict_do_update(
+            index_elements=["source"], set_={"cursor_value": str(history_id)}
+        )
+    )
+
+
 async def _save_history_cursor(email: str, history_id: str) -> None:
     async with SessionLocal() as session:
-        stmt = (
-            pg_insert(SyncCursor)
-            .values(source=cursor_source_for(email), cursor_value=str(history_id))
-            .on_conflict_do_update(
-                index_elements=["source"], set_={"cursor_value": str(history_id)}
-            )
-        )
-        await session.execute(stmt)
+        await session.execute(_save_history_cursor_stmt(email, history_id))
         await session.commit()
+
+
+async def _save_history_cursor_in_session(session, email: str, history_id: str) -> None:
+    """Advance the cursor on a caller-owned transaction (no commit here).
+
+    Used by the Gmail webhook so the enqueue and the cursor advance commit
+    together — they can never disagree: either both land or neither does.
+    """
+    await session.execute(_save_history_cursor_stmt(email, history_id))
 
 
 async def _known_project_thread_ids(thread_ids: set[str]) -> set[str]:
@@ -795,56 +809,42 @@ async def _gmail_webhook_impl(request: Request) -> Response:
         new_history_id,
     )
 
-    # Hand off the actual sync work to a background task and ack Pub/Sub now.
-    # Splitting a forwarded chain via the local LLM routinely takes 60–90s on
-    # the M4 dev host; Pub/Sub's default ack deadline is 10s. Without this
-    # fire-and-forget, Pub/Sub would redeliver while sync is still running,
-    # causing duplicate work and stressing Ollama.
-    asyncio.create_task(
-        _run_thread_syncs_background(email, sorted(thread_ids), new_history_id)
+    # Durable handoff: enqueue the threads AND advance the history cursor in one
+    # transaction, then ack Pub/Sub. The actual sync runs later in the queue
+    # worker. Doing both in one txn means the cursor can never advance past work
+    # that wasn't durably recorded — if the enqueue fails, the cursor stays put
+    # and we return non-200 so Pub/Sub redelivers. (Previously this was a
+    # fire-and-forget asyncio task that lost everything on a crash.)
+    sorted_ids = sorted(thread_ids)
+    try:
+        async with SessionLocal() as session:
+            inserted = await enqueue_threads(email, sorted_ids, session=session)
+            await _save_history_cursor_in_session(session, email, new_history_id)
+            await session.commit()
+    except Exception:
+        logger.exception(
+            "Enqueue failed for %s — cursor NOT advanced, Pub/Sub will redeliver", email
+        )
+        raise HTTPException(503, "enqueue failed") from None
+
+    # `inserted` < len when a thread already had an active queue row (deduped) —
+    # e.g. a second push/reply on a thread still waiting to be processed.
+    skipped = len(sorted_ids) - inserted
+    logger.info(
+        "  ⇢ enqueued %d thread(s)%s — worker will sync them",
+        inserted,
+        f" ({skipped} already queued, deduped)" if skipped else "",
     )
+
+    # Wake the worker so it picks the new work up immediately rather than waiting
+    # for its poll interval. Best-effort mirror to the client's Notion worklist.
+    queue_worker.wake()
+    for tid in sorted_ids:
+        await queue_mirror.mark_queued(tid, subject=tid)
 
     return Response(
         content=json.dumps(
-            {"email": email, "queued": len(thread_ids), "history_id": new_history_id}
+            {"email": email, "enqueued": len(sorted_ids), "history_id": new_history_id}
         ),
         media_type="application/json",
     )
-
-
-async def _run_thread_syncs_background(
-    email: str, thread_ids: list[str], new_history_id: str
-) -> None:
-    """Background body of /webhooks/gmail — runs after we've ack'd Pub/Sub.
-
-    Mirrors what the inline loop used to do: sync each thread, then save the
-    cursor at the end so a partial run doesn't advance past unprocessed work.
-    Errors are logged here rather than propagated — there's no HTTP request
-    waiting for the result.
-    """
-    for tid in thread_ids:
-        try:
-            result = await sync_thread(email, tid)
-            label = result.thread_subject or "(unknown thread)"
-            if result.project_page_id:
-                logger.info(
-                    "  ✓ %r [%s]: +%d row(s), %d already present",
-                    label,
-                    result.project_name,
-                    result.rows_created,
-                    result.rows_already_present,
-                )
-            else:
-                logger.info(
-                    "  ⊘ %r skipped: %s",
-                    label,
-                    result.skipped_reason or "no project match",
-                )
-            logger.debug("  (thread_id=%s)", tid)
-        except Exception:
-            logger.exception("sync_thread failed for %s / %s", email, tid)
-
-    try:
-        await _save_history_cursor(email, new_history_id)
-    except Exception:
-        logger.exception("Failed to save history cursor for %s", email)

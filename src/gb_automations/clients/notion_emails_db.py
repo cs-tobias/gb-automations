@@ -71,8 +71,23 @@ async def get_emails_db_for_year(year: int) -> str:
     async with SessionLocal() as session:
         cached_id = await _read_cache(session, year)
         if cached_id:
-            _IN_PROCESS_CACHE[year] = cached_id
-            return cached_id
+            # Validate the cached id ONCE per process (we're past the in-process
+            # cache, so this only fires on first use of the year after a
+            # restart). A per-machine Postgres volume can hold a stale id — e.g.
+            # the DB was (re)created on another host with its own cache, and the
+            # original was deleted. Trusting a dead id wedges every sync for the
+            # year with a 404 forever. If it's gone, evict and re-resolve.
+            if await _database_exists(cached_id):
+                _IN_PROCESS_CACHE[year] = cached_id
+                return cached_id
+            logger.warning(
+                "Cached Emails DB %s for %d no longer exists in Notion — "
+                "evicting stale cache and re-resolving",
+                cached_id,
+                year,
+            )
+            await _delete_cache(session, year)
+            await session.commit()
 
         # Look in Notion. The integration may have been pointed at a parent
         # page that ALREADY has year DBs (set up by a prior deployment or by
@@ -136,6 +151,35 @@ async def _write_cache(session: AsyncSession, year: int, db_id: str) -> None:
         .on_conflict_do_update(index_elements=["year"], set_={"notion_db_id": db_id})
     )
     await session.execute(stmt)
+
+
+async def _delete_cache(session: AsyncSession, year: int) -> None:
+    row = await session.get(EmailsDbCache, year)
+    if row is not None:
+        await session.delete(row)
+
+
+async def _database_exists(db_id: str) -> bool:
+    """True if the Notion database still exists (and isn't trashed).
+
+    A 404 (object_not_found) means it was deleted — the signal we use to evict a
+    stale cache entry. Any other error is re-raised: we must NOT treat a
+    transient network/auth blip as "deleted", or we'd needlessly re-resolve (or
+    worse, recreate) a perfectly good DB.
+    """
+    from gb_automations.clients.notion import NotionAPIError, _client, _raise_for_status
+
+    async with _client() as client:
+        response = await client.get(f"/databases/{db_id}")
+    try:
+        _raise_for_status(response)
+    except NotionAPIError as err:
+        if err.status_code == 404:
+            return False
+        raise
+    # A retrieved DB can still be archived/in_trash — treat that as gone too.
+    body = response.json()
+    return not (body.get("archived") or body.get("in_trash"))
 
 
 async def _find_in_notion(year: int) -> str | None:

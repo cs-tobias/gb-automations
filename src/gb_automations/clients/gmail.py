@@ -363,27 +363,63 @@ def stop_watch(user_email: str) -> None:
     service.users().stop(userId="me").execute()
 
 
-def list_history(user_email: str, start_history_id: str, max_results: int = 100) -> dict[str, Any]:
-    """Fetch Gmail history starting from `start_history_id`.
+def list_history(
+    user_email: str, start_history_id: str, max_results: int = 100, *, max_pages: int = 50
+) -> dict[str, Any]:
+    """Fetch ALL Gmail history since `start_history_id`, following pagination.
 
-    Returns the raw response; caller iterates `history` entries to find affected
-    messages/threads. `historyId` on the response is the new cursor to save.
+    Returns a single merged response: `history` holds every entry across pages
+    and `historyId` is the newest cursor to save. The caller iterates `history`
+    to find affected messages/threads.
+
+    Pagination matters: a bulk label of dozens of threads produces one Pub/Sub
+    push but many history records. Without following `nextPageToken` we'd take
+    only the first `max_results` and silently drop the rest — threads would
+    never sync. `max_pages` caps the loop (max_results × max_pages records) so a
+    pathological token chain can't spin forever; hitting it is logged and means
+    a full reconcile is warranted.
     """
-    logger.debug(
-        "gmail → history.list(user=%s, since=%s)", user_email, start_history_id
-    )
+    logger.debug("gmail → history.list(user=%s, since=%s)", user_email, start_history_id)
     service = gmail_for(user_email)
-    return (
-        service.users()
-        .history()
-        .list(
-            userId="me",
-            startHistoryId=start_history_id,
-            historyTypes=["messageAdded", "labelAdded", "labelRemoved"],
-            maxResults=max_results,
+
+    merged: dict[str, Any] = {}
+    history: list[dict[str, Any]] = []
+    page_token: str | None = None
+    pages = 0
+    while True:
+        response = (
+            service.users()
+            .history()
+            .list(
+                userId="me",
+                startHistoryId=start_history_id,
+                historyTypes=["messageAdded", "labelAdded", "labelRemoved"],
+                maxResults=max_results,
+                pageToken=page_token,
+            )
+            .execute()
         )
-        .execute()
-    )
+        history.extend(response.get("history", []) or [])
+        # The newest historyId is on the last page's response; keep overwriting.
+        if response.get("historyId"):
+            merged["historyId"] = response["historyId"]
+        page_token = response.get("nextPageToken")
+        pages += 1
+        if not page_token:
+            break
+        if pages >= max_pages:
+            logger.warning(
+                "gmail history.list for %s hit max_pages=%d (>%d records) since %s — "
+                "truncating; run reconcile to backfill any missed threads",
+                user_email,
+                max_pages,
+                max_pages * max_results,
+                start_history_id,
+            )
+            break
+
+    merged["history"] = history
+    return merged
 
 
 # ============================================================

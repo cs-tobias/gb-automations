@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     # parent isn't this database. If empty, the parent check is skipped (the button
     # is only placed on the Projects DB template anyway).
     projects_db_id: str = ""
+    # Optional: live mirror of the durable sync queue so the client can watch
+    # what's queued / processing / failed in Notion. If empty, the mirror is a
+    # no-op (the Postgres queue still works, observable via /debug/queue).
+    sync_queue_db_id: str = ""
+    # Optional: write an at-a-glance sync status dot (🟢/🔴/⚪) onto each Projects
+    # DB page via the `Sync` Select property. Off by default; requires the
+    # property + its emoji options to exist on the Projects DB. Independent of
+    # sync_queue_db_id — you can have the dot without the detail DB, or both.
+    projects_sync_status: bool = False
 
     # Webhook auth secrets
     notion_webhook_secret: str = ""
@@ -227,6 +236,43 @@ COMPANIES_PROPS = {
     "name": "Navn",
     "domain": "Nettside",
     "contacts": "Kontaktpersoner",
+}
+
+
+# Live mirror of the durable sync queue (sync_queue_db_id). One row per active
+# task so the client can watch what's queued / processing / failed. Edit these
+# to match the actual property names in the Notion DB the operator creates.
+SYNC_QUEUE_PROPS = {
+    "subject": "Emne",        # title
+    "status": "Status",       # select: Queued / Processing / Failed
+    "thread_id": "Thread ID",  # rich_text — dedup key for the mirror row
+    "project": "Prosjekt",    # rich_text (project label/name; kept simple, not a relation)
+    "attempts": "Forsøk",     # number
+    "error": "Feil",          # rich_text
+    "queued_at": "Lagt i kø", # date
+}
+
+# The Status select option labels, surfaced in the Notion view.
+SYNC_QUEUE_STATUS_QUEUED = "Queued"
+SYNC_QUEUE_STATUS_PROCESSING = "Processing"
+SYNC_QUEUE_STATUS_FAILED = "Failed"
+
+
+# At-a-glance sync status dot on the Projects DB. A single Select property whose
+# option NAMES are the emoji+label below — so the chip itself shows the dot.
+# The property name lives here; edit it to match the column you add in Notion.
+PROJECTS_SYNC_PROP = "Sync"
+PROJECT_SYNC_ACTIVE = "🟢 Active"
+PROJECT_SYNC_FAILED = "🔴 Failed"
+PROJECT_SYNC_IDLE = "⚪ Idle"
+
+# Maps the queue's internal state strings (project_sync_state) to the Notion
+# select option. None → clear the property (we leave idle as an explicit chip
+# rather than blank, so "no dot" never looks like "not set up").
+PROJECT_SYNC_OPTION = {
+    "active": PROJECT_SYNC_ACTIVE,
+    "failed": PROJECT_SYNC_FAILED,
+    "idle": PROJECT_SYNC_IDLE,
 }
 
 

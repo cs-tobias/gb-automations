@@ -1,7 +1,17 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -225,4 +235,81 @@ class EmailsDbCache(Base):
     notion_db_id: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# Status values for SyncTask. Kept as a plain string + CHECK (not a Postgres
+# ENUM) because ENUMs are painful to extend via Alembic and the rest of the
+# schema uses plain strings/booleans.
+SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
+
+
+class SyncTask(Base):
+    """Durable work queue: one Gmail thread that must be synced into Notion.
+
+    This is the crash-safe heart of the guarantee "a thread under a project
+    label WILL reach Notion." The Gmail webhook only ENQUEUES rows here (in the
+    same transaction as the history cursor advance); a background worker claims
+    `pending` rows, runs `sync_thread`, and marks them `done` or `failed`.
+    Because the work lives on disk, a crash/restart loses nothing — pending rows
+    are still here, and a row left `in_progress` by a dead process is reset to
+    `pending` on boot.
+
+    One *active* row per (user_email, gmail_thread_id) — enforced by the partial
+    unique index below. After a row reaches `done`/`failed` a fresh row may be
+    enqueued for the same thread (e.g. a reply months later); `sync_thread`'s
+    Notion-backed dedup means re-running only appends the new messages.
+    """
+
+    __tablename__ = "sync_tasks"
+
+    # Surrogate PK gives the claim query a stable tiebreaker for FIFO ordering.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_email: Mapped[str] = mapped_column(String(254), nullable=False)
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
+    # Resolved lazily by the worker once sync_thread reads the thread's labels
+    # (null until then, and for threads that match no project). Lets the Projects
+    # DB status dot answer "any active/failed task for project X?" without
+    # re-deriving the project. A thread can map to several projects; we record
+    # the primary one (first match) — enough for an at-a-glance per-project dot.
+    project_page_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enqueued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Backoff gate: a failed row becomes claimable again only once now() passes
+    # this. One column drives both "claim now" (pending) and "retry later".
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','in_progress','done','failed')",
+            name="ck_sync_tasks_status",
+        ),
+        # At most one ACTIVE (pending/in_progress) row per thread — this is the
+        # dedup that makes re-enqueue on every push/reply a safe no-op. The
+        # partial predicate still allows a new row once the prior one is
+        # done/failed (so a later reply re-enqueues the thread).
+        Index(
+            "uq_sync_tasks_active_thread",
+            "user_email",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending','in_progress')"),
+        ),
+        # Drives the worker's claim query: filter by status, FIFO by oldest
+        # next_attempt_at then id.
+        Index("ix_sync_tasks_claim", "status", "next_attempt_at", "id"),
+        # Per-project status rollup for the Projects-DB dot: "any active/failed
+        # task for this project?".
+        Index("ix_sync_tasks_project", "project_page_id", "status"),
     )

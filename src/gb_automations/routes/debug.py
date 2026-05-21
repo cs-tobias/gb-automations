@@ -225,3 +225,33 @@ async def debug_frame() -> dict[str, Any]:
         "name": profile.get("name"),
         "id": profile.get("id"),
     }
+
+
+@router.get("/queue")
+async def queue_status() -> dict[str, Any]:
+    """Live state of the durable sync queue: counts by status, oldest pending
+    age, current in-progress task(s), and recent terminally-failed tasks.
+
+    The authoritative answer to "is this thread synced or not?" \u2014 the Notion
+    mirror is a convenience view on top of this.
+    """
+    from gb_automations.sync.queue import queue_counts
+
+    return await queue_counts()
+
+
+@router.post("/queue/retry-failed")
+async def queue_retry_failed(thread_id: str | None = Query(default=None)) -> dict[str, Any]:
+    """Re-run terminally-failed tasks (operator recovery after a fix).
+
+    Flips `failed` rows back to `pending` with a fresh attempt budget and wakes
+    the worker. With `?thread_id=...`, retries just that thread; otherwise all
+    failed tasks. Backs a future "Retry" button in the Notion Sync Queue mirror.
+    """
+    from gb_automations.jobs import queue_worker
+    from gb_automations.sync.queue import requeue_failed
+
+    requeued = await requeue_failed(thread_id)
+    if requeued:
+        queue_worker.wake()
+    return {"requeued": requeued, "thread_id": thread_id}

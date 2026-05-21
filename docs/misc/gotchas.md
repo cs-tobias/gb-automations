@@ -290,6 +290,24 @@ Gmail filter rules don't save us either — they only run on incoming messages, 
 
 ---
 
+## 16. A labeled thread doesn't show in Notion right away — and where the queue lives
+
+**Symptom:** you drag 50 threads into a project label and Notion stays empty for a while; or you wonder where a "pending" sync actually lives if Docker restarts.
+
+**Why (by design):** the Gmail webhook no longer syncs inline. It writes one durable row per thread to the Postgres `sync_tasks` table (in the *same transaction* as the history-cursor advance) and returns immediately. A single background worker (`jobs/queue_worker.py`, started in `main.py` lifespan) drains the queue **one thread at a time** — each `sync_thread` is ~30–45s because of the Ollama signature LLM, so 50 threads take ~30 min to fully land. That's expected throughput, not a failure.
+
+**Key facts:**
+- The queue is **rows on disk** (the `db_data` Postgres volume, a separate container), not in-memory. A crash/restart loses nothing: `pending` rows are still there, and a row left `in_progress` by a dead process is flipped back to `pending` on boot (`reset_in_progress()` in lifespan). The interrupted thread re-runs — safe, because `sync_thread` is idempotent (Notion-backed dedup only appends new messages).
+- A reply on an already-`done` thread **re-enqueues that thread id**; the sync appends just the new message(s). Multiple replies while it's already queued collapse into the one pending row (partial unique index `uq_sync_tasks_active_thread`).
+- Threads labeled while the app was **completely down** are never enqueued by a push. The boot reconcile (`enqueue_missing_for_all_projects()`) enumerates every thread under every label and enqueues anything lacking a `done`/`failed` row — the only safety net the live queue can't provide itself. It runs **on boot only** (no cron).
+- After 5 failed attempts a thread parks as `failed` (visible, not retried forever) and — if `SYNC_QUEUE_DB_ID` is set — shows as 🔴 Failed in the Notion "Sync Queue" mirror.
+
+**How to inspect:** `GET /debug/queue` is the authoritative state — counts by status, oldest-pending age, in-progress task(s), recent failed rows. The Notion "Sync Queue" DB is a best-effort live mirror on top of it (a Notion outage never blocks a sync; Postgres stays correct).
+
+**`list_history` truncation:** Gmail's `history.list` caps at 100 records/page. A bulk label produces many records; `list_history` now follows `nextPageToken` (capped at `max_pages`). If you ever see the "hit max_pages" warning, run reconcile to backfill — pathological case only.
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.

@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -41,6 +42,7 @@ from gb_automations.models import (
     EmailRow,
     ThreadAttachment,
 )
+from gb_automations.obs import describe_error, log_api_error
 from gb_automations.utils.email_cleaning import (
     body_before_quotes,
     clean_body,
@@ -113,8 +115,21 @@ async def _acquire_thread_lock(session: AsyncSession, thread_id: str) -> None:
     await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
 
 
-async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
-    """Sync one Gmail thread into Notion. See module docstring for behavior."""
+async def sync_thread(
+    user_email: str,
+    thread_id: str,
+    on_resolved: Callable[[str, str | None], Awaitable[None]] | None = None,
+) -> SyncResult:
+    """Sync one Gmail thread into Notion. See module docstring for behavior.
+
+    `on_resolved`, if given, is awaited with `(subject, project_page_id)` as soon
+    as both are known (after the Gmail fetch + project match; project_page_id is
+    None if the thread matches no project). The queue worker uses this to
+    backfill the Notion "Sync Queue" row's subject and to light the Projects-DB
+    sync dot mid-flight. Best-effort by contract — callers swallow their own
+    errors. Fired once; if the thread matches no project it's still called (with
+    the subject and None) so the mirror subject can be backfilled.
+    """
     started = time.monotonic()
     result = SyncResult(thread_id=thread_id, project_name=None, project_page_id=None)
     logger.debug("🧵 sync_thread start: thread=%s user=%s", thread_id, user_email)
@@ -150,6 +165,8 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
     )
     result.project_name = ", ".join(project_names) or None
     result.project_page_id = project_page_ids[0] if project_page_ids else None
+    if on_resolved is not None:
+        await on_resolved(result.thread_subject, result.project_page_id)
     if not project_page_ids:
         result.skipped_reason = (
             f"no Notion project matches any thread label "
@@ -221,8 +238,8 @@ async def sync_thread(user_email: str, thread_id: str) -> SyncResult:
                     result.rows_created += created_count
                     result.rows_already_present += skipped_count
                 except Exception as err:  # one bad message shouldn't kill the thread
-                    logger.exception("Failed to sync message %s", msg.message_id)
-                    result.errors.append(f"{msg.message_id}: {err}")
+                    log_api_error(logger, f"failed to sync message {msg.message_id}", err)
+                    result.errors.append(f"{msg.message_id}: {describe_error(err)}")
 
             await session.commit()
         except Exception:
@@ -992,9 +1009,9 @@ async def _sync_single_message(
             await notion_client.patch_email_row_project(
                 cached.notion_page_id, project_page_ids
             )
-        except Exception:
-            logger.exception(
-                "    project reconciliation failed for msg %s", msg.message_id
+        except Exception as err:
+            log_api_error(
+                logger, f"    project reconciliation failed for msg {msg.message_id}", err
             )
         _db_id, emails_db_props = await _resolve_db_for_date(msg.date)
         await _relink_existing_row_files(
@@ -1021,9 +1038,9 @@ async def _sync_single_message(
             await notion_client.patch_email_row_project(
                 existing["id"], project_page_ids
             )
-        except Exception:
-            logger.exception(
-                "    project reconciliation failed for msg %s", msg.message_id
+        except Exception as err:
+            log_api_error(
+                logger, f"    project reconciliation failed for msg {msg.message_id}", err
             )
         await _relink_existing_row_files(
             parent_msg=msg,
@@ -1225,9 +1242,9 @@ async def _sync_extracted_message(
             await notion_client.patch_email_row_project(
                 cached.notion_page_id, project_page_ids
             )
-        except Exception:
-            logger.exception(
-                "    project reconciliation failed for extracted %s", synthetic_id
+        except Exception as err:
+            log_api_error(
+                logger, f"    project reconciliation failed for extracted {synthetic_id}", err
             )
         _db_id, emails_db_props = await _resolve_db_for_date(inner.date)
         await _relink_existing_row_files(
@@ -1252,9 +1269,9 @@ async def _sync_extracted_message(
             await notion_client.patch_email_row_project(
                 existing["id"], project_page_ids
             )
-        except Exception:
-            logger.exception(
-                "    project reconciliation failed for extracted %s", synthetic_id
+        except Exception as err:
+            log_api_error(
+                logger, f"    project reconciliation failed for extracted {synthetic_id}", err
             )
         await _relink_existing_row_files(
             parent_msg=parent_msg,

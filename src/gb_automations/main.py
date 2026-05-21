@@ -34,9 +34,11 @@ logging.config.dictConfig(
             "request_id": {"()": "gb_automations.obs.RequestIdFilter"},
         },
         "formatters": {
+            # Compact, colorized, human-readable console output. Color auto-
+            # disables when piped to a file or when NO_COLOR is set; force with
+            # LOG_COLOR=0/1. See gb_automations.obs.ColorFormatter.
             "default": {
-                "format": "%(asctime)s %(levelname)-7s %(name)s | %(request_id)s%(message)s",
-                "datefmt": "%H:%M:%S",
+                "()": "gb_automations.obs.ColorFormatter",
             },
         },
         "handlers": {
@@ -194,16 +196,54 @@ def _check_nas_mount() -> None:
         log.info("NAS project root %r is mounted and writable", settings.nas_projects_root)
 
 
+async def _recover_and_reconcile_queue() -> None:
+    # Boot-time guarantee work, in order:
+    #   1. reset_in_progress(): a row left `in_progress` means a previous process
+    #      crashed mid-sync — flip it back to pending so the worker re-runs it
+    #      (sync_thread is idempotent, so re-running is safe).
+    #   2. enqueue_missing_for_all_projects(): catch threads labeled while the app
+    #      was completely DOWN (never enqueued — the push was dropped / outside
+    #      Gmail's history window). This is the only thing the live queue can't
+    #      cover on its own. Best-effort: log and continue on failure.
+    from gb_automations.sync.queue import reset_in_progress
+    from gb_automations.sync.resync_project import enqueue_missing_for_all_projects
+
+    log = logging.getLogger(__name__)
+    try:
+        reset = await reset_in_progress()
+        if reset:
+            log.info("Recovered %d in-progress sync task(s) left by a previous run", reset)
+    except Exception:
+        log.exception("Queue crash-recovery (reset_in_progress) failed")
+
+    try:
+        await enqueue_missing_for_all_projects()
+    except Exception:
+        log.exception("Boot reconcile (enqueue_missing_for_all_projects) failed")
+
+
 async def lifespan(app: FastAPI):
+    from gb_automations.jobs import queue_worker
+
     _check_nas_mount()
     start_scheduler()
     pull_task = asyncio.create_task(_ensure_model_present())
     seed_task = asyncio.create_task(_seed_and_watch_mailboxes())
+    recover_task = asyncio.create_task(_recover_and_reconcile_queue())
+    worker_task = asyncio.create_task(queue_worker.run_worker())
     try:
         yield
     finally:
+        # Stop the worker gracefully so an in-flight sync settles; anything still
+        # mid-flight is recovered on next boot by reset_in_progress().
+        queue_worker.request_shutdown()
         pull_task.cancel()
         seed_task.cancel()
+        recover_task.cancel()
+        try:
+            await asyncio.wait_for(worker_task, timeout=30)
+        except (TimeoutError, asyncio.CancelledError):
+            worker_task.cancel()
         shutdown_scheduler()
 
 

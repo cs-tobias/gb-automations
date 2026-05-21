@@ -11,7 +11,14 @@ from typing import Any
 
 import httpx
 
-from gb_automations.config import COMPANIES_PROPS, CONTACTS_PROPS, EMAILS_PROPS, settings
+from gb_automations.config import (
+    COMPANIES_PROPS,
+    CONTACTS_PROPS,
+    EMAILS_PROPS,
+    PROJECTS_SYNC_PROP,
+    SYNC_QUEUE_PROPS,
+    settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,17 +97,27 @@ async def _log_response(response: httpx.Response) -> None:
 
 
 class NotionAPIError(RuntimeError):
-    """Wraps a Notion HTTP error with the response body so the actual cause is visible."""
+    """Wraps a Notion HTTP error.
+
+    `str(err)` is a single readable line (status + Notion's own message + the
+    endpoint) for clean logs; `err.detail` holds the full body + URL for DEBUG.
+    """
 
     def __init__(self, response: httpx.Response):
         try:
             body = response.json()
         except Exception:
             body = {"raw": response.text}
-        message = f"Notion {response.status_code} {response.request.method} {response.url}: {body}"
-        super().__init__(message)
         self.status_code = response.status_code
         self.body = body
+        # Notion returns a human-readable `message`; surface just that on the
+        # one-liner, plus the endpoint path (not the full URL with query).
+        short = body.get("message") if isinstance(body, dict) else None
+        method = response.request.method
+        path = response.request.url.path
+        self.summary = f"Notion {response.status_code} {method} {path}: {short or body}"
+        self.detail = f"Notion {response.status_code} {method} {response.url}: {body}"
+        super().__init__(self.summary)
 
 
 def _raise_for_status(response: httpx.Response) -> None:
@@ -396,6 +413,116 @@ async def archive_page(page_id: str) -> None:
         response = await _with_retries(
             lambda: client.patch(f"/pages/{page_id}", json={"archived": True}),
             op_name=f"PATCH /pages/{page_id} archive",
+        )
+        _raise_for_status(response)
+
+
+# ============================================================
+# Sync Queue DB (live mirror of the durable Postgres queue)
+# ============================================================
+
+
+async def find_sync_queue_row(thread_id: str) -> dict[str, Any] | None:
+    """Find the existing mirror row for a thread, if any (dedup key = Thread ID)."""
+    if not settings.sync_queue_db_id:
+        return None
+    async with _client() as client:
+        response = await client.post(
+            f"/databases/{settings.sync_queue_db_id}/query",
+            json={
+                "filter": {
+                    "property": SYNC_QUEUE_PROPS["thread_id"],
+                    "rich_text": {"equals": thread_id},
+                },
+                "page_size": 1,
+            },
+        )
+        _raise_for_status(response)
+        results = response.json().get("results", [])
+        return results[0] if results else None
+
+
+async def upsert_sync_queue_row(
+    *,
+    thread_id: str,
+    subject: str,
+    status: str,
+    project: str | None = None,
+    attempts: int | None = None,
+    error: str | None = None,
+    queued_at_iso: str | None = None,
+) -> None:
+    """Create or update the mirror row for a thread, keyed by Thread ID.
+
+    One row per active queue task. Caller passes the status label
+    (SYNC_QUEUE_STATUS_*). No-op when sync_queue_db_id is unset.
+    """
+    if not settings.sync_queue_db_id:
+        return
+    properties: dict[str, Any] = {
+        SYNC_QUEUE_PROPS["subject"]: {"title": [{"text": {"content": subject or "(no subject)"}}]},
+        SYNC_QUEUE_PROPS["status"]: {"select": {"name": status}},
+        SYNC_QUEUE_PROPS["thread_id"]: {"rich_text": [{"text": {"content": thread_id}}]},
+    }
+    if project:
+        properties[SYNC_QUEUE_PROPS["project"]] = {
+            "rich_text": [{"text": {"content": project}}]
+        }
+    if attempts is not None:
+        properties[SYNC_QUEUE_PROPS["attempts"]] = {"number": attempts}
+    if error:
+        properties[SYNC_QUEUE_PROPS["error"]] = {"rich_text": [{"text": {"content": error[:1900]}}]}
+    if queued_at_iso:
+        properties[SYNC_QUEUE_PROPS["queued_at"]] = {"date": {"start": queued_at_iso}}
+
+    existing = await find_sync_queue_row(thread_id)
+    async with _client() as client:
+        if existing:
+            response = await client.patch(
+                f"/pages/{existing['id']}", json={"properties": properties}
+            )
+        else:
+            response = await client.post(
+                "/pages",
+                json={
+                    "parent": {"database_id": settings.sync_queue_db_id},
+                    "properties": properties,
+                },
+            )
+        _raise_for_status(response)
+
+
+async def remove_sync_queue_row(thread_id: str) -> None:
+    """Archive the mirror row for a thread (it's a live worklist, not a log).
+
+    No-op when sync_queue_db_id is unset or no row exists.
+    """
+    if not settings.sync_queue_db_id:
+        return
+    existing = await find_sync_queue_row(thread_id)
+    if not existing:
+        return
+    await archive_page(existing["id"])
+
+
+async def set_project_sync_status(project_page_id: str, option_name: str | None) -> None:
+    """Set (or clear) the at-a-glance sync-status Select on a Projects-DB page.
+
+    `option_name` is the literal Notion select option (e.g. "🟢 Active"); None
+    clears the property. Caller is responsible for having created the property
+    and its options in Notion — a missing property surfaces as a Notion 400,
+    which the best-effort caller logs and ignores.
+    """
+    value: dict[str, Any] = (
+        {"select": {"name": option_name}} if option_name else {"select": None}
+    )
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}",
+                json={"properties": {PROJECTS_SYNC_PROP: value}},
+            ),
+            op_name=f"PATCH /pages/{project_page_id} sync-status",
         )
         _raise_for_status(response)
 

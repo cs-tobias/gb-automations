@@ -352,10 +352,72 @@ async def resync_project(
     return result
 
 
+async def enqueue_missing_for_all_projects() -> int:
+    """Enqueue every labeled thread that the queue has never finished.
+
+    The boot-time safety net: while the app runs, the durable queue already
+    guarantees delivery, but a thread labeled while the app was completely DOWN
+    is never enqueued (the push was dropped / fell outside Gmail's history
+    window). On startup we enumerate every thread under every project label and
+    enqueue any that lack a terminal (`done`/`failed`) row in `sync_tasks`.
+    `failed` counts as covered — a terminally-failed thread needs operator
+    action, not an automatic daily re-attempt.
+
+    Feeds the same queue as the webhook (one drain path, one retry policy, one
+    place to observe). Returns the number of newly-enqueued tasks.
+    """
+    from gb_automations.models import SyncTask
+    from gb_automations.sync.queue import enqueue_threads
+
+    projects = await list_projects()
+    if not projects:
+        logger.info("reconcile-enqueue: no projects mapped — nothing to do")
+        return 0
+
+    total = 0
+    for project in projects:
+        labels = await _resolve_labels(project.page_id, only_user=None)
+        if not labels:
+            continue
+        owner_by_thread = await _enumerate_threads(labels)
+        thread_ids = list(owner_by_thread)
+        if not thread_ids:
+            continue
+
+        async with SessionLocal() as session:
+            covered = set(
+                (
+                    await session.execute(
+                        select(SyncTask.gmail_thread_id).where(
+                            SyncTask.gmail_thread_id.in_(thread_ids),
+                            SyncTask.status.in_(("done", "failed")),
+                        )
+                    )
+                ).scalars()
+            )
+
+        # Group the missing threads by owning mailbox for enqueue.
+        missing_by_owner: dict[str, list[str]] = {}
+        for tid, owner in owner_by_thread.items():
+            if tid not in covered:
+                missing_by_owner.setdefault(owner, []).append(tid)
+
+        for owner, tids in missing_by_owner.items():
+            inserted = await enqueue_threads(owner, tids)
+            total += inserted
+
+    if total:
+        logger.info("reconcile-enqueue: enqueued %d previously-missed thread(s)", total)
+    else:
+        logger.info("reconcile-enqueue: queue already covers every labeled thread")
+    return total
+
+
 __all__ = [
     "ProjectRef",
     "ResyncResult",
     "list_projects",
     "resolve_project",
     "resync_project",
+    "enqueue_missing_for_all_projects",
 ]
