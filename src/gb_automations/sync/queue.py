@@ -32,7 +32,11 @@ _ACTIVE_PREDICATE = text("status IN ('pending','in_progress')")
 
 
 async def enqueue_threads(
-    user_email: str, thread_ids: Iterable[str], session: AsyncSession | None = None
+    user_email: str,
+    thread_ids: Iterable[str],
+    session: AsyncSession | None = None,
+    *,
+    rebuild: bool = False,
 ) -> int:
     """Enqueue threads for syncing. Returns the number of NEW rows inserted.
 
@@ -41,6 +45,9 @@ async def enqueue_threads(
     caller's transaction and is NOT committed here (lets the webhook enqueue and
     advance the history cursor atomically); otherwise a private session is
     opened and committed.
+
+    `rebuild=True` flags the task so the worker archives + recreates the thread's
+    rows under current code, instead of a plain repair-in-place sync.
     """
     ids = sorted({tid for tid in thread_ids if tid})
     if not ids:
@@ -48,7 +55,12 @@ async def enqueue_threads(
 
     stmt = (
         pg_insert(SyncTask)
-        .values([{"user_email": user_email, "gmail_thread_id": tid} for tid in ids])
+        .values(
+            [
+                {"user_email": user_email, "gmail_thread_id": tid, "rebuild": rebuild}
+                for tid in ids
+            ]
+        )
         .on_conflict_do_nothing(
             index_elements=["user_email", "gmail_thread_id"],
             index_where=_ACTIVE_PREDICATE,
@@ -195,36 +207,44 @@ async def set_task_project(task_id: int, project_page_id: str) -> None:
 
 
 async def project_sync_state(project_page_id: str) -> str:
-    """Return the Projects-DB dot state for a project: 'active' | 'failed' | 'idle'.
+    """Return the Projects-DB dot state for a project.
 
-    Priority: any pending/in_progress task → active; else any failed task →
-    failed; else idle. Computed straight from sync_tasks so it can't drift from
-    reality (no in-memory bookkeeping to get out of sync across restarts).
+    Precedence (highest first), Deadline-style:
+      'failed'   — at least one task terminally stopped (hit max attempts). Red.
+      'retrying' — no terminal failures, but an active task has already failed
+                   at least once and is still retrying (attempts > 1). Orange:
+                   "something's wrong here, but it hasn't given up." Note that a
+                   first attempt is attempts == 1 (incremented at claim time), so
+                   "has retried" is attempts > 1.
+      'active'   — tasks running cleanly, no failures yet. Green.
+      'idle'     — nothing pending or failed. Grey.
+
+    Computed straight from sync_tasks so it can't drift from reality (no
+    in-memory bookkeeping to get out of sync across restarts).
     """
+
+    async def _exists(session, *conditions) -> bool:
+        row = (
+            await session.execute(
+                select(SyncTask.id)
+                .where(SyncTask.project_page_id == project_page_id, *conditions)
+                .limit(1)
+            )
+        ).first()
+        return row is not None
+
     async with SessionLocal() as session:
-        active = (
-            await session.execute(
-                select(SyncTask.id)
-                .where(
-                    SyncTask.project_page_id == project_page_id,
-                    SyncTask.status.in_(("pending", "in_progress")),
-                )
-                .limit(1)
-            )
-        ).first()
-        if active:
+        if await _exists(session, SyncTask.status == "failed"):
+            return "failed"
+        if await _exists(
+            session,
+            SyncTask.status.in_(("pending", "in_progress")),
+            SyncTask.attempts > 1,
+        ):
+            return "retrying"
+        if await _exists(session, SyncTask.status.in_(("pending", "in_progress"))):
             return "active"
-        failed = (
-            await session.execute(
-                select(SyncTask.id)
-                .where(
-                    SyncTask.project_page_id == project_page_id,
-                    SyncTask.status == "failed",
-                )
-                .limit(1)
-            )
-        ).first()
-        return "failed" if failed else "idle"
+        return "idle"
 
 
 async def status_counts() -> dict[str, int]:

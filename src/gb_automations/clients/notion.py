@@ -119,6 +119,24 @@ class NotionAPIError(RuntimeError):
         self.detail = f"Notion {response.status_code} {method} {response.url}: {body}"
         super().__init__(self.summary)
 
+    @property
+    def is_stale_object(self) -> bool:
+        """True when this error means the cached Notion id is no longer usable.
+
+        Two distinct shapes, both meaning "the id we cached points at something
+        gone or trashed — evict it and re-resolve":
+          - 404 object_not_found: the page/db was deleted outright.
+          - 400 with an "archived ancestor" message: the page itself still
+            resolves, but its parent DB was archived/trashed, so it can't be
+            edited. We've seen this when an old Emails DB is deleted but cached
+            row ids linger.
+        """
+        if self.status_code == 404:
+            return True
+        if self.status_code == 400 and isinstance(self.body, dict):
+            return "archived ancestor" in (self.body.get("message") or "").lower()
+        return False
+
 
 def _raise_for_status(response: httpx.Response) -> None:
     if response.is_success:
@@ -185,6 +203,20 @@ def extract_database_title(db: dict[str, Any]) -> str:
     """Pull the title out of a database object."""
     title_blocks = db.get("title", [])
     return "".join(t.get("plain_text", "") for t in title_blocks) or "(untitled)"
+
+
+def read_rich_text_prop(page: dict[str, Any], prop_name: str) -> str | None:
+    """Read a rich_text (or title) property's plain text from a page object.
+
+    Used to pull the `Thread ID` off an Emails-DB row when the client clicks a
+    per-row "Re-sync" button. Returns None if the property is absent/empty.
+    """
+    prop = (page.get("properties") or {}).get(prop_name)
+    if not prop:
+        return None
+    blocks = prop.get("rich_text") or prop.get("title") or []
+    text = "".join(b.get("plain_text", "") for b in blocks).strip()
+    return text or None
 
 
 # ============================================================
@@ -278,6 +310,27 @@ async def get_page(page_id: str) -> dict[str, Any]:
         response = await client.get(f"/pages/{page_id}")
         _raise_for_status(response)
         return response.json()
+
+
+async def page_is_live(page_id: str) -> bool:
+    """True if a page still exists and is editable (not deleted/archived/trashed).
+
+    Used to validate a cached `notion_page_id` before trusting it: a deleted
+    page 404s; an archived page (or one whose parent DB was trashed) comes back
+    with archived/in_trash set. Either way the cached id is stale and should be
+    evicted. A non-stale error (network/auth blip) is re-raised so we don't
+    wrongly discard a good cache entry. Mirrors `notion_emails_db._database_exists`.
+    """
+    async with _client() as client:
+        response = await client.get(f"/pages/{page_id}")
+    try:
+        _raise_for_status(response)
+    except NotionAPIError as err:
+        if err.is_stale_object:
+            return False
+        raise
+    body = response.json()
+    return not (body.get("archived") or body.get("in_trash"))
 
 
 async def find_email_row_by_message_id(message_id: str, db_id: str) -> dict[str, Any] | None:

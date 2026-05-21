@@ -57,27 +57,32 @@ def request_shutdown() -> None:
     _wake_event.set()
 
 
-async def _claim() -> tuple[int, str, str, int] | None:
-    """Atomically claim the next task. Returns (id, email, thread_id, attempts)."""
+async def _claim() -> tuple[int, str, str, int, bool] | None:
+    """Atomically claim the next task. Returns (id, email, thread_id, attempts, rebuild)."""
     async with SessionLocal() as session:
         task = await claim_one(session)
         if task is None:
             return None
         await session.commit()
-        return (task.id, task.user_email, task.gmail_thread_id, task.attempts)
+        return (task.id, task.user_email, task.gmail_thread_id, task.attempts, task.rebuild)
 
 
-async def _process(claimed: tuple[int, str, str, int], progress: str) -> None:
-    """Run sync_thread for an already-claimed task and record the outcome.
+async def _process(claimed: tuple[int, str, str, int, bool], progress: str) -> None:
+    """Run the sync for an already-claimed task and record the outcome.
 
     `progress` is a human "N/M" batch position used purely for log narration.
     The claim already committed `in_progress` (so boot recovery sees a mid-sync
     crash); the sync and its outcome run here in separate transactions.
+
+    `rebuild` tasks archive + recreate the thread's rows under current code; the
+    rest do a normal repair-in-place sync. Both go through the same outcome
+    handling (retry/backoff/dot).
     """
-    task_id, email, thread_id, attempts = claimed
+    task_id, email, thread_id, attempts, rebuild = claimed
 
     retry_note = f" (retry {attempts}/{MAX_ATTEMPTS})" if attempts > 1 else ""
-    logger.info("▶ task %s — syncing thread %s%s", progress, thread_id, retry_note)
+    verb = "rebuilding" if rebuild else "syncing"
+    logger.info("▶ task %s — %s thread %s%s", progress, verb, thread_id, retry_note)
 
     # Subject + project aren't known until the sync fetches the thread; show the
     # thread id as a placeholder, then (via on_resolved, ~1-2s in) backfill the
@@ -95,7 +100,14 @@ async def _process(claimed: tuple[int, str, str, int], progress: str) -> None:
             await queue_mirror.refresh_project_dot(project_page_id)
 
     try:
-        result = await sync_thread(email, thread_id, on_resolved=_on_resolved)
+        if rebuild:
+            # Lazy import: resync_project imports sync_thread; importing it at
+            # module load would risk a cycle with the worker's other imports.
+            from gb_automations.sync.resync_project import rebuild_thread
+
+            result = await rebuild_thread(thread_id, email, on_resolved=_on_resolved)
+        else:
+            result = await sync_thread(email, thread_id, on_resolved=_on_resolved)
         # result.errors entries can stringify to "" (e.g. an httpx ReadTimeout),
         # which would make the failure reason invisible — describe_error keeps
         # every entry meaningful (falls back to the exception class name).
@@ -148,9 +160,9 @@ async def _process(claimed: tuple[int, str, str, int], progress: str) -> None:
                     outcome_error,
                 )
 
-    # Recompute the project dot now this task settled: 🟢 if siblings are still
-    # running, 🔴 if it (or a sibling) is failed, ⚪ idle once nothing remains.
-    # Prefer the project resolved this run; fall back to whatever was persisted.
+    # Recompute the project dot now this task settled: 🔴 failed > 🟠 retrying
+    # (a task failed once but is still retrying) > 🟢 active (siblings running) >
+    # ⚪ idle. Prefer the project resolved this run; fall back to the persisted one.
     project = resolved_project or getattr(result, "project_page_id", None)
     await queue_mirror.refresh_project_dot(project)
 

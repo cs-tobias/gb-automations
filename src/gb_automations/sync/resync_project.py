@@ -352,6 +352,32 @@ async def resync_project(
     return result
 
 
+async def rebuild_thread(thread_id: str, owner_email: str, on_resolved=None) -> SyncResult:
+    """Archive + recreate ONE thread's email rows under current code.
+
+    Unlike a plain re-sync (which finds the rows already present and only
+    refreshes their project/files), this regenerates every field — body, tags,
+    history splitting, attachments — by taking the rows down first, then
+    re-running `sync_thread`. Use it after a code change that should re-author
+    existing rows.
+
+    Scope is deliberately narrow: it archives only the EMAIL rows for this
+    thread and clears only the local `EmailRow` cache. Contacts and Companies
+    are NOT deleted — they're re-matched/refreshed by the sync. `ThreadAttachment`
+    is kept, so Drive files are re-linked rather than re-uploaded (no duplicates).
+
+    `on_resolved` is forwarded to sync_thread (the worker uses it to backfill the
+    queue-mirror subject and light the project dot).
+    """
+    page_ids = await _page_ids_for_threads([thread_id])
+    if page_ids:
+        ok, failed = await _archive_pages(page_ids)
+        logger.info("🔁 rebuild %s: archived %d row(s) (%d failed)", thread_id, ok, failed)
+    await _clear_local_cache([thread_id], hard=False)
+    # Rows + cache gone → sync_thread now recreates every row fresh.
+    return await sync_thread(owner_email, thread_id, on_resolved=on_resolved)
+
+
 async def enqueue_missing_for_all_projects() -> int:
     """Enqueue every labeled thread that the queue has never finished.
 
@@ -419,5 +445,6 @@ __all__ = [
     "list_projects",
     "resolve_project",
     "resync_project",
+    "rebuild_thread",
     "enqueue_missing_for_all_projects",
 ]

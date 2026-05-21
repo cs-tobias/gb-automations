@@ -32,7 +32,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import nas as nas_client
 from gb_automations.clients import notion as notion_client
-from gb_automations.config import settings
+from gb_automations.config import EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.jobs import queue_worker
 from gb_automations.models import EmailRow, ProjectFolder, ProjectLabel, SyncCursor, User
@@ -390,6 +390,99 @@ async def notion_webhook(request: Request) -> Response:
     """
     with request_scope("notion"):
         return await _notion_webhook_impl(request)
+
+
+async def _owning_email_for_thread(thread_id: str) -> str | None:
+    """Which mailbox should re-sync this thread? Prefer the one that first saw
+    it (EmailRow.seen_by_email); else any active user (the thread is shared, and
+    sync_thread fetches it via DWD impersonation, so any active mailbox works).
+    """
+    async with SessionLocal() as session:
+        seen = (
+            await session.execute(
+                select(EmailRow.seen_by_email)
+                .where(EmailRow.gmail_thread_id == thread_id, EmailRow.seen_by_email.isnot(None))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if seen:
+            return seen
+        return (
+            await session.execute(select(User.email).where(User.active.is_(True)).limit(1))
+        ).scalar_one_or_none()
+
+
+async def _resync_thread_impl(request: Request) -> Response:
+    if not _verify_bearer(request.headers.get("Authorization")):
+        raise HTTPException(401, "Bad or missing bearer token")
+
+    raw_body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body") from None
+
+    page_id = ((payload.get("data") or {}).get("id") or "").strip()
+    if not page_id:
+        raise HTTPException(400, "Missing data.id in Notion button payload")
+
+    # Re-fetch the Emails row to read its Thread ID (the button envelope already
+    # carries properties, but re-fetching avoids depending on the envelope shape).
+    try:
+        page = await notion_client.get_page(page_id)
+    except Exception as err:
+        logger.exception("Failed to fetch Notion page %s", page_id)
+        raise HTTPException(502, f"Notion fetch failed: {err}") from err
+
+    thread_id = notion_client.read_rich_text_prop(page, EMAILS_PROPS["thread_id"])
+    if not thread_id:
+        logger.warning("↳ page %s has no %s — can't re-sync", page_id, EMAILS_PROPS["thread_id"])
+        return _json(
+            {"page_id": page_id, "action": "skipped", "reason": "no Thread ID on this row"}
+        )
+
+    owner = await _owning_email_for_thread(thread_id)
+    if not owner:
+        return _json(
+            {"thread_id": thread_id, "action": "skipped", "reason": "no active mailbox to sync"}
+        )
+
+    # Just a queue add — but flagged as a REBUILD so the worker archives the
+    # thread's existing rows and recreates them fresh under current code (body/
+    # tags/splitting all regenerate), rather than a plain repair-in-place. The
+    # rebuild rides the same queue: retries, dot, visibility, all for free.
+    # Contacts/Companies are never deleted (only re-matched by the sync).
+    inserted = await enqueue_threads(owner, [thread_id], rebuild=True)
+    queue_worker.wake()
+    await queue_mirror.mark_queued(thread_id, subject=thread_id)
+    logger.info(
+        "🔁 rebuild requested for thread %s (owner %s) — %s",
+        thread_id,
+        owner,
+        "enqueued" if inserted else "already queued",
+    )
+    return _json(
+        {
+            "thread_id": thread_id,
+            "owner": owner,
+            "action": "rebuilding" if inserted else "already_queued",
+        }
+    )
+
+
+@router.post("/notion/resync-thread")
+async def notion_resync_thread(request: Request) -> Response:
+    """Per-email "Re-sync" button receiver (on the Emails DB).
+
+    A Button property on each Emails row POSTs here with the bearer token and
+    the row's page id. We read the row's `Thread ID` and enqueue a fresh sync
+    for that thread — the worker re-runs sync_thread, which repairs existing
+    rows in place (idempotent, Notion-backed dedup) and now also self-heals any
+    stale cached ids. Use it to redo a thread that synced but looks wrong, or to
+    re-run it under new code. Idempotent: a thread already queued is a no-op.
+    """
+    with request_scope("resync"):
+        return await _resync_thread_impl(request)
 
 
 async def _notion_webhook_impl(request: Request) -> Response:

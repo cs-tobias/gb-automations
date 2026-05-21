@@ -727,23 +727,37 @@ async def _upsert_contact(
     title = contact["title"]
     address = contact["address"]
 
-    # 1. Local cache hit?
+    # 1. Local cache hit? Re-query Notion by email so a stale cached id (the
+    # contact row was deleted/archived on another host) self-heals: we patch the
+    # LIVE row the query returns, not the cached id, and re-cache it. If the
+    # query finds nothing, the cache is stale → evict and fall through to create.
     cached = await session.get(ContactCache, email)
     if cached:
         try:
             existing = await notion_client.find_contact_by_email(email)
-            existing_props = (existing or {}).get("properties", {})
-            await notion_client.patch_contact_enrichment(
-                cached.notion_page_id,
-                existing_props=existing_props,
-                phone=phone,
-                title=title,
-                address=address,
-                company_page_id=company_page_id,
-            )
         except Exception:
-            logger.exception("Enrichment failed for %s", email)
-        return cached.notion_page_id
+            existing = None
+        if existing:
+            live_id = existing["id"]
+            if live_id != cached.notion_page_id:
+                logger.info("    cache was stale for contact %s — re-resolved", email)
+                await _cache_contact(session, email=email, page_id=live_id)
+            try:
+                await notion_client.patch_contact_enrichment(
+                    live_id,
+                    existing_props=existing.get("properties", {}),
+                    phone=phone,
+                    title=title,
+                    address=address,
+                    company_page_id=company_page_id,
+                )
+            except Exception as err:
+                log_api_error(logger, f"enrichment failed for {email}", err)
+            return live_id
+        # Cached but not found live → stale. Evict and fall through to create.
+        logger.info("    cache was stale for contact %s (gone) — re-creating", email)
+        await session.delete(cached)
+        await session.flush()
 
     # 2. Notion already has this contact by email?
     existing = await notion_client.find_contact_by_email(email)
@@ -828,10 +842,28 @@ async def _cache_contact(session: AsyncSession, *, email: str, page_id: str) -> 
 async def _upsert_company(
     *, domain: str, name: str, session: AsyncSession
 ) -> str | None:
-    """Find-or-create a company row by domain. Cache first, then Notion."""
+    """Find-or-create a company row by domain. Cache first, then Notion.
+
+    On a cache hit we re-query Notion by domain so a stale cached id (company
+    row deleted/archived on another host) self-heals — otherwise we'd hand a
+    dead relation id to create_contact and Notion would reject it. Found-live →
+    re-cache + use; not-found → evict and fall through to create.
+    """
     cached = await session.get(CompanyCache, domain)
     if cached:
-        return cached.notion_page_id
+        try:
+            existing = await notion_client.find_company_by_domain(domain)
+        except Exception:
+            # Transient lookup error — trust the cache rather than risk a dup.
+            return cached.notion_page_id
+        if existing:
+            if existing["id"] != cached.notion_page_id:
+                logger.info("    cache was stale for company %s — re-resolved", domain)
+                await _cache_company(session, domain=domain, page_id=existing["id"])
+            return existing["id"]
+        logger.info("    cache was stale for company %s (gone) — re-creating", domain)
+        await session.delete(cached)
+        await session.flush()
 
     existing = await notion_client.find_company_by_domain(domain)
     if existing:
@@ -1003,7 +1035,7 @@ async def _sync_single_message(
     # Files property — a row created in a sync where the upload was deduped (or
     # by an older build) never got its files; this self-heals it.
     cached = await session.get(EmailRow, msg.message_id)
-    if cached:
+    if cached and not await _evict_if_stale_email_row(session, cached, msg.message_id):
         logger.debug("    dedup hit (local cache) for msg %s", msg.message_id)
         try:
             await notion_client.patch_email_row_project(
@@ -1026,6 +1058,7 @@ async def _sync_single_message(
             project_label_paths=project_label_paths or [],
         )
         return (0, 1)
+    # cache miss, or the cached id was stale and just evicted → re-resolve below.
 
     db_id, emails_db_props = await _resolve_db_for_date(msg.date)
 
@@ -1236,7 +1269,7 @@ async def _sync_extracted_message(
     tracker = thread_tracker or ThreadAttachmentTracker()
 
     cached = await session.get(EmailRow, synthetic_id)
-    if cached:
+    if cached and not await _evict_if_stale_email_row(session, cached, synthetic_id):
         logger.debug("    dedup hit (local cache) for extracted %s", synthetic_id)
         try:
             await notion_client.patch_email_row_project(
@@ -1259,6 +1292,7 @@ async def _sync_extracted_message(
             project_label_paths=project_label_paths or [],
         )
         return (0, 1)
+    # cache miss / stale-evicted → re-resolve below.
 
     db_id, emails_db_props = await _resolve_db_for_date(inner.date)
 
@@ -1387,6 +1421,37 @@ async def _cache_email_row(
         )
     )
     await session.execute(stmt)
+
+
+async def _evict_if_stale_email_row(
+    session: AsyncSession, cached: EmailRow, message_id: str
+) -> bool:
+    """If the cached row's Notion page is gone/archived, evict it. Returns evicted?
+
+    A per-machine cache can hold a `notion_page_id` whose page (or whose parent
+    Emails DB) was deleted on another host — patching it then fails with a 404
+    or "archived ancestor" 400. We validate once on the cache-hit path; if stale,
+    delete the local row so the caller falls through to the Notion re-query/
+    create path (which re-links a live row or makes a fresh one). Self-healing,
+    counts as a clean sync. A transient (non-stale) error re-raises, so we never
+    discard a good cache entry over a network blip.
+    """
+    try:
+        live = await notion_client.page_is_live(cached.notion_page_id)
+    except Exception:
+        # Non-stale error (network/auth) — trust the cache, let the normal path
+        # try and surface any real failure there.
+        return False
+    if live:
+        return False
+    logger.info(
+        "    cache was stale for msg %s (page %s gone/archived) — re-resolving",
+        message_id,
+        cached.notion_page_id,
+    )
+    await session.delete(cached)
+    await session.flush()
+    return True
 
 
 # ============================================================

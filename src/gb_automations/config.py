@@ -263,14 +263,18 @@ SYNC_QUEUE_STATUS_FAILED = "Failed"
 # The property name lives here; edit it to match the column you add in Notion.
 PROJECTS_SYNC_PROP = "Sync"
 PROJECT_SYNC_ACTIVE = "🟢 Active"
+PROJECT_SYNC_RETRYING = "🟠 Retrying"
 PROJECT_SYNC_FAILED = "🔴 Failed"
 PROJECT_SYNC_IDLE = "⚪ Idle"
 
 # Maps the queue's internal state strings (project_sync_state) to the Notion
-# select option. None → clear the property (we leave idle as an explicit chip
-# rather than blank, so "no dot" never looks like "not set up").
+# select option. Notion auto-creates an option the first time we write it, so
+# these don't need pre-creating — but the names must match EXACTLY (emoji
+# included) or you get duplicate chips. None → clear the property (we use an
+# explicit Idle chip instead, so "no dot" never looks like "not set up").
 PROJECT_SYNC_OPTION = {
     "active": PROJECT_SYNC_ACTIVE,
+    "retrying": PROJECT_SYNC_RETRYING,
     "failed": PROJECT_SYNC_FAILED,
     "idle": PROJECT_SYNC_IDLE,
 }

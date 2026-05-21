@@ -268,6 +268,10 @@ class SyncTask(Base):
     user_email: Mapped[str] = mapped_column(String(254), nullable=False)
     gmail_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
+    # When true the worker REBUILDS (archive existing rows + recreate fresh under
+    # current code) instead of a plain repair-in-place sync. Set by the per-email
+    # "Re-sync" button; a normal Gmail-push enqueue leaves it false.
+    rebuild: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     # Resolved lazily by the worker once sync_thread reads the thread's labels
     # (null until then, and for threads that match no project). Lets the Projects
     # DB status dot answer "any active/failed task for project X?" without
