@@ -28,6 +28,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select, text
@@ -37,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gb_automations.clients import drive as drive_client
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import llm as llm_client
+from gb_automations.clients import nas as nas_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.clients import notion_emails_db
 from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
@@ -45,6 +47,7 @@ from gb_automations.models import (
     CompanyCache,
     ContactCache,
     EmailRow,
+    ProjectFolder,
     ThreadAttachment,
 )
 from gb_automations.obs import describe_error, log_api_error
@@ -1076,6 +1079,8 @@ async def _sync_single_message(
             emails_db_props=emails_db_props,
             thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=msg.date,
         )
         return (0, 1)
     # cache miss, or the cached id was stale and just evicted → re-resolve below.
@@ -1105,6 +1110,9 @@ async def _sync_single_message(
             emails_db_props=emails_db_props,
             thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=msg.date,
+            tags=_tags_from_page(existing),
         )
         await _cache_email_row(
             session,
@@ -1152,7 +1160,7 @@ async def _sync_single_message(
         _format_extraction_preview(msg.from_field, msg.subject, cleaned_body),
     )
     logger.debug("       (message_id=%s)", msg.message_id)
-    properties = await _build_email_row_properties(
+    properties, row_tags = await _build_email_row_properties(
         msg=msg,
         project_page_ids=project_page_ids,
         user_email=user_email,
@@ -1176,6 +1184,9 @@ async def _sync_single_message(
             session=session,
             thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=msg.date,
+            tags=row_tags,
         )
         if uploaded:
             try:
@@ -1310,6 +1321,8 @@ async def _sync_extracted_message(
             emails_db_props=emails_db_props,
             thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=inner.date,
         )
         return (0, 1)
     # cache miss / stale-evicted → re-resolve below.
@@ -1337,6 +1350,9 @@ async def _sync_extracted_message(
             emails_db_props=emails_db_props,
             thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=inner.date,
+            tags=_tags_from_page(existing),
         )
         await _cache_email_row(
             session,
@@ -1367,7 +1383,7 @@ async def _sync_extracted_message(
         _format_extraction_preview(inner.from_field, inner.subject, display_body),
     )
     logger.debug("       (synthetic_id=%s)", synthetic_id)
-    properties = await _build_extracted_row_properties(
+    properties, row_tags = await _build_extracted_row_properties(
         parent_msg=parent_msg,
         inner=inner,
         synthetic_id=synthetic_id,
@@ -1393,6 +1409,9 @@ async def _sync_extracted_message(
             session=session,
             thread_tracker=tracker,
             project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=inner.date,
+            tags=row_tags,
         )
         if uploaded:
             try:
@@ -1505,8 +1524,10 @@ async def _build_email_row_properties(
     emails_db_props: set[str],
     body: str,
     contact_ids: dict[str, str],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[str]]:
     """Build the Notion properties dict for a single-message Emails-DB row.
+
+    Returns (props, tags); see `_assemble_row_props`.
 
     `body` is the already-cleaned text the row should display — callers are
     responsible for running `clean_body` with the right `keep_image_markers`
@@ -1549,8 +1570,10 @@ async def _build_extracted_row_properties(
     emails_db_props: set[str],
     body: str,
     contact_ids: dict[str, str],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[str]]:
     """Build Notion properties for an LLM-extracted sub-message.
+
+    Returns (props, tags); see `_assemble_row_props`.
 
     `body` is the display body the row should carry — caller computes it
     from `inner.raw_body` with the keep-list set to whichever attachment
@@ -1600,8 +1623,13 @@ async def _assemble_row_props(
     contact_ids: dict[str, str],
     date_iso: str,
     body: str,
-) -> dict[str, Any]:
-    """Shared property-dict assembly for regular and extracted rows."""
+) -> tuple[dict[str, Any], list[str]]:
+    """Shared property-dict assembly for regular and extracted rows.
+
+    Returns (props, tags) — the LLM tag list is handed back alongside the
+    property dict so callers can reuse it for the NAS Mottatt subfolder name
+    (`<date> - <Tags>`) without re-running classification.
+    """
     # Tag classification via LLM. Gated by:
     #   - `settings.tagging_enabled` (ON by default — see config.py)
     #   - body has at least 10 chars (skip "OK"/"Takk!"/"Super" — the LLM
@@ -1674,7 +1702,7 @@ async def _assemble_row_props(
         )
     if tags:
         maybe_set("tags", {"multi_select": [{"name": t} for t in tags]})
-    return props
+    return props, tags
 
 
 def _build_chat_blocks(
@@ -2095,6 +2123,9 @@ async def _upload_attachments(
     session: AsyncSession,
     thread_tracker: ThreadAttachmentTracker,
     project_label_paths: list[str],
+    project_page_ids: list[str],
+    email_date: datetime,
+    tags: list[str],
 ) -> list[dict[str, str]]:
     """Download + upload each non-signature attachment, return uploaded {name, url} list.
 
@@ -2135,6 +2166,62 @@ async def _upload_attachments(
         # _pick_projects matched ≥1 project. If we ever wire in a no-project
         # path, fall back to the flat root rather than uploading nothing.
         folder_paths = [(root,)]
+
+    # Resolve each matched project's "Mottatt" folder on the NAS, so a copy of
+    # every uploaded attachment also lands beside the Drive copy. We read the
+    # authoritative folder path from the ProjectFolder cache (written by the
+    # project-provisioning step, sync_labels._sync_nas_folder_for_project) —
+    # no Notion call, no re-deriving created_time. Rides along with
+    # SYNC_NAS_FOLDERS: if the feature is off, or a project was never
+    # provisioned to the NAS (cache miss), the list is empty and the copy is a
+    # no-op. Best-effort throughout — a NAS failure never blocks the Drive
+    # upload or the row, exactly like the Drive path's own per-error handling.
+    received_dirs: list[Path] = []
+    if settings.sync_nas_folders and settings.nas_projects_root and project_page_ids:
+        for page_id in project_page_ids:
+            row = await session.get(ProjectFolder, page_id)
+            if row is not None:
+                received_dirs.append(
+                    Path(row.current_path) / settings.nas_received_subfolder
+                )
+    # Goldbox groups received files into a "<date> - <Tags>" subfolder of
+    # Mottatt. Computed once (date + tags are constant for this row). Same
+    # date+tag-set reuses the folder; a new date or tag-set makes a new one.
+    # NOTE drift window: tags come from the LLM on the create path, which isn't
+    # guaranteed stable — a true re-create (local cache wiped AND no Notion row)
+    # could classify differently and land the same bytes in a second folder.
+    # The common re-sync route (re-link path) reads persisted Notion tags, so
+    # it stays drift-free; this window is rare and accepted.
+    mottatt_subfolder = nas_client.received_subfolder_name(email_date, tags)
+
+    async def _ensure_in_nas(filename: str, data: bytes) -> None:
+        """Ensure these bytes exist in each project's Mottatt/<date> - <tags>/.
+
+        Called for BOTH freshly-uploaded files and files already on Drive from a
+        prior sync — `write_to_received` is content-idempotent, so this writes
+        only when the file is missing and is a silent no-op otherwise. That makes
+        it the reconciliation step: a thread whose attachments reached Drive
+        before the NAS feature (or while the share was down) self-heals on the
+        next sync instead of staying "in Drive, not in NAS". Best-effort: a NAS
+        error is logged per project and never blocks the Drive upload or the row.
+        """
+        for received_dir in received_dirs:
+            try:
+                written = await asyncio.to_thread(
+                    nas_client.write_to_received,
+                    received_dir,
+                    filename or "attachment",
+                    data,
+                    subfolder=mottatt_subfolder,
+                )
+            except Exception:
+                logger.exception(
+                    "    ✗ NAS Mottatt copy failed for %r → %s", filename, received_dir
+                )
+                continue
+            if written is not None:
+                logger.info("    📁 added to NAS Mottatt %r → %s", filename, written)
+
     for d in decisions:
         if not d.upload:
             logger.info(
@@ -2205,6 +2292,10 @@ async def _upload_attachments(
                 "    📎 linked %r from Drive (already uploaded earlier)",
                 d.attachment.filename,
             )
+            # Already on Drive, but maybe never made it to the NAS (synced before
+            # the NAS feature, or while the share was down). Reconcile it now —
+            # idempotent, so a no-op when the file is already in Mottatt.
+            await _ensure_in_nas(d.attachment.filename, content)
             continue
 
         # Upload once per matched project subfolder. Each project's folder
@@ -2237,6 +2328,11 @@ async def _upload_attachments(
                 sender,
                 "/".join(folder_path),
             )
+
+        # Freshly uploaded to Drive — also drop a copy into each project's NAS
+        # Mottatt folder, reusing the bytes already in memory.
+        await _ensure_in_nas(d.attachment.filename, content)
+
         if att_links:
             uploaded.extend(att_links)
             thread_tracker.attached_this_pass.add(content_sha1)
@@ -2267,6 +2363,12 @@ async def _upload_attachments(
     return uploaded
 
 
+def _tags_from_page(page: dict[str, Any]) -> list[str]:
+    """Read an Emails-row's multi-select tag names back out of a Notion page."""
+    prop = (page.get("properties") or {}).get(EMAILS_PROPS["tags"]) or {}
+    return [o.get("name", "") for o in (prop.get("multi_select") or []) if o.get("name")]
+
+
 async def _relink_existing_row_files(
     *,
     parent_msg: gmail_client.GmailMessage,
@@ -2278,6 +2380,9 @@ async def _relink_existing_row_files(
     emails_db_props: dict[str, Any],
     thread_tracker: ThreadAttachmentTracker,
     project_label_paths: list[str],
+    project_page_ids: list[str],
+    email_date: datetime,
+    tags: list[str] | None = None,
 ) -> None:
     """Re-set the Files property on an ALREADY-EXISTING row (dedup-hit path).
 
@@ -2292,11 +2397,25 @@ async def _relink_existing_row_files(
     `patch_email_row_files` overwrites the property wholesale, so repeating it
     every sync is idempotent. No-op when this message carries no uploadable
     attachments or the DB has no Files property.
+
+    `tags` names the NAS Mottatt subfolder (`<date> - <Tags>`). We DON'T re-run
+    the LLM here (the row already exists, and re-classifying could drift): the
+    Notion-dedup caller passes the tags it already fetched; the cache-hit caller
+    passes None, so we read the persisted tags off the row with one get_page.
     """
     if EMAILS_PROPS.get("files") not in emails_db_props:
         return
     if not any(d.upload for d in decisions):
         return
+    if tags is None:
+        try:
+            page = await notion_client.get_page(row_id)
+            tags = _tags_from_page(page)
+        except Exception:
+            logger.exception(
+                "    ✗ tag read-back failed for %s; defaulting Mottatt subfolder", row_id
+            )
+            tags = []
     uploaded = await _upload_attachments(
         parent_msg=parent_msg,
         decisions=decisions,
@@ -2305,6 +2424,9 @@ async def _relink_existing_row_files(
         session=session,
         thread_tracker=thread_tracker,
         project_label_paths=project_label_paths,
+        project_page_ids=project_page_ids,
+        email_date=email_date,
+        tags=tags,
     )
     if not uploaded:
         return

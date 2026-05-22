@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose *)",
+      "Bash(set +e)",
+      "Bash(docker volume *)",
+      "Bash(docker run *)",
+      "PowerShell(docker run --rm -v /run/desktop/mnt/host/x:/probe alpine sh -c \"ls /probe 2>&1 | head; echo '---gb-nas-test?---'; ls /probe/gb-nas-test/Prosjekt 2>&1\")",
+      "PowerShell(cmd /c dir /s /b \"X:\\\\gb-nas-test\")",
+      "Bash(python -m py_compile src/gb_automations/sync/sync_thread.py src/gb_automations/clients/nas.py)",
+      "Bash(python -m pytest tests/test_nas.py -q)",
+      "Bash(uv run *)",
+      "Bash(Get-Content -Path 'c:\\\\Users\\\\tobia\\\\Documents\\\\Code\\\\gb-automations\\\\src\\\\gb_automations\\\\sync\\\\sync_thread.py')",
+      "Bash(Select-String \"def _sync_message|def _sync_single_message|def _sync_extracted_message|def _upload_attachments|def _build_email_row_properties\" -Context 0,0)",
+      "PowerShell($file = Get-Content -Path 'c:\\\\Users\\\\tobia\\\\Documents\\\\Code\\\\gb-automations\\\\src\\\\gb_automations\\\\sync\\\\sync_thread.py' -ReadCount 0; for \\($i = 0; $i -lt $file.Count; $i++\\) { if \\($file[$i] -match 'def \\(_sync_message|_sync_single_message|_sync_extracted_message|_upload_attachments|_build_email_row_properties\\)'\\) { Write-Host \"$\\($i+1\\): $\\($file[$i]\\)\" } })",
+      "Read(//c/c/Users/tobia/Documents/Code/gb-automations/src/gb_automations/sync/**)",
+      "Bash(python -m py_compile src/gb_automations/sync/sync_thread.py)"
+    ]
+  }
+}

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 
 from gb_automations.config import settings
@@ -104,3 +106,79 @@ def rename_project_folder(
     # Ensure the received subfolder exists even if the old folder predated it.
     (new_dir / settings.nas_received_subfolder).mkdir(parents=True, exist_ok=True)
     return new_dir
+
+
+# Windows/SMB-illegal characters in a filename. Email attachment names come from
+# arbitrary senders, so a name like `Q3: report?.pdf` would fail os I/O on the
+# (Windows-hosted, CIFS-mounted) NAS — sanitize before writing.
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_filename(name: str) -> str:
+    cleaned = _ILLEGAL_FILENAME_CHARS.sub("_", name).strip().rstrip(".")
+    return cleaned or "attachment"
+
+
+def received_subfolder_name(date: datetime, tags: list[str]) -> str:
+    """Build the dated/tagged subfolder name for a Mottatt copy.
+
+    Format: ``<YYYY-MM-DD> - <Tag1> <Tag2> …`` — each tag capitalized (first
+    char upper, rest unchanged), single-space joined, in the order the LLM
+    returned them. Goldbox groups incoming files by "date - topic" this way.
+    An untagged email defaults to "Underlag" (briefing material) so its files
+    still land in a dated folder rather than loose in Mottatt.
+
+    Uses `t[:1].upper() + t[1:]`, not `str.capitalize()`, because capitalize()
+    lower-cases the rest — same result for today's all-lowercase taxonomy but
+    safe if a tag like "FDV" is ever added. Tag values come from EMAIL_TAGS
+    (controlled; the æ/ø/å in them are valid on the CIFS/utf8 mount); the
+    result still runs through the illegal-char sanitizer as defense in depth.
+    """
+    cleaned = [t.strip() for t in tags if t and t.strip()]
+    if not cleaned:
+        cleaned = ["Underlag"]
+    capped = [t[:1].upper() + t[1:] for t in cleaned]
+    name = f"{date.strftime('%Y-%m-%d')} - {' '.join(capped)}"
+    return _ILLEGAL_FILENAME_CHARS.sub("_", name).strip().rstrip(".")
+
+
+def write_to_received(
+    received_dir: Path,
+    filename: str,
+    content: bytes,
+    *,
+    subfolder: str | None = None,
+) -> Path | None:
+    """Write one attachment into a project's received ("Mottatt") folder.
+
+    `subfolder`, when given, nests the file one level deeper (Goldbox's
+    "<date> - <tags>" grouping). Creating it on demand with exist_ok gives
+    same-date+same-tagset reuse and new-date/new-tagset isolation for free.
+
+    Content-idempotent and non-clobbering, mirroring the Drive upload's sha1
+    dedup at the filesystem level:
+      - if a same-named file with the SAME bytes already exists → skip (a re-sync
+        or a re-carried quote shouldn't pile up duplicates), return None.
+      - if a same-named file with DIFFERENT bytes exists → write `name (2).ext`,
+        `name (3).ext`, … so a genuinely different file is never lost or clobbered
+        (we never overwrite a file a user may have placed there by hand).
+
+    Returns the path written, or None if the identical file was already present.
+    Synchronous filesystem I/O — callers wrap it in asyncio.to_thread.
+    """
+    target_dir = received_dir / subfolder if subfolder else received_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    safe = _sanitize_filename(filename)
+    stem, dot, ext = safe.partition(".")
+    suffix = f"{dot}{ext}" if dot else ""
+
+    candidate = target_dir / safe
+    n = 1
+    while candidate.exists():
+        if candidate.stat().st_size == len(content) and candidate.read_bytes() == content:
+            return None  # identical file already there — idempotent no-op
+        n += 1
+        candidate = target_dir / f"{stem} ({n}){suffix}"
+
+    candidate.write_bytes(content)
+    return candidate
