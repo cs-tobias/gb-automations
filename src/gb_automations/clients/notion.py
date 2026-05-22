@@ -6,6 +6,7 @@ project page lookup, and generic block append for chat-style row bodies.
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -243,8 +244,44 @@ def read_rich_text_prop(page: dict[str, Any], prop_name: str) -> str | None:
 # Project pages (top-level pages, used to match Gmail labels)
 # ============================================================
 
+# Short-TTL cache for get_project_pages(). sync_thread calls it once per thread,
+# and a queue drain / resync processes many threads back-to-back; without this
+# each thread would re-query the project list. The list barely changes within one
+# pass, so a few-second TTL collapses N lookups into one while staying fresh for a
+# project created moments earlier.
+_PROJECT_PAGES_TTL_SECONDS = 30.0
+_project_pages_cache: dict[str, dict[str, str]] | None = None
+_project_pages_cached_at: float = 0.0
 
-async def get_project_pages() -> dict[str, dict[str, str]]:
+
+async def _query_projects_db(db_id: str) -> list[dict[str, Any]]:
+    """Every non-archived row in the Projects DB, paginated.
+
+    Querying the one Projects DB is the cheap path: it holds only project rows
+    (tens at most), versus /search which scans every page in the workspace —
+    every synced Email and Contact row included. As the mailbox fills up, /search
+    grows without bound and pages past the cap get dropped; the DB query does not.
+    """
+    rows: list[dict[str, Any]] = []
+    start_cursor: str | None = None
+    async with _client() as client:
+        while True:
+            body: dict[str, Any] = {"page_size": 100}
+            if start_cursor:
+                body["start_cursor"] = start_cursor
+            response = await client.post(f"/databases/{db_id}/query", json=body)
+            _raise_for_status(response)
+            payload = response.json()
+            rows.extend(payload.get("results", []))
+            if not payload.get("has_more"):
+                break
+            start_cursor = payload.get("next_cursor")
+            if not start_cursor:  # defensive: has_more true but no cursor
+                break
+    return [r for r in rows if not r.get("archived") and not r.get("in_trash")]
+
+
+async def get_project_pages(*, force_refresh: bool = False) -> dict[str, dict[str, str]]:
     """Full Gmail-label path → {id, title, created_time}, for every Notion project page.
 
     The key is the *nested Gmail label name* (e.g. "Prosjekt/2026/Acme") so it
@@ -258,24 +295,47 @@ async def get_project_pages() -> dict[str, dict[str, str]]:
       - created_time: ISO 8601 from Notion; the year segment of the key derives
                       from this and is locked at project-creation time
 
-    Excludes pages that are rows in the Contacts database OR in any year-
-    partitioned Emails database. The Emails DB set is fetched from the local
-    cache table populated by `notion_emails_db.get_emails_db_for_year`.
+    Source: when `projects_db_id` is configured we query that one database (cheap,
+    bounded — see `_query_projects_db`). Only when it's unset (some local/dev
+    workspaces) do we fall back to a full workspace /search, post-filtering out
+    Contacts and year-partitioned Emails DB rows.
+
+    Cached for `_PROJECT_PAGES_TTL_SECONDS`. Pass `force_refresh=True` to bypass
+    the cache when a just-created project must be visible immediately.
     """
-    from gb_automations.clients import notion_emails_db
+    global _project_pages_cache, _project_pages_cached_at
+
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _project_pages_cache is not None
+        and now - _project_pages_cached_at < _PROJECT_PAGES_TTL_SECONDS
+    ):
+        return _project_pages_cache
+
     from gb_automations.utils.labels import project_label_path
 
-    contacts_id = settings.contacts_db_id.replace("-", "")
-    emails_db_ids = await notion_emails_db.all_known_db_ids()
     out: dict[str, dict[str, str]] = {}
 
-    pages = await search_pages()
+    if settings.projects_db_id:
+        pages = await _query_projects_db(settings.projects_db_id)
+    else:
+        # Dev/local fallback: no Projects DB configured, so scan everything and
+        # drop the rows that are Contacts or Emails-DB entries.
+        from gb_automations.clients import notion_emails_db
+
+        contacts_id = settings.contacts_db_id.replace("-", "")
+        emails_db_ids = await notion_emails_db.all_known_db_ids()
+        pages = []
+        for page in await search_pages():
+            parent = page.get("parent") or {}
+            if parent.get("type") == "database_id":
+                parent_db = (parent.get("database_id") or "").replace("-", "").lower()
+                if parent_db == contacts_id.lower() or parent_db in emails_db_ids:
+                    continue
+            pages.append(page)
+
     for page in pages:
-        parent = page.get("parent") or {}
-        if parent.get("type") == "database_id":
-            parent_db = (parent.get("database_id") or "").replace("-", "").lower()
-            if parent_db == contacts_id.lower() or parent_db in emails_db_ids:
-                continue
         title = extract_page_title(page)
         if not title:
             continue
@@ -286,6 +346,9 @@ async def get_project_pages() -> dict[str, dict[str, str]]:
             "title": title,
             "created_time": created_time,
         }
+
+    _project_pages_cache = out
+    _project_pages_cached_at = now
     return out
 
 
