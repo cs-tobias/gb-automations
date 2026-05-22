@@ -15,14 +15,17 @@ Pin the behaviors that matter without a live Postgres/Gmail/Notion:
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import gb_automations.sync.sync_labels as sl
 
 
-def _patch_engine(monkeypatch, *, reconcile, topup, nas="skipped", title="Acme", sync_gmail=True):
+def _patch_engine(
+    monkeypatch, *, reconcile, topup, nas="skipped", title="Acme", sync_gmail=True
+):
     """Stub sync_labels' Notion fetch + the two per-user phases + NAS."""
-    monkeypatch.setattr(sl.notion_client, "get_page", _aval({"created_time": "2026-01-01T00:00:00Z"}))
+    monkeypatch.setattr(
+        sl.notion_client, "get_page", _aval({"created_time": "2026-01-01T00:00:00Z"})
+    )
     monkeypatch.setattr(sl.notion_client, "extract_page_title", lambda page: title)
     monkeypatch.setattr(sl, "project_label_path", lambda t, ct: f"Prosjekt/2026/{t}")
     monkeypatch.setattr(sl.settings, "sync_gmail_labels", sync_gmail)
@@ -140,3 +143,32 @@ def test_worker_label_sync_clean_marks_done(monkeypatch):
     )
     asyncio.run(qw._process_label_sync(claimed, "1/1"))
     assert recorded["outcome_error"] is None
+
+
+# --------------------------------------------------------------------------
+# ON CONFLICT predicate must match the partial unique index predicate, or
+# Postgres errors "no unique or exclusion constraint matching the ON CONFLICT
+# specification" at runtime (the regression that broke Gmail thread enqueue
+# when the index gained `AND task_type = 'thread'`). Pure-SQL assertion, no DB.
+# --------------------------------------------------------------------------
+
+
+def _index_predicate(index_name: str) -> str:
+    from gb_automations.models import SyncTask
+
+    for idx in SyncTask.__table__.indexes:
+        if idx.name == index_name:
+            return str(idx.dialect_options["postgresql"]["where"])
+    raise AssertionError(f"index {index_name} not found")
+
+
+def test_enqueue_thread_conflict_matches_index():
+    import gb_automations.sync.queue as q
+
+    assert str(q._ACTIVE_THREAD_PREDICATE) == _index_predicate("uq_sync_tasks_active_thread")
+
+
+def test_enqueue_label_conflict_matches_index():
+    import gb_automations.sync.queue as q
+
+    assert str(q._ACTIVE_LABEL_PREDICATE) == _index_predicate("uq_sync_tasks_active_label")

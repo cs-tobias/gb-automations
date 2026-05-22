@@ -26,9 +26,16 @@ from gb_automations.models import SyncTask
 
 logger = logging.getLogger(__name__)
 
-# Predicate for "this row represents work still owed" — shared by the dedup
-# index target and any active-row queries.
+# Predicate for "this row represents work still owed" — used by active-row
+# queries (claim, reset, status rollups).
 _ACTIVE_PREDICATE = text("status IN ('pending','in_progress')")
+
+# ON CONFLICT predicates must match a partial unique index's WHERE *exactly* for
+# Postgres to use it. These mirror uq_sync_tasks_active_thread /
+# uq_sync_tasks_active_label in models.py — keep them in lockstep with the index
+# definitions (and any migration that changes them).
+_ACTIVE_THREAD_PREDICATE = text("status IN ('pending','in_progress') AND task_type = 'thread'")
+_ACTIVE_LABEL_PREDICATE = text("status IN ('pending','in_progress') AND task_type = 'label_sync'")
 
 
 async def enqueue_threads(
@@ -57,13 +64,18 @@ async def enqueue_threads(
         pg_insert(SyncTask)
         .values(
             [
-                {"user_email": user_email, "gmail_thread_id": tid, "rebuild": rebuild}
+                {
+                    "task_type": "thread",
+                    "user_email": user_email,
+                    "gmail_thread_id": tid,
+                    "rebuild": rebuild,
+                }
                 for tid in ids
             ]
         )
         .on_conflict_do_nothing(
             index_elements=["user_email", "gmail_thread_id"],
-            index_where=_ACTIVE_PREDICATE,
+            index_where=_ACTIVE_THREAD_PREDICATE,
         )
     )
 
@@ -100,7 +112,7 @@ async def enqueue_label_sync(project_page_id: str) -> int:
         )
         .on_conflict_do_nothing(
             index_elements=["project_page_id"],
-            index_where=text("status IN ('pending','in_progress') AND task_type = 'label_sync'"),
+            index_where=_ACTIVE_LABEL_PREDICATE,
         )
     )
     async with SessionLocal() as own:
