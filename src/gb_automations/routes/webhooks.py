@@ -4,9 +4,11 @@
   Cloudflare Tunnel is wired up.
 - /webhooks/notion — Notion → Gmail label flow. Triggered by a "Sync to Gmail"
   Notion button on the Projects DB: POST with bearer auth and a JSON body
-  {"page_id": "<id>"}. Creates the Gmail label across active mailboxes the
-  first time, renames it on later clicks if the project title changed, and
-  reconciles per-user rows that drifted.
+  {"page_id": "<id>"}. ENQUEUES a `label_sync` task and returns — the durable
+  queue worker creates/reconciles the Gmail label across mailboxes (+ the NAS
+  folder). Does NOT do that work inline: it used to, which intermittently
+  exceeded Notion's button-webhook timeout. The label engine lives in
+  sync/sync_labels.py.
 
 - /webhooks/gmail — inbound side (Gmail Pub/Sub push). Does NOT sync inline: it
   ENQUEUES a durable `sync_tasks` row and advances the history cursor in one
@@ -31,23 +33,20 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from google.auth.transport import requests as g_requests
 from google.oauth2 import id_token
-from googleapiclient.errors import HttpError
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
-from gb_automations.clients import nas as nas_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.jobs import queue_worker
-from gb_automations.models import EmailRow, ProjectFolder, ProjectLabel, SyncCursor, User
+from gb_automations.models import EmailRow, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
-from gb_automations.sync.queue import enqueue_threads
+from gb_automations.sync.queue import enqueue_label_sync, enqueue_threads
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
-from gb_automations.utils.labels import project_label_path
 
 logger = logging.getLogger(__name__)
 
@@ -125,262 +124,10 @@ def _page_parented_to_projects_db(page: dict[str, Any]) -> bool:
     return parent_db == target
 
 
-async def _create_label_for_all_users(
-    notion_page_id: str, label_name: str
-) -> dict[str, list[str]]:
-    """Create the label in every active user's mailbox AND record the (project, user) → label_id
-    mapping so a future rename can target each label by ID.
-
-    Returns lists of user emails per outcome: `created` minted a fresh label,
-    `already_present` was an idempotent no-op (label was already in that
-    mailbox), `failed` errored.
-    """
-    async with SessionLocal() as session:
-        users = (await session.execute(select(User).where(User.active.is_(True)))).scalars().all()
-
-    created: list[str] = []
-    already_present: list[str] = []
-    failed: list[str] = []
-    label_ids_by_user: dict[str, str] = {}
-    loop = asyncio.get_running_loop()
-    for user in users:
-        try:
-            label = await loop.run_in_executor(
-                _executor, partial(gmail_client.create_label, user.email, label_name)
-            )
-            if label.get("_created"):
-                created.append(user.email)
-            else:
-                already_present.append(user.email)
-            label_ids_by_user[user.email] = label["id"]
-        except Exception:
-            logger.exception("Failed to create label %r for %s", label_name, user.email)
-            failed.append(user.email)
-
-    if label_ids_by_user:
-        async with SessionLocal() as session:
-            for email, label_id in label_ids_by_user.items():
-                stmt = (
-                    pg_insert(ProjectLabel)
-                    .values(
-                        notion_page_id=notion_page_id,
-                        user_email=email,
-                        gmail_label_id=label_id,
-                        current_name=label_name,
-                    )
-                    .on_conflict_do_update(
-                        index_elements=["notion_page_id", "user_email"],
-                        set_={"gmail_label_id": label_id, "current_name": label_name},
-                    )
-                )
-                await session.execute(stmt)
-            await session.commit()
-
-    return {"created": created, "already_present": already_present, "failed": failed}
-
-
-async def _reconcile_label_for_all_users(
-    notion_page_id: str, expected_name: str
-) -> dict[str, Any]:
-    """Force every active user's Gmail label for this project to match `expected_name`.
-
-    Notion is the source of truth. On every button click we fetch the live label
-    name from Gmail (by stored ID), compare to `expected_name`, and patch back
-    if they differ. This catches three drift cases in one place:
-
-    1. Project renamed in Notion → DB row is stale → live label still has the
-       old name → patch.
-    2. Label renamed manually in Gmail → DB row may "look fine" (current_name
-       matches expected) but the live label diverged → patch.
-    3. Label deleted in Gmail → labels.get returns 404 → create-by-name and
-       rewrite the row with the fresh ID (self-heal).
-
-    Returns: {patched: [emails], healed: [emails], unchanged: [emails], failed: [emails]}.
-    """
-    async with SessionLocal() as session:
-        rows = list(
-            (
-                await session.execute(
-                    select(ProjectLabel).where(ProjectLabel.notion_page_id == notion_page_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-    if not rows:
-        return {"patched": [], "healed": [], "unchanged": [], "failed": [], "no_mapping": True}
-
-    patched: list[str] = []
-    healed_ids: dict[str, str] = {}
-    unchanged: list[str] = []
-    failed: list[str] = []
-    loop = asyncio.get_running_loop()
-
-    for row in rows:
-        try:
-            live = await loop.run_in_executor(
-                _executor,
-                partial(gmail_client.get_label, row.user_email, row.gmail_label_id),
-            )
-        except HttpError as err:
-            if err.resp.status == 404:
-                logger.warning(
-                    "Stale label %s for %s (page=%s); creating by name and healing the row",
-                    row.gmail_label_id,
-                    row.user_email,
-                    notion_page_id,
-                )
-                try:
-                    label = await loop.run_in_executor(
-                        _executor,
-                        partial(gmail_client.create_label, row.user_email, expected_name),
-                    )
-                    healed_ids[row.user_email] = label["id"]
-                    continue
-                except Exception:
-                    logger.exception(
-                        "Self-heal failed for %s (page=%s)", row.user_email, notion_page_id
-                    )
-                    failed.append(row.user_email)
-                    continue
-            logger.exception(
-                "Failed to fetch label %s for %s (page=%s)",
-                row.gmail_label_id,
-                row.user_email,
-                notion_page_id,
-            )
-            failed.append(row.user_email)
-            continue
-        except Exception:
-            logger.exception(
-                "Failed to fetch label %s for %s (page=%s)",
-                row.gmail_label_id,
-                row.user_email,
-                notion_page_id,
-            )
-            failed.append(row.user_email)
-            continue
-
-        if live.get("name") == expected_name:
-            unchanged.append(row.user_email)
-            continue
-
-        logger.info(
-            "↳ drift detected for %s: live=%r expected=%r; patching",
-            row.user_email,
-            live.get("name"),
-            expected_name,
-        )
-        try:
-            await loop.run_in_executor(
-                _executor,
-                partial(
-                    gmail_client.update_label_name,
-                    row.user_email,
-                    row.gmail_label_id,
-                    expected_name,
-                ),
-            )
-            patched.append(row.user_email)
-        except Exception:
-            logger.exception(
-                "Failed to patch label %s for %s (page=%s)",
-                row.gmail_label_id,
-                row.user_email,
-                notion_page_id,
-            )
-            failed.append(row.user_email)
-
-    if patched or healed_ids:
-        async with SessionLocal() as session:
-            touched = patched + list(healed_ids.keys())
-            await session.execute(
-                update(ProjectLabel)
-                .where(ProjectLabel.notion_page_id == notion_page_id)
-                .where(ProjectLabel.user_email.in_(touched))
-                .values(current_name=expected_name)
-            )
-            for email, fresh_id in healed_ids.items():
-                await session.execute(
-                    update(ProjectLabel)
-                    .where(ProjectLabel.notion_page_id == notion_page_id)
-                    .where(ProjectLabel.user_email == email)
-                    .values(gmail_label_id=fresh_id)
-                )
-            await session.commit()
-
-    return {
-        "patched": patched,
-        "healed": list(healed_ids.keys()),
-        "unchanged": unchanged,
-        "failed": failed,
-    }
-
-
 def _json(payload: dict[str, Any], status: int = 200) -> Response:
     return Response(
         content=json.dumps(payload), media_type="application/json", status_code=status
     )
-
-
-async def _sync_nas_folder_for_project(
-    notion_page_id: str, title: str, created_time: str | None
-) -> str:
-    """Create or rename the project's folder on the office NAS.
-
-    Best-effort and fully decoupled from the Gmail-label step: a down or
-    unmounted share (or any filesystem error) is logged and reported, never
-    raised — the team relies on label creation, so the NAS must not be able to
-    block it. Mirrors how Drive-upload failures are treated in the sync engine.
-
-    Returns one of: "created" | "renamed" | "unchanged" | "skipped" | "failed".
-    """
-    if not (settings.sync_nas_folders and settings.nas_projects_root):
-        return "skipped"
-
-    if not await asyncio.to_thread(nas_client.nas_available):
-        logger.warning(
-            "↳ NAS unavailable (root %r not a writable dir); skipping folder sync",
-            settings.nas_projects_root,
-        )
-        return "failed"
-
-    try:
-        async with SessionLocal() as session:
-            row = await session.get(ProjectFolder, notion_page_id)
-
-            if row is None:
-                target = await asyncio.to_thread(
-                    nas_client.ensure_project_folders, title, created_time
-                )
-                outcome = "created"
-            elif row.current_name != title:
-                target = await asyncio.to_thread(
-                    nas_client.rename_project_folder, row.current_name, title, created_time
-                )
-                outcome = "renamed"
-            else:
-                # Unchanged name — still ensure the folder exists, so a folder a
-                # user deleted by hand gets healed on the next click.
-                target = await asyncio.to_thread(
-                    nas_client.ensure_project_folders, title, created_time
-                )
-                outcome = "unchanged"
-
-            await session.merge(
-                ProjectFolder(
-                    notion_page_id=notion_page_id,
-                    current_path=str(target),
-                    current_name=title,
-                )
-            )
-            await session.commit()
-        logger.info("↳ NAS folder %s: %s", outcome, target)
-        return outcome
-    except Exception:
-        logger.exception("↳ NAS folder sync failed for project %r", title)
-        return "failed"
 
 
 @router.post("/notion")
@@ -602,99 +349,25 @@ async def _notion_webhook_impl(request: Request) -> Response:
             }
         )
 
-    # Year segment of the label path comes from Notion's immutable created_time,
-    # so renames only change the leaf — the year stays pinned to the project's
-    # creation year even if the title is edited across a year boundary.
-    created_time = page.get("created_time")
-    label_name = project_label_path(title, created_time)
-
-    # Fan out to every enabled target. Each is independently togglable via
-    # config (see Settings.sync_*) so we can decouple while building — e.g. run
-    # the NAS step alone during testing with SYNC_GMAIL_LABELS=false.
-    parts: list[str] = []
-
-    # --- Gmail label target ---
-    if settings.sync_gmail_labels:
-        # Two operations on every click, in this order:
-        #   1. Reconcile existing rows: compare each user's live Gmail label name
-        #      against `label_name` and patch any drift (whether the drift came
-        #      from a Notion rename or a Gmail-side rename).
-        #   2. Top up missing rows: create the label for any active user who
-        #      doesn't yet have a project_labels row (new workspace user, or a
-        #      first-ever sync of this project — same code path either way).
-        # Order matters: step 1 is a no-op when there are no rows yet (first
-        # sync), and step 2's create is idempotent so it doesn't re-create
-        # labels users already have.
-        reconcile = await _reconcile_label_for_all_users(page_id, label_name)
-        topup = await _create_label_for_all_users(page_id, label_name)
-
-        if reconcile.get("no_mapping"):
-            gmail_action = "created"
-        elif reconcile["patched"] or reconcile["healed"]:
-            gmail_action = "synced"
-        else:
-            gmail_action = "unchanged"
-
-        gmail_failed = list({*reconcile["failed"], *topup["failed"]})
-
-        # The reconcile phase already emits a "↳ drift detected" log when it
-        # patches, so the summary here just confirms the outcome and reports any
-        # genuine side effect (new label minted, healed, failed).
-        if gmail_action == "created":
-            parts.append(f"created label {label_name!r} in {len(topup['created'])} mailbox(es)")
-        elif reconcile["patched"]:
-            parts.append(
-                f"renamed label to {label_name!r} in {len(reconcile['patched'])} mailbox(es)"
-            )
-            if topup["created"]:
-                parts.append(f"also created in {len(topup['created'])} new mailbox(es)")
-        elif reconcile["healed"]:
-            parts.append(
-                f"re-created missing label {label_name!r} in {len(reconcile['healed'])} mailbox(es)"
-            )
-        elif topup["created"]:
-            # Reconcile said nothing changed for existing rows, but top-up minted
-            # the label somewhere new (e.g. a new active user was added since the
-            # last sync of this project).
-            parts.append(
-                f"created label {label_name!r} in {len(topup['created'])} new mailbox(es)"
-            )
-        else:
-            parts.append(f"label {label_name!r} already up to date everywhere")
-
-        if gmail_failed:
-            parts.append(f"label FAILED in {len(gmail_failed)} mailbox(es): {', '.join(gmail_failed)}")
-        label_block = {
-            "action": gmail_action,
-            "patched": reconcile["patched"],
-            "healed": reconcile["healed"],
-            "unchanged": reconcile["unchanged"],
-            "created": topup["created"],
-            "already_present": topup["already_present"],
-            "failed": gmail_failed,
-        }
-    else:
-        gmail_action = "skipped"
-        parts.append("gmail label skipped (SYNC_GMAIL_LABELS=false)")
-        label_block = {"action": "skipped"}
-
-    # --- NAS folder target ---
-    nas_action = await _sync_nas_folder_for_project(page_id, title, created_time)
-    if nas_action != "skipped":
-        parts.append(f"NAS folder {nas_action}")
-
-    logger.info("↳ done — %s", "; ".join(parts))
-
+    # Enqueue + return — do NOT do the Gmail/NAS work inline. That work is many
+    # sequential Gmail calls per mailbox; doing it on the request path made this
+    # button intermittently exceed Notion's webhook timeout ("failed to execute",
+    # button auto-paused). The durable queue worker now runs it (a `label_sync`
+    # task) with retries/backoff/visibility, exactly like the resync buttons.
+    # The label name is recomputed at processing time from the (possibly renamed)
+    # title — see sync.sync_labels.sync_project_labels.
+    inserted = await enqueue_label_sync(page_id)
+    queue_worker.wake()
+    logger.info(
+        "🏷  label sync requested for %r (page %s) — %s",
+        title,
+        page_id,
+        "enqueued" if inserted else "already queued",
+    )
     return _json(
         {
             "page_id": page_id,
-            "label": label_name,
-            # Top-level `action` reflects the Gmail target for backward compat
-            # with the existing Notion button feedback. Per-target detail lives
-            # under `gmail` and `nas`.
-            "action": gmail_action,
-            "gmail": label_block,
-            "nas": nas_action,
+            "action": "queued" if inserted else "already_queued",
         }
     )
 

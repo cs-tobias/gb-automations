@@ -77,6 +77,38 @@ async def enqueue_threads(
         return result.rowcount or 0
 
 
+async def enqueue_label_sync(project_page_id: str) -> int:
+    """Enqueue a label-sync task for a project. Returns 1 if newly enqueued, 0 if
+    one was already active (idempotent — backs the "Sync to Gmail" button so a
+    double-click, or fast clicks on the same project, collapse to one task).
+
+    A label_sync row has no real thread; user_email/gmail_thread_id are NOT-NULL
+    placeholders (the dedup index `uq_sync_tasks_active_label` keys on
+    project_page_id instead). We stash the page id in gmail_thread_id so the
+    worker has it without a second column, and "*" in user_email as a sentinel.
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="label_sync",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id"],
+            index_where=text("status IN ('pending','in_progress') AND task_type = 'label_sync'"),
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
 async def claim_one(session: AsyncSession) -> SyncTask | None:
     """Claim the oldest eligible pending task, marking it in_progress.
 
@@ -331,6 +363,7 @@ async def queue_counts(failed_limit: int = 50) -> dict[str, Any]:
 
 __all__ = [
     "enqueue_threads",
+    "enqueue_label_sync",
     "claim_one",
     "mark_done",
     "mark_failed",

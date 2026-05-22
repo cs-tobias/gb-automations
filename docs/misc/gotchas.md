@@ -308,6 +308,18 @@ Gmail filter rules don't save us either — they only run on incoming messages, 
 
 ---
 
+## 17. Notion button webhooks time out — never do slow work inline in a button handler
+
+**Symptom:** the "Sync to Gmail" button (Projects DB) showed **"failed to execute"** maybe half the time or more, while the "Re-sync" and "Resync Project" buttons were rock-solid. Re-clicking sometimes worked, sometimes the button looked stuck — because Notion **auto-pauses an automation that fails**, so a timed-out click could leave it disabled until re-clicked.
+
+**Why:** Notion's button "Send webhook" action waits only a short, undocumented window for the HTTP response and reports "failed to execute" on timeout. The original "Sync to Gmail" handler did **all** the Gmail work *inline* before responding: for every active mailbox, reconcile the label (a `labels.get`, maybe a `patch`) **and** create it (`labels.list` + up to 3 `labels.create` to walk `Prosjekt/<year>/<name>`) — sequentially. With several mailboxes that's many seconds of wall-clock, which crossed the timeout intermittently (Gmail latency varies, so it failed *some* of the time, not always). The two resync buttons never failed for one reason: they only **enqueue** onto the durable queue and return in well under a second.
+
+Note this is NOT a Gmail rate-limit problem — per-mailbox errors were always caught and the handler still returned 200 with a "FAILED in N mailbox(es)" note. The failure was the *request never completing in time*.
+
+**Fix (shipped):** the button now does the same thing the resync buttons do — validate fast (auth, fetch page, parent/title check), `enqueue_label_sync(page_id)`, `wake()`, return `{"action": "queued"}`. The slow work runs in the queue worker as a **`label_sync` task** (a second `task_type` on `sync_tasks` alongside `'thread'`), with retries/backoff/`/debug/queue` visibility and the Projects-DB status dot — engine in [src/gb_automations/sync/sync_labels.py](../src/gb_automations/sync/sync_labels.py). One active label_sync per project (partial unique index `uq_sync_tasks_active_label`), so fast/repeat clicks on the same project collapse to one task. **Rule of thumb: a Notion button handler must enqueue-and-return, never block on external API work.**
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.

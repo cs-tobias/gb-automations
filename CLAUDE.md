@@ -32,7 +32,8 @@ After Frame: Toggl (daily aggregated hours → Notion), Fiken (accounting), meet
                    │  FastAPI (src/gb_automations)   │
                    │  ───────────────────────────    │
    Notion ────────►│  /webhooks/notion               │
-   webhook         │     → create/rename Gmail label │
+   webhook         │     → ENQUEUE label_sync task   │   (worker creates/renames
+                   │       (does NOT sync inline)    │    Gmail label + NAS folder)
                    │  /webhooks/notion/resync-thread │
                    │     → enqueue a thread rebuild  │
                    │                                 │
@@ -126,7 +127,7 @@ tests/                pytest — unit tests for cleaning/splitting/extraction/pa
 
 - **Python ≥3.12, async FastAPI + async SQLAlchemy**. Sync Google client calls go through `asyncio.to_thread` / a thread pool — don't block the event loop.
 - **Dedup belongs in Postgres, truth in Notion.** `EmailRow` / `ContactCache` / `CompanyCache` / `EmailsDbCache` are local caches to avoid re-querying Notion; we still write to Notion on every change. Because Notion is truth, a cached id can go stale (object deleted/archived) — the read paths **self-heal**: on a 404 / "archived ancestor" error they evict the cache row and re-resolve. Don't add a new cached-id read without that fallback.
-- **Sync work is queued, not inline.** The Gmail webhook enqueues; the worker ([jobs/queue_worker.py](src/gb_automations/jobs/queue_worker.py)) runs `sync_thread`. `sync_thread` must stay idempotent (re-running a synced thread is a no-op / repair). New "do something per email" work belongs in/after `sync_thread`, reached via the queue — not bolted onto the webhook.
+- **Sync work is queued, not inline — for ALL webhooks, including buttons.** The Gmail webhook enqueues a `thread` task; the "Sync to Gmail" Projects button enqueues a `label_sync` task (the worker dispatches on `SyncTask.task_type`). The worker ([jobs/queue_worker.py](src/gb_automations/jobs/queue_worker.py)) runs `sync_thread` / `sync_project_labels`. Both must stay idempotent (re-running is a no-op / repair). New work belongs in/after the worker, reached via the queue — **never block a webhook (especially a Notion button) on external API work**: it'll exceed Notion's button timeout (gotchas §17). New "do something per email" work goes in/after `sync_thread`.
 - **Notion `Emails` DB property names live in `EMAILS_PROPS`** in `config.py`. Same for `CONTACTS_PROPS`. If a property is renamed in Notion, edit the constant — don't hard-code names elsewhere.
 - **Settings are env-driven**, validated at startup (`_validate_required_settings`). New required env vars get a startup check, not a runtime crash.
 - **Logging**: `logger = logging.getLogger(__name__)`. INFO is visible by default (see `main.py` dictConfig). Use the `request_id` filter — already wired — so every line during a webhook carries `[notion:abcd]` or `[gmail:abcd]`.
@@ -168,7 +169,7 @@ curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20ti
 
 | Question | File |
 |---|---|
-| "How does a Notion event become a Gmail label?" | [routes/webhooks.py](src/gb_automations/routes/webhooks.py) `_notion_webhook_impl` |
+| "How does a Notion event become a Gmail label?" | [routes/webhooks.py](src/gb_automations/routes/webhooks.py) `_notion_webhook_impl` ENQUEUES a `label_sync` task → worker runs [sync/sync_labels.py](src/gb_automations/sync/sync_labels.py) `sync_project_labels` (does NOT sync inline) |
 | "How does a Gmail push get processed?" | [routes/webhooks.py](src/gb_automations/routes/webhooks.py) `_gmail_webhook_impl` ENQUEUES → [sync/queue.py](src/gb_automations/sync/queue.py) `enqueue_threads` (does NOT sync inline) |
 | "What actually runs the sync?" | [jobs/queue_worker.py](src/gb_automations/jobs/queue_worker.py) drains the queue → [sync/sync_thread.py](src/gb_automations/sync/sync_thread.py) `sync_thread` |
 | "How do I see what's queued / pending / failed?" | `GET /debug/queue`; the `sync_tasks` table is the truth |

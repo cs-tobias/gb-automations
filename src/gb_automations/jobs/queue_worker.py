@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from gb_automations.db import SessionLocal
 from gb_automations.obs import describe_error, log_api_error
@@ -32,6 +33,7 @@ from gb_automations.sync.queue import (
     set_task_project,
     status_counts,
 )
+from gb_automations.sync.sync_labels import sync_project_labels
 from gb_automations.sync.sync_thread import sync_thread
 
 logger = logging.getLogger(__name__)
@@ -57,28 +59,136 @@ def request_shutdown() -> None:
     _wake_event.set()
 
 
-async def _claim() -> tuple[int, str, str, int, bool] | None:
-    """Atomically claim the next task. Returns (id, email, thread_id, attempts, rebuild)."""
+@dataclass
+class _Claimed:
+    """A claimed task, flattened off the ORM object before its session closes."""
+
+    id: int
+    task_type: str
+    user_email: str
+    gmail_thread_id: str
+    project_page_id: str | None
+    attempts: int
+    rebuild: bool
+
+
+async def _claim() -> _Claimed | None:
+    """Atomically claim the next task (any type), flattened for use after commit."""
     async with SessionLocal() as session:
         task = await claim_one(session)
         if task is None:
             return None
+        claimed = _Claimed(
+            id=task.id,
+            task_type=task.task_type,
+            user_email=task.user_email,
+            gmail_thread_id=task.gmail_thread_id,
+            project_page_id=task.project_page_id,
+            attempts=task.attempts,
+            rebuild=task.rebuild,
+        )
         await session.commit()
-        return (task.id, task.user_email, task.gmail_thread_id, task.attempts, task.rebuild)
+        return claimed
 
 
-async def _process(claimed: tuple[int, str, str, int, bool], progress: str) -> None:
-    """Run the sync for an already-claimed task and record the outcome.
+async def _record_outcome(
+    task_id: int,
+    attempts: int,
+    outcome_error: str | None,
+    *,
+    progress: str,
+    label: str,
+) -> bool:
+    """Mark a claimed task done or failed (with retry/backoff). Returns True if it
+    succeeded. `label` is a short human descriptor for logs (thread id or page id).
+
+    Shared by the thread and label_sync paths so retry semantics stay identical
+    across task types: below MAX_ATTEMPTS a failure backs off and retries; at the
+    cap it parks as `failed` (visible in /debug/queue).
+    """
+    async with SessionLocal() as session:
+        if outcome_error is None:
+            await mark_done(session, task_id)
+            await session.commit()
+            logger.info("✔ task %s done — %s", progress, label)
+            return True
+
+        stub = _TaskStub(id=task_id, attempts=attempts)
+        terminal = await mark_failed(
+            session,
+            stub,
+            outcome_error,
+            max_attempts=MAX_ATTEMPTS,
+            base_backoff_seconds=BASE_BACKOFF_SECONDS,
+        )
+        await session.commit()
+        if terminal:
+            logger.error(
+                "✖ task %s FAILED for good after %d attempts (%s): %s",
+                progress,
+                attempts,
+                label,
+                outcome_error,
+            )
+        else:
+            logger.warning(
+                "↻ task %s failed (attempt %d/%d) — will retry: %s",
+                progress,
+                attempts,
+                MAX_ATTEMPTS,
+                outcome_error,
+            )
+        return False
+
+
+async def _process_label_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a label_sync task: reconcile + create the project's Gmail label across
+    all mailboxes (+ NAS folder), then light the project dot. No thread, so the
+    per-thread Sync Queue mirror is skipped — the Projects-DB dot is the surface.
+    """
+    project_page_id = claimed.project_page_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing labels for project %s%s", progress, project_page_id, retry_note
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError("label_sync task has no project_page_id")
+        result = await sync_project_labels(project_page_id)
+        # A mailbox that errored is a (likely transient) failure worth retrying;
+        # surface it so _record_outcome backs off rather than marking done.
+        if result.failed:
+            outcome_error = f"label sync failed in mailbox(es): {', '.join(result.failed)}"
+    except Exception as err:
+        log_api_error(logger, f"label sync crashed for project {project_page_id}", err)
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(project_page_id)
+    )
+    await queue_mirror.refresh_project_dot(project_page_id)
+
+
+async def _process(claimed: _Claimed, progress: str) -> None:
+    """Dispatch a claimed task by type and record the outcome.
 
     `progress` is a human "N/M" batch position used purely for log narration.
-    The claim already committed `in_progress` (so boot recovery sees a mid-sync
-    crash); the sync and its outcome run here in separate transactions.
-
-    `rebuild` tasks archive + recreate the thread's rows under current code; the
-    rest do a normal repair-in-place sync. Both go through the same outcome
-    handling (retry/backoff/dot).
+    The claim already committed `in_progress` (so boot recovery sees a mid-run
+    crash); the run and its outcome happen here in separate transactions.
     """
-    task_id, email, thread_id, attempts, rebuild = claimed
+    if claimed.task_type == "label_sync":
+        await _process_label_sync(claimed, progress)
+        return
+
+    task_id, email, thread_id, attempts, rebuild = (
+        claimed.id,
+        claimed.user_email,
+        claimed.gmail_thread_id,
+        claimed.attempts,
+        claimed.rebuild,
+    )
 
     retry_note = f" (retry {attempts}/{MAX_ATTEMPTS})" if attempts > 1 else ""
     verb = "rebuilding" if rebuild else "syncing"

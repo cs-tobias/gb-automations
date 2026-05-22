@@ -248,6 +248,13 @@ class EmailsDbCache(Base):
 # schema uses plain strings/booleans.
 SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
 
+# What unit of work a row represents. 'thread' is the original (and default):
+# one Gmail thread → Notion rows via sync_thread. 'label_sync' is "reconcile +
+# create this project's Gmail label across every active mailbox" — a different
+# unit (keyed on project, no thread), dispatched on in the worker. New types go
+# here + the CHECK below + a branch in jobs/queue_worker._process.
+SYNC_TASK_TYPES = ("thread", "label_sync")
+
 
 class SyncTask(Base):
     """Durable work queue: one Gmail thread that must be synced into Notion.
@@ -270,6 +277,16 @@ class SyncTask(Base):
 
     # Surrogate PK gives the claim query a stable tiebreaker for FIFO ordering.
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # What kind of work this row is. Defaults to 'thread' so every existing
+    # enqueue path (gmail push, resync buttons) keeps working unchanged. A
+    # 'label_sync' row syncs a project's Gmail label across all mailboxes; it has
+    # no real thread, so user_email/gmail_thread_id below are NOT meaningful for
+    # it — only project_page_id is. The worker dispatches on this column.
+    task_type: Mapped[str] = mapped_column(String(16), nullable=False, server_default="thread")
+    # For a 'thread' row these identify the work. For a 'label_sync' row they are
+    # unused placeholders (the active-dedup index for label_sync keys on
+    # project_page_id instead — see uq_sync_tasks_active_label below); we still
+    # fill them with the project page id / "*" because the columns are NOT NULL.
     user_email: Mapped[str] = mapped_column(String(254), nullable=False)
     gmail_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
@@ -304,16 +321,34 @@ class SyncTask(Base):
             "status IN ('pending','in_progress','done','failed')",
             name="ck_sync_tasks_status",
         ),
+        CheckConstraint(
+            "task_type IN ('thread','label_sync')",
+            name="ck_sync_tasks_task_type",
+        ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
         # dedup that makes re-enqueue on every push/reply a safe no-op. The
         # partial predicate still allows a new row once the prior one is
-        # done/failed (so a later reply re-enqueues the thread).
+        # done/failed (so a later reply re-enqueues the thread). Scoped to
+        # task_type='thread' so label_sync rows (which reuse the thread columns
+        # as placeholders) don't collide here.
         Index(
             "uq_sync_tasks_active_thread",
             "user_email",
             "gmail_thread_id",
             unique=True,
-            postgresql_where=text("status IN ('pending','in_progress')"),
+            postgresql_where=text("status IN ('pending','in_progress') AND task_type = 'thread'"),
+        ),
+        # At most one ACTIVE label_sync per project — so a double-click (or 5 fast
+        # clicks on the same project) collapses to one task, while distinct
+        # projects each get their own. The thread index above can't serve this:
+        # label_sync rows share placeholder thread-column values.
+        Index(
+            "uq_sync_tasks_active_label",
+            "project_page_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'label_sync'"
+            ),
         ),
         # Drives the worker's claim query: filter by status, FIFO by oldest
         # next_attempt_at then id.
