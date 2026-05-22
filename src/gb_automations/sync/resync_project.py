@@ -35,6 +35,7 @@ from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.db import SessionLocal
 from gb_automations.models import EmailRow, ProjectLabel, ThreadAttachment, User
+from gb_automations.sync.queue import enqueue_threads
 from gb_automations.sync.sync_thread import SyncResult, sync_thread
 
 logger = logging.getLogger(__name__)
@@ -378,6 +379,44 @@ async def rebuild_thread(thread_id: str, owner_email: str, on_resolved=None) -> 
     return await sync_thread(owner_email, thread_id, on_resolved=on_resolved)
 
 
+async def enqueue_project(
+    project_page_id: str, *, rebuild: bool = True, only_user: str | None = None
+) -> dict[str, int]:
+    """Enqueue every thread under a project's label(s) for a (re)sync.
+
+    The queue-based counterpart to `resync_project`: it does NOT archive or sync
+    inline. It resolves the project's threads and drops them on the durable
+    queue, exactly like the per-email "Re-sync" button does for one thread. The
+    queue worker then handles each thread the normal way — with `rebuild=True`
+    it archives + recreates the rows under current code — so logging, retries
+    and the Projects-DB status dot are all the standard path. This is what the
+    Notion "Resync Project" button calls.
+
+    Returns a summary: {threads, enqueued, labels}. `enqueued` < `threads` when
+    some threads already have an active queue row (idempotent — those are
+    skipped, not duplicated).
+    """
+    labels = await _resolve_labels(project_page_id, only_user)
+    owner_by_thread = await _enumerate_threads(labels)
+
+    by_owner: dict[str, list[str]] = {}
+    for thread_id, owner in owner_by_thread.items():
+        by_owner.setdefault(owner, []).append(thread_id)
+
+    enqueued = 0
+    for owner, thread_ids in by_owner.items():
+        enqueued += await enqueue_threads(owner, thread_ids, rebuild=rebuild)
+
+    logger.info(
+        "🔁 resync project %s: %d thread(s) across %d label(s) — %d newly enqueued",
+        project_page_id,
+        len(owner_by_thread),
+        len(labels),
+        enqueued,
+    )
+    return {"threads": len(owner_by_thread), "enqueued": enqueued, "labels": len(labels)}
+
+
 async def enqueue_missing_for_all_projects() -> int:
     """Enqueue every labeled thread that the queue has never finished.
 
@@ -446,5 +485,6 @@ __all__ = [
     "resolve_project",
     "resync_project",
     "rebuild_thread",
+    "enqueue_project",
     "enqueue_missing_for_all_projects",
 ]

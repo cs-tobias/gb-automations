@@ -91,4 +91,38 @@ For every project that pre-dates the integration, open it and click `Sync to Gma
 
 ---
 
+## Part 5 — Add the resync buttons (optional but recommended)
+
+Two buttons that re-run the sync on demand — e.g. after a code change, or to repair rows that look wrong. Both just enqueue work onto the durable queue (the same queue every sync uses), then return immediately; the queue worker rebuilds the rows under current code with the normal logging/retries/status-dot. Both use the same `NOTION_WEBHOOK_SECRET` and button setup as Part 4 — only the **URL** and the **database** differ.
+
+### 5a — "Re-sync" button on the Emails DB (per-thread)
+
+1. Open the **Emails** database → **+** → **Button** → name it `Re-sync`
+2. Header → **Edit automation** → **+ Add step** → **Send webhook**:
+   - **URL**: `https://hub.{your-domain}/webhooks/notion/resync-thread`
+   - **Method**: `POST`
+   - **Body**: `{"page_id": "{{page.id}}"}` (use the variable picker for `{{page.id}}`)
+   - **Headers**: `Authorization` → `Bearer <NOTION_WEBHOOK_SECRET>`, `Content-Type` → `application/json`
+
+Clicking it on a row rebuilds that one thread.
+
+### 5b — "Resync Project" button on the Projects DB (whole project)
+
+Same as above, on the **Projects** database, named `Resync Project`, with **URL**:
+
+```
+https://hub.{your-domain}/webhooks/notion/resync-project
+```
+
+Clicking it on a project row enqueues **every** thread under that project's Gmail label(s) for a rebuild — the project-level equivalent of the per-email `Re-sync`.
+
+### 5c — Test it
+
+1. Click `Resync Project` on a project row. The webhook returns instantly.
+2. `docker compose logs -f api | grep -v "GET /health"` — expect `🔁 resync project requested … enqueued N thread(s)`, then the worker draining each thread (`🧵 sync start / • matched 1 project(s) / 🧵 sync done`).
+3. `curl http://localhost:8000/debug/queue` shows the threads moving `pending → done`.
+4. Click again while it's running → already-queued threads are skipped (idempotent, no duplicates).
+
+---
+
 Notion is done.

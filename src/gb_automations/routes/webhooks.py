@@ -44,6 +44,7 @@ from gb_automations.jobs import queue_worker
 from gb_automations.models import EmailRow, ProjectFolder, ProjectLabel, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
+from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import enqueue_threads
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
 from gb_automations.utils.labels import project_label_path
@@ -489,6 +490,64 @@ async def notion_resync_thread(request: Request) -> Response:
     """
     with request_scope("resync"):
         return await _resync_thread_impl(request)
+
+
+async def _resync_project_impl(request: Request) -> Response:
+    if not _verify_bearer(request.headers.get("Authorization")):
+        raise HTTPException(401, "Bad or missing bearer token")
+
+    raw_body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body") from None
+
+    page_id = ((payload.get("data") or {}).get("id") or "").strip()
+    if not page_id:
+        raise HTTPException(400, "Missing data.id in Notion button payload")
+
+    # Re-fetch the page to guard that the click came from the Projects DB (not a
+    # stray button elsewhere), same as the "Sync to Gmail" button does.
+    try:
+        page = await notion_client.get_page(page_id)
+    except Exception as err:
+        logger.exception("Failed to fetch Notion page %s", page_id)
+        raise HTTPException(502, f"Notion fetch failed: {err}") from err
+
+    if not _page_parented_to_projects_db(page):
+        logger.warning("↳ page %s is not a Projects DB row — ignoring", page_id)
+        return _json(
+            {"page_id": page_id, "action": "skipped", "reason": "not a Projects DB row"}
+        )
+
+    # Fan the per-email "Re-sync" pattern out over every thread in the project:
+    # resolve the project's threads and drop them on the durable queue with
+    # rebuild=True. The worker archives + recreates each thread under current
+    # code, exactly like a normal sync — same logging, retries and status dot.
+    summary = await resync_project_mod.enqueue_project(page_id, rebuild=True)
+    queue_worker.wake()
+    logger.info(
+        "🔁 resync project requested for %s — enqueued %d of %d thread(s)",
+        page_id,
+        summary["enqueued"],
+        summary["threads"],
+    )
+    return _json({"page_id": page_id, "action": "resyncing", **summary})
+
+
+@router.post("/notion/resync-project")
+async def notion_resync_project(request: Request) -> Response:
+    """Per-project "Resync Project" button receiver (on the Projects DB).
+
+    The project equivalent of the per-email "Re-sync" button: a Button property
+    on each Projects row POSTs here with the bearer token and the row's page id.
+    We enumerate every Gmail thread under the project's label(s) and enqueue them
+    all for a rebuild — the queue worker drains them like any other sync. No
+    inline work, so the webhook returns immediately. Idempotent: threads already
+    queued are skipped.
+    """
+    with request_scope("resync-project"):
+        return await _resync_project_impl(request)
 
 
 async def _notion_webhook_impl(request: Request) -> Response:
