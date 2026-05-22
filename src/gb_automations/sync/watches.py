@@ -49,6 +49,33 @@ async def fetch_project_label_ids_for_user(email: str) -> set[str]:
         return {row[0] for row in rows}
 
 
+async def resolve_projects_for_labels(
+    user_email: str, label_ids: set[str]
+) -> list[tuple[str, str]]:
+    """Resolve a thread's Gmail label IDs to the Notion project(s) they map to.
+
+    Returns `(notion_page_id, current_name)` for each of this user's project
+    labels present on the thread, where `current_name` is the full nested label
+    path (e.g. "Prosjekt/2026/1228_Metropolis_Versalen").
+
+    Local Postgres lookup — no Notion call. This is the per-thread project match
+    in sync_thread; keeping it off Notion is what keeps sync fast regardless of
+    how many projects exist. Keyed on `gmail_label_id` (not the name): a label
+    ID is stable when a project is renamed in Notion, so the match never goes
+    stale on a rename. The reverse of `fetch_project_label_ids_for_user`.
+    """
+    if not label_ids:
+        return []
+    async with SessionLocal() as session:
+        rows = await session.execute(
+            select(ProjectLabel.notion_page_id, ProjectLabel.current_name).where(
+                ProjectLabel.user_email == user_email,
+                ProjectLabel.gmail_label_id.in_(label_ids),
+            )
+        )
+        return [(row[0], row[1]) for row in rows.all()]
+
+
 async def start_watch_for_user(user_email: str) -> dict:
     """Call users.watch() for one user. Saves the returned historyId as the baseline."""
     if not settings.pubsub_topic:

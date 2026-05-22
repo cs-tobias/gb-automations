@@ -194,9 +194,14 @@ class ProjectLabel(Base):
 
     # PK is (notion_page_id, user_email) in that order, so single-column lookups
     # by user_email can't use it. The Gmail webhook filters every push against
-    # `WHERE user_email = ?` — keep that hot path on a real index.
+    # `WHERE user_email = ?` — keep that hot path on a real index. The composite
+    # below additionally serves the per-thread project match in sync_thread
+    # (`WHERE user_email = ? AND gmail_label_id IN (...)`); its leading column
+    # also covers the plain user_email lookup, but the standalone index is kept
+    # for clarity of intent.
     __table_args__ = (
         Index("ix_project_labels_user_email", "user_email"),
+        Index("ix_project_labels_user_label", "user_email", "gmail_label_id"),
     )
 
 

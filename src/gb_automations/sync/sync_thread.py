@@ -48,6 +48,7 @@ from gb_automations.models import (
     ThreadAttachment,
 )
 from gb_automations.obs import describe_error, log_api_error
+from gb_automations.sync import watches
 from gb_automations.utils.email_cleaning import (
     body_before_quotes,
     clean_body,
@@ -139,10 +140,11 @@ async def sync_thread(
     result = SyncResult(thread_id=thread_id, project_name=None, project_page_id=None)
     logger.debug("🧵 sync_thread start: thread=%s user=%s", thread_id, user_email)
 
-    # 1. Fetch thread + label map from Gmail (sync API, threadpool-wrapped)
+    # 1. Fetch the thread from Gmail (sync API, threadpool-wrapped). The project
+    # match below works off label IDs alone (via the local ProjectLabel cache),
+    # so we no longer pull the full label list on the happy path — only lazily,
+    # to humanize the skip log when nothing matches.
     thread = await asyncio.to_thread(gmail_client.get_thread, user_email, thread_id)
-    labels = await asyncio.to_thread(gmail_client.list_labels, user_email)
-    label_id_to_name = {label["id"]: label["name"] for label in labels}
     result.messages_seen = len(thread.messages)
 
     if not thread.messages:
@@ -159,23 +161,32 @@ async def sync_thread(
         user_email,
     )
 
-    # 2. Pick the Notion projects for this thread. Multiple labels (dual-tagged
-    # thread) all flow into the Project relation — Notion supports many-target
-    # relations and the team treats this as "this email is shared across
-    # projects" rather than "pick one." See _pick_projects docstring.
-    project_map = await notion_client.get_project_pages()
-    thread_label_names = _collect_thread_label_names(thread.messages, label_id_to_name)
-    project_names, project_page_ids, project_label_paths = _pick_projects(
-        thread_label_names, project_map
-    )
+    # 2. Pick the Notion projects for this thread from the local ProjectLabel
+    # cache — a single indexed Postgres lookup, no Notion call. Keyed on the
+    # thread's Gmail label IDs (stable across project renames). Multiple labels
+    # (dual-tagged thread) all flow into the Project relation — Notion supports
+    # many-target relations and the team treats this as "this email is shared
+    # across projects" rather than "pick one."
+    thread_label_ids = _collect_thread_label_ids(thread.messages)
+    matches = await watches.resolve_projects_for_labels(user_email, thread_label_ids)
+    project_names, project_page_ids, project_label_paths = _projects_from_matches(matches)
     result.project_name = ", ".join(project_names) or None
     result.project_page_id = project_page_ids[0] if project_page_ids else None
     if on_resolved is not None:
         await on_resolved(result.thread_subject, result.project_page_id)
     if not project_page_ids:
+        # No ProjectLabel cache row maps any of this thread's labels to a
+        # project. Usually means the cache is stale/missing for this project —
+        # a `backfill_project_labels` run repairs it. Resolve label IDs → names
+        # here (off the happy path) so the gap is obvious in the logs.
+        labels = await asyncio.to_thread(gmail_client.list_labels, user_email)
+        label_id_to_name = {label["id"]: label["name"] for label in labels}
+        thread_label_names = sorted(
+            label_id_to_name.get(lid, lid) for lid in thread_label_ids
+        )
         result.skipped_reason = (
-            f"no Notion project matches any thread label "
-            f"(thread labels: {sorted(thread_label_names)})"
+            f"no project label cached for any thread label "
+            f"(thread labels: {thread_label_names})"
         )
         logger.warning(
             "🧵 sync skip: %r thread=%s for %s — %s",
@@ -378,44 +389,41 @@ async def _resplit_under_split_blocks(
 # ============================================================
 
 
-def _collect_thread_label_names(
-    messages: list[gmail_client.GmailMessage], label_id_to_name: dict[str, str]
+def _collect_thread_label_ids(
+    messages: list[gmail_client.GmailMessage],
 ) -> set[str]:
-    """Union of label names across every message in the thread."""
-    names: set[str] = set()
-    for msg in messages:
-        for lid in msg.label_ids:
-            if lid in label_id_to_name:
-                names.add(label_id_to_name[lid])
-    return names
+    """Union of Gmail label IDs across every message in the thread.
 
-
-def _pick_projects(
-    thread_label_names: set[str], project_map: dict[str, dict[str, str]]
-) -> tuple[list[str], list[str], list[str]]:
-    """Find EVERY thread-label whose name matches a Notion project's label path.
-
-    `project_map` keys are full nested Gmail label paths (e.g.
-    "Prosjekt/2026/Acme"), produced by `notion_client.get_project_pages()`.
-    Gmail thread labels carry the same nested name, so set intersection works
-    without rebuilding paths here.
-
-    Returns (titles, page_ids, label_paths) — *titles* (leaf names, e.g.
-    "Acme") for human-friendly logs/SyncResult, *page_ids* for Notion
-    relations, and *label_paths* (full nested names) for downstream Drive
-    folder placement. All three lists are aligned in sorted-by-label-path
-    order, so the same thread always picks projects in the same order
-    regardless of how Gmail orders labels.
-
-    Dual-labeled threads return multiple entries. The `Project` relation on
-    each row is set to all of them — Notion relations are multi-target. This
-    is intentional: when the team genuinely runs an email across two projects,
-    we don't want to silently drop one.
+    Label IDs (not names) because the project match keys on the stable
+    `ProjectLabel.gmail_label_id` — a label ID survives a project rename, the
+    name does not. See `watches.resolve_projects_for_labels`.
     """
-    matched = sorted(thread_label_names & project_map.keys())
-    titles = [project_map[name]["title"] for name in matched]
-    ids = [project_map[name]["id"] for name in matched]
-    return titles, ids, matched
+    ids: set[str] = set()
+    for msg in messages:
+        ids.update(msg.label_ids)
+    return ids
+
+
+def _projects_from_matches(
+    matches: list[tuple[str, str]],
+) -> tuple[list[str], list[str], list[str]]:
+    """Turn `(notion_page_id, label_path)` matches into the three aligned lists
+    sync_thread needs: (names, page_ids, label_paths).
+
+    - *names*: leaf of the label path (e.g. "1228_Metropolis_Versalen") for logs.
+    - *page_ids*: Notion page IDs for the (multi-target) Project relation.
+    - *label_paths*: full nested paths, split downstream for Drive folders.
+
+    Sorted by label path so a thread always picks projects in the same order
+    regardless of the DB row / Gmail label ordering. Dual-labeled threads keep
+    every match — Notion relations are multi-target and the team treats this as
+    "this email is shared across projects" rather than "pick one."
+    """
+    ordered = sorted(matches, key=lambda m: m[1])
+    page_ids = [page_id for page_id, _ in ordered]
+    label_paths = [name for _, name in ordered]
+    names = [name.rsplit("/", 1)[-1] for _, name in ordered]
+    return names, page_ids, label_paths
 
 
 # ============================================================

@@ -12,51 +12,37 @@ from __future__ import annotations
 import asyncio
 
 from gb_automations.config import EMAILS_PROPS
-from gb_automations.sync.sync_thread import _assemble_row_props, _pick_projects
+from gb_automations.sync.sync_thread import _assemble_row_props, _projects_from_matches
 
 
-def test_pick_projects_returns_all_matches_sorted():
-    project_map = {
-        "Prosjekt/2026/Bravo": {"id": "page-b", "title": "Bravo", "created_time": ""},
-        "Prosjekt/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
-        "Prosjekt/2026/Other": {"id": "page-o", "title": "Other", "created_time": ""},
-    }
-    labels = {"INBOX", "Prosjekt/2026/Bravo", "Prosjekt/2026/Alpha"}
+def test_projects_from_matches_returns_all_sorted():
+    # (notion_page_id, label_path) as returned by resolve_projects_for_labels,
+    # deliberately out of order — must come back sorted by label path.
+    matches = [
+        ("page-b", "Prosjekt/2026/Bravo"),
+        ("page-a", "Prosjekt/2026/Alpha"),
+    ]
 
-    titles, ids, label_paths = _pick_projects(labels, project_map)
+    names, ids, label_paths = _projects_from_matches(matches)
 
-    # Sorted by full label path, so order is deterministic across re-syncs even
-    # when Gmail returns labels in a different order.
-    assert titles == ["Alpha", "Bravo"]
+    assert names == ["Alpha", "Bravo"]
     assert ids == ["page-a", "page-b"]
     assert label_paths == ["Prosjekt/2026/Alpha", "Prosjekt/2026/Bravo"]
 
 
-def test_pick_projects_returns_empty_when_no_label_matches():
-    project_map = {
-        "Prosjekt/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
-    }
-    labels = {"INBOX", "SENT", "Prosjekt/2025/Bravo"}  # different year, no match
-
-    titles, ids, label_paths = _pick_projects(labels, project_map)
-
-    assert titles == []
-    assert ids == []
-    assert label_paths == []
+def test_projects_from_matches_empty():
+    assert _projects_from_matches([]) == ([], [], [])
 
 
-def test_pick_projects_single_match_returns_one_element_list():
-    project_map = {
-        "Prosjekt/2026/Alpha": {"id": "page-a", "title": "Alpha", "created_time": ""},
-        "Prosjekt/2026/Bravo": {"id": "page-b", "title": "Bravo", "created_time": ""},
-    }
-    labels = {"Prosjekt/2026/Alpha"}
+def test_projects_from_matches_single():
+    names, ids, label_paths = _projects_from_matches(
+        [("page-a", "Prosjekt/2026/1228_Metropolis_Versalen")]
+    )
 
-    titles, ids, label_paths = _pick_projects(labels, project_map)
-
-    assert titles == ["Alpha"]
+    # name is the leaf of the nested label path, used for human-friendly logs.
+    assert names == ["1228_Metropolis_Versalen"]
     assert ids == ["page-a"]
-    assert label_paths == ["Prosjekt/2026/Alpha"]
+    assert label_paths == ["Prosjekt/2026/1228_Metropolis_Versalen"]
 
 
 def test_assemble_row_props_writes_multi_target_project_relation():
