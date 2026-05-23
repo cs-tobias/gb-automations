@@ -270,6 +270,12 @@ SYNC_QUEUE_STATUS_FAILED = "Failed"
 #   🔄 syncing now · ⚠️ failed once, retrying · 🛑 failed (needs attention) · ✅ synced/idle
 # The property name lives here; edit it to match the column you add in Notion.
 PROJECTS_SYNC_PROP = "Sync"
+# Sibling rich-text property to PROJECTS_SYNC_PROP. The queue worker writes
+# "<done>/<total>" here while a project has active/failed tasks, so the user
+# can see live progress (e.g. "11/23") next to the icon during a project
+# resync. Cleared when the project goes idle, same condition as the ✅ icon.
+# Field name lives here; edit to match the column you add in Notion.
+PROJECTS_SYNC_PROGRESS_PROP = "Sync progress"
 PROJECT_SYNC_ACTIVE = "🔄"
 PROJECT_SYNC_RETRYING = "⚠️"
 PROJECT_SYNC_FAILED = "🛑"

@@ -16,6 +16,7 @@ from gb_automations.config import (
     COMPANIES_PROPS,
     CONTACTS_PROPS,
     EMAILS_PROPS,
+    PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
     SYNC_QUEUE_PROPS,
     TASKS_PROPS,
@@ -733,6 +734,30 @@ async def set_project_sync_status(project_page_id: str, option_name: str | None)
                 json={"properties": {PROJECTS_SYNC_PROP: value}},
             ),
             op_name=f"PATCH /pages/{project_page_id} sync-status",
+        )
+        _raise_for_status(response)
+
+
+async def set_project_sync_progress(project_page_id: str, text: str | None) -> None:
+    """Set (or clear) the live "<done>/<total>" progress text on a Projects-DB page.
+
+    Sibling to set_project_sync_status — the worker writes "11/23" here while a
+    project's sync_tasks are in flight, and clears it (text=None) when the
+    project goes idle. Best-effort: if the user hasn't added the property to
+    Notion, the PATCH 400s and the caller logs+ignores (same pattern as the
+    status writer above).
+    """
+    if text:
+        value: dict[str, Any] = {"rich_text": [{"text": {"content": text}}]}
+    else:
+        value = {"rich_text": []}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}",
+                json={"properties": {PROJECTS_SYNC_PROGRESS_PROP: value}},
+            ),
+            op_name=f"PATCH /pages/{project_page_id} sync-progress",
         )
         _raise_for_status(response)
 

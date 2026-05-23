@@ -324,6 +324,41 @@ async def project_sync_state(project_page_id: str) -> str:
         return "idle"
 
 
+async def project_sync_progress(project_page_id: str) -> tuple[int, int]:
+    """Return (done, total) sync_tasks counts for one project.
+
+    Used by the Projects-DB live progress counter ("11/23") that sits next to
+    the ✅/🔄 icon. Same authoritative source (sync_tasks) as project_sync_state,
+    so the icon and the number can't drift from each other.
+
+      done  = count of status='done'.
+      total = done + pending + in_progress + failed.
+
+    `total == 0` is the caller's signal to clear the Notion field (no tasks
+    have ever existed for this project, or all rows have been swept). A
+    partially-failed project keeps the last `done/total` visible until the
+    failure is resolved (same logic as the 🛑 icon — both stick around).
+    """
+    async with SessionLocal() as session:
+        # One grouped count is cheaper than four scalar selects (still O(rows
+        # for this project), but with a single round-trip).
+        rows = (
+            await session.execute(
+                select(SyncTask.status, func.count(SyncTask.id))
+                .where(SyncTask.project_page_id == project_page_id)
+                .group_by(SyncTask.status)
+            )
+        ).all()
+    by_status = {status: n for status, n in rows}
+    done = by_status.get("done", 0)
+    in_play = (
+        by_status.get("pending", 0)
+        + by_status.get("in_progress", 0)
+        + by_status.get("failed", 0)
+    )
+    return done, done + in_play
+
+
 async def status_counts() -> dict[str, int]:
     """{status: count} across the whole queue. Cheap; used for log narration."""
     async with SessionLocal() as session:

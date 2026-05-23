@@ -90,22 +90,48 @@ async def remove(thread_id: str) -> None:
 
 
 async def refresh_project_dot(project_page_id: str | None) -> None:
-    """Recompute and write a project's 🟢/🔴/⚪ sync dot from its queue tasks.
+    """Recompute and write a project's sync icon + live "<done>/<total>" counter.
 
     Reads the authoritative state from sync_tasks (active > failed > idle), so
-    it's correct even when several threads for the same project overlap — a dot
-    only goes idle once NO task for the project is pending/in_progress/failed.
-    Best-effort and a no-op when the dot isn't enabled or the project is unknown.
+    it's correct even when several threads for the same project overlap — the
+    icon only goes idle once NO task for the project is pending/in_progress/failed.
+    The progress counter ticks up on each completed task and clears when the
+    project goes idle (same condition as the ✅ icon). A partially-failed
+    project keeps the last "22/23" visible alongside the 🛑.
+
+    Best-effort throughout: status and progress writes are independent try/except
+    so a failure on one can't suppress the other, and either failing is logged
+    but never raised (the Notion mirror is a convenience; sync_tasks remains
+    the source of truth, observable via /debug/queue).
     """
     if not _dot_enabled() or not project_page_id:
         return
     # Imported here (not at module top) to avoid a queue ↔ mirror import cycle.
-    from gb_automations.sync.queue import project_sync_state
+    from gb_automations.sync.queue import project_sync_progress, project_sync_state
 
+    state: str | None = None
     try:
         state = await project_sync_state(project_page_id)
-        await notion_client.set_project_sync_status(project_page_id, PROJECT_SYNC_OPTION[state])
+        await notion_client.set_project_sync_status(
+            project_page_id, PROJECT_SYNC_OPTION[state]
+        )
     except Exception:
         logger.warning(
-            "project-dot: refresh failed for %s", project_page_id, exc_info=True
+            "project-dot: status refresh failed for %s", project_page_id, exc_info=True
+        )
+
+    try:
+        done, total = await project_sync_progress(project_page_id)
+        # Clear the counter when nothing's in play (same condition as ✅).
+        # A partially-failed project (state=='failed', total>0) keeps its last
+        # "22/23" visible until the user retries — matches the sticky 🛑.
+        if total == 0 or state == "idle":
+            await notion_client.set_project_sync_progress(project_page_id, None)
+        else:
+            await notion_client.set_project_sync_progress(
+                project_page_id, f"{done}/{total}"
+            )
+    except Exception:
+        logger.warning(
+            "project-dot: progress refresh failed for %s", project_page_id, exc_info=True
         )

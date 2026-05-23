@@ -1777,7 +1777,21 @@ async def _evict_if_stale_content_dedup(
     try:
         live = await notion_client.page_is_live(cached.notion_page_id)
     except Exception:
+        # Log the exception (was silently swallowed before — we got production
+        # reports of the dedup branch still hitting archived pages after the
+        # supposed self-heal, and we couldn't tell from logs whether the
+        # liveness check raised or returned True).
+        logger.exception(
+            "    content-dedup liveness check raised for page %s — leaving entry, "
+            "downstream patch will surface any real issue",
+            cached.notion_page_id,
+        )
         return False
+    logger.info(
+        "    content-dedup liveness for page %s → live=%s",
+        cached.notion_page_id,
+        live,
+    )
     if live:
         return False
     logger.info(

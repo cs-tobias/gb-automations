@@ -32,7 +32,8 @@
       "Bash(find \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\" -name \"notion_emails_db.py\" -o -name \"notion.py\")",
       "Bash(xargs grep -l \"find_email_row_by_message_id\")",
       "Bash(python -m py_compile src/gb_automations/sync/sync_thread.py src/gb_automations/models.py migrations/versions/a7b8c9d0e1f2_add_email_content_dedup.py)",
-      "Bash(python -m py_compile src/gb_automations/utils/email_cleaning.py src/gb_automations/sync/sync_thread.py tests/test_email_cleaning.py)"
+      "Bash(python -m py_compile src/gb_automations/utils/email_cleaning.py src/gb_automations/sync/sync_thread.py tests/test_email_cleaning.py)",
+      "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/sync/queue.py src/gb_automations/clients/notion.py src/gb_automations/sync/queue_mirror.py)"
     ]
   }
 }
