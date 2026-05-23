@@ -619,13 +619,33 @@ async def archive_page(page_id: str) -> None:
     ~30 days), which is enough for our dedup readers — `find_email_row_by_message_id`
     and `has_any_row_for_thread` both filter out `archived`/`in_trash` pages, so
     the row becomes invisible and re-sync recreates it fresh.
+
+    When the page is ALREADY archived, Notion returns 400 "Can't edit block
+    that is archived. You must unarchive the block before editing." That's
+    semantically a no-op success for us (goal: page archived → already met),
+    so we swallow that specific 400 rather than treating it as an error. Lets
+    `resync_project` survive an old list of page ids that includes pages a
+    previous resync already archived (which used to log noisy ERROR + traceback
+    on every duplicate-archive attempt).
     """
     async with _client() as client:
-        response = await _with_retries(
-            lambda: client.patch(f"/pages/{page_id}", json={"archived": True}),
-            op_name=f"PATCH /pages/{page_id} archive",
-        )
-        _raise_for_status(response)
+        try:
+            response = await _with_retries(
+                lambda: client.patch(f"/pages/{page_id}", json={"archived": True}),
+                op_name=f"PATCH /pages/{page_id} archive",
+            )
+            _raise_for_status(response)
+        except NotionAPIError as err:
+            # 400 with "archived" in the message = page is already archived.
+            # Treat as success; any other 400/5xx still propagates.
+            if (
+                err.status_code == 400
+                and isinstance(err.body, dict)
+                and "archived" in (err.body.get("message") or "").lower()
+            ):
+                logger.debug("archive_page: %s already archived — no-op", page_id)
+                return
+            raise
 
 
 # ============================================================

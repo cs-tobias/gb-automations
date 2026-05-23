@@ -325,27 +325,52 @@ async def project_sync_state(project_page_id: str) -> str:
 
 
 async def project_sync_progress(project_page_id: str) -> tuple[int, int]:
-    """Return (done, total) sync_tasks counts for one project.
+    """Return (done_in_current_batch, total_in_current_batch) for one project.
 
-    Used by the Projects-DB live progress counter ("11/23") that sits next to
-    the ✅/🔄 icon. Same authoritative source (sync_tasks) as project_sync_state,
-    so the icon and the number can't drift from each other.
+    Powers the Projects-DB live "<done>/<total>" counter next to the ✅/🔄 icon.
+    Mirrors the per-consumer N/M the queue worker logs ("▶ task 5/23 …"), but
+    scoped to one project: as a resync of 23 threads progresses, the field
+    should tick 1/23 → 2/23 → … → 23/23 → blank, NOT 94/116 → 95/116 (which
+    would happen with a naive lifetime count including historical done rows).
 
-      done  = count of status='done'.
-      total = done + pending + in_progress + failed.
+    A "batch" for a project is defined implicitly the same way the worker
+    defines it: the active period from the moment the queue is non-empty until
+    it next drains. Concretely: the anchor is the oldest non-done task for
+    this project; the batch is every task with enqueued_at >= anchor. When
+    every task is done there is no anchor — we return (0, 0) and the caller
+    clears the Notion field.
 
-    `total == 0` is the caller's signal to clear the Notion field (no tasks
-    have ever existed for this project, or all rows have been swept). A
-    partially-failed project keeps the last `done/total` visible until the
-    failure is resolved (same logic as the 🛑 icon — both stick around).
+    A partially-failed project keeps its last `done/total` visible (the anchor
+    is the oldest failed task) — same sticky behavior as the 🛑 icon.
     """
     async with SessionLocal() as session:
-        # One grouped count is cheaper than four scalar selects (still O(rows
-        # for this project), but with a single round-trip).
+        # 1. Find the oldest task for this project that's NOT done. This is
+        #    the start of the "current batch."
+        anchor_row = (
+            await session.execute(
+                select(SyncTask.enqueued_at)
+                .where(
+                    SyncTask.project_page_id == project_page_id,
+                    SyncTask.status != "done",
+                )
+                .order_by(SyncTask.enqueued_at.asc())
+                .limit(1)
+            )
+        ).first()
+        if anchor_row is None:
+            # Everything for this project is already done. No active batch.
+            return 0, 0
+        anchor = anchor_row[0]
+
+        # 2. Count batch members (this project, enqueued at-or-after anchor),
+        #    grouped by status. Same single round-trip as before.
         rows = (
             await session.execute(
                 select(SyncTask.status, func.count(SyncTask.id))
-                .where(SyncTask.project_page_id == project_page_id)
+                .where(
+                    SyncTask.project_page_id == project_page_id,
+                    SyncTask.enqueued_at >= anchor,
+                )
                 .group_by(SyncTask.status)
             )
         ).all()

@@ -330,6 +330,22 @@ async def _pending_now() -> int:
     return (await status_counts()).get("pending", 0)
 
 
+def _rss_mb() -> float:
+    """Current process RSS in MiB, read from /proc/self/status. Lightweight
+    diagnostic for tracking whether memory grows linearly across a batch
+    (= leak somewhere) or stays bounded (= host pressure is the issue).
+    Returns 0.0 if /proc isn't readable (e.g. macOS dev), so logging stays safe.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0  # kB → MiB
+    except OSError:
+        pass
+    return 0.0
+
+
 async def _consumer(name: int) -> None:
     """One consumer loop: drain the queue (narrating N/M), then wait or poll.
 
@@ -361,16 +377,23 @@ async def _consumer(name: int) -> None:
         if batch_pos == 1:  # idle → busy: announce the batch
             failed = (await status_counts()).get("failed", 0)
             logger.info(
-                "📋 queue: %d to process%s — starting",
+                "📋 queue: %d to process%s — starting (RSS %.0fMiB)",
                 total,
                 f", {failed} parked as failed" if failed else "",
+                _rss_mb(),
             )
         progress = f"{batch_pos}/{total}"
+        # Per-task RSS log: lets us see (in the next prod resync's logs) whether
+        # memory climbs linearly across the batch (= leak) or stays bounded
+        # (= the production PC just doesn't have enough headroom — host issue,
+        # not code). Cheap: a single /proc read per task, microseconds.
+        logger.info("   mem rss=%.0fMiB before task %s", _rss_mb(), progress)
 
         try:
             await _process(claimed, progress)
         except Exception:
             logger.exception("queue consumer %d hit an unexpected error", name)
+        logger.info("   mem rss=%.0fMiB after task %s", _rss_mb(), progress)
 
 
 async def run_worker() -> None:
