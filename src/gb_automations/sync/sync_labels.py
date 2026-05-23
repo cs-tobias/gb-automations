@@ -258,9 +258,17 @@ async def _reconcile_label_for_all_users(
 
 
 async def _sync_nas_folder_for_project(
-    notion_page_id: str, title: str, created_time: str | None
+    notion_page_id: str,
+    title: str,
+    created_time: str | None,
+    disciplines: list[str] | None = None,
 ) -> str:
-    """Create or rename the project's folder on the office NAS.
+    """Create or rename the project's folder structure on the office NAS.
+
+    `disciplines` are the raw Notion `Disipliner` labels; they decide which
+    discipline-conditional branches get created (the NAS layer normalizes and
+    filters them). Re-read from Notion each sync — not persisted — so a
+    discipline added in Notion gets its folders on the next sync.
 
     Best-effort and fully decoupled from the Gmail-label step: a down or
     unmounted share (or any filesystem error) is logged and reported, never
@@ -282,19 +290,24 @@ async def _sync_nas_folder_for_project(
 
             if row is None:
                 target = await asyncio.to_thread(
-                    nas_client.ensure_project_folders, title, created_time
+                    nas_client.ensure_project_folders, title, created_time, disciplines
                 )
                 outcome = "created"
             elif row.current_name != title:
                 target = await asyncio.to_thread(
-                    nas_client.rename_project_folder, row.current_name, title, created_time
+                    nas_client.rename_project_folder,
+                    row.current_name,
+                    title,
+                    created_time,
+                    disciplines,
                 )
                 outcome = "renamed"
             else:
-                # Unchanged name — still ensure the folder exists, so a folder a
-                # user deleted by hand gets healed on the next click.
+                # Unchanged name — still ensure the structure exists, so a folder
+                # a user deleted by hand (or a discipline added in Notion since
+                # the last sync) gets healed/created on the next click.
                 target = await asyncio.to_thread(
-                    nas_client.ensure_project_folders, title, created_time
+                    nas_client.ensure_project_folders, title, created_time, disciplines
                 )
                 outcome = "unchanged"
 
@@ -364,7 +377,10 @@ async def sync_project_labels(project_page_id: str) -> LabelSyncResult:
     else:
         logger.info("↳ gmail label sync skipped (SYNC_GMAIL_LABELS=false)")
 
-    result.nas_action = await _sync_nas_folder_for_project(project_page_id, title, created_time)
+    disciplines = notion_client.disciplines_from_page(page)
+    result.nas_action = await _sync_nas_folder_for_project(
+        project_page_id, title, created_time, disciplines
+    )
     if result.nas_action != "skipped":
         logger.info("↳ NAS folder %s", result.nas_action)
 

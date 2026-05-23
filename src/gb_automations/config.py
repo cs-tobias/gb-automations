@@ -297,6 +297,32 @@ PROJECT_SYNC_OPTION = {
 PROJECTS_LABEL_PREFIX = "Prosjekt"
 
 
+# Project disciplines — which branches of Goldbox's NAS folder template get
+# created for a project. Read from a multi-select property on the Projects DB.
+PROJECTS_DISCIPLINES_PROP = "Disipliner"
+
+# Notion multi-select label (lowercased) → canonical discipline key.
+DISCIPLINE_KEYS = {
+    "interiør": "interior",
+    "eksteriør": "exterior",
+    "animasjon": "animation",
+}
+
+# Canonical key → on-disk folder name. The template spells the animation folder
+# differently by location ("Animation" under Arbeidsfiler/3ds max/scenes vs
+# "Animasjon" under Media), so the mapping is split per location.
+DISCIPLINE_FOLDER_SCENES = {
+    "interior": "Interioer",
+    "exterior": "Eksterioer",
+    "animation": "Animation",
+}
+DISCIPLINE_FOLDER_MEDIA = {
+    "interior": "Interioer",
+    "exterior": "Eksterioer",
+    "animation": "Animasjon",
+}
+
+
 # Notion's multi-select API supports exactly these 10 colors. "default" is the
 # greyish unstyled chip we want to avoid — leaving it out makes every tag chip
 # carry a real color.

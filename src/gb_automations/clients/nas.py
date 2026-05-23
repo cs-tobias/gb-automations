@@ -23,13 +23,100 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
-from gb_automations.config import settings
+from gb_automations.config import (
+    DISCIPLINE_FOLDER_MEDIA,
+    DISCIPLINE_FOLDER_SCENES,
+    DISCIPLINE_KEYS,
+    settings,
+)
 from gb_automations.utils.labels import project_path_parts
 
 logger = logging.getLogger(__name__)
+
+
+# Goldbox's project folder template ("Mappestruktur"). Encoded as data, not read
+# from the live template folder on the NAS, so we never replicate the OS noise
+# (.DS_Store/Thumbs.db) that lives there and so discipline filtering is explicit.
+# Paths are "/"-relative to the project dir; created with mkdir(parents=True).
+#
+# ALWAYS-CREATED — every project gets these regardless of discipline. ("Mottatt"
+# is created separately, the same as before this template existed.) The whole
+# Master subtree is here, NOT under the conditional set: its "Interioer" is a
+# fixed folder, unrelated to the Interiør discipline.
+_ALWAYS_FOLDERS: tuple[str, ...] = (
+    "Arbeidsfiler/3ds max/autoback",
+    "Arbeidsfiler/3ds max/export",
+    "Arbeidsfiler/3ds max/sceneassets/images",
+    "Arbeidsfiler/3ds max/sceneassets/material libraries",
+    "Arbeidsfiler/3ds max/sceneassets/objects",
+    "Arbeidsfiler/3ds max/sceneassets/render presets",
+    "Arbeidsfiler/3ds max/scenes/Trinn 01/Master/Bygg/Versjoner",
+    "Arbeidsfiler/3ds max/scenes/Trinn 01/Master/Interioer/Versjoner",
+    "Arbeidsfiler/3ds max/scenes/Trinn 01/Master/Utomhus/Versjoner",
+    "Arbeidsfiler/After effects/arbeidsfiler",
+    "Arbeidsfiler/After effects/assets",
+    "Arbeidsfiler/Blender/Blender filer",
+    "Arbeidsfiler/Blender/Export",
+    "Arbeidsfiler/Blender/Maps filer",
+    "Arbeidsfiler/Marvelous/arbeidsfiler",
+    "Arbeidsfiler/Marvelous/export",
+    "Arbeidsfiler/Metashape/arbeidsfiler",
+    "Arbeidsfiler/Metashape/export",
+    "Arbeidsfiler/PureRef",
+    "Arbeidsfiler/Studio Scene",
+    "Arbeidsfiler/Syntheyes/arbeidsfiler",
+    "Arbeidsfiler/Syntheyes/export",
+    "Arbeidsfiler/Unreal",
+    "Arbeidsfiler/Zbrush/arbeidsfiler",
+    "Arbeidsfiler/Zbrush/export",
+    "Media/Finals",
+    "Media/Footage/Trinn 01",
+    "Media/Photoshop",
+    "Media/Preview",
+    "Media/Render",
+)
+
+# DISCIPLINE-CONDITIONAL parents: (parent path, which folder-name table to use).
+# For each project discipline, a child folder is created under each parent using
+# the table — "scenes" → DISCIPLINE_FOLDER_SCENES (Animation), "media" →
+# DISCIPLINE_FOLDER_MEDIA (Animasjon). Disciplines the project lacks are skipped.
+_DISCIPLINE_PARENTS: tuple[tuple[str, str], ...] = (
+    ("Arbeidsfiler/3ds max/scenes/Trinn 01", "scenes"),
+    ("Media/Finals/Trinn 01", "media"),
+    ("Media/Photoshop/Trinn 01", "media"),
+    ("Media/Preview/Trinn 01", "media"),
+    ("Media/Render/Trinn 01", "media"),
+)
+
+
+def normalize_disciplines(labels: Iterable[str]) -> set[str]:
+    """Map Notion 'Disipliner' labels to canonical keys, dropping unknowns.
+
+    >>> sorted(normalize_disciplines(["Interiør", " Animasjon "]))
+    ['animation', 'interior']
+    """
+    keys: set[str] = set()
+    for label in labels:
+        key = DISCIPLINE_KEYS.get((label or "").strip().lower())
+        if key:
+            keys.add(key)
+        elif label and label.strip():
+            logger.warning("unknown discipline label %r — ignoring", label)
+    return keys
+
+
+def _planned_folders(disciplines: set[str]) -> list[str]:
+    """All folders to create for a project with these (canonical) disciplines."""
+    folders = list(_ALWAYS_FOLDERS)
+    for parent, kind in _DISCIPLINE_PARENTS:
+        table = DISCIPLINE_FOLDER_SCENES if kind == "scenes" else DISCIPLINE_FOLDER_MEDIA
+        for key in disciplines:
+            folders.append(f"{parent}/{table[key]}")
+    return folders
 
 
 def _root() -> Path:
@@ -58,38 +145,65 @@ def project_dir(project_name: str, created_time: str | None) -> Path:
     return _root() / year / leaf
 
 
-def ensure_project_folders(project_name: str, created_time: str | None) -> Path:
-    """Create the project dir and its received subfolder. Idempotent.
+def ensure_project_folders(
+    project_name: str,
+    created_time: str | None,
+    disciplines: Iterable[str] | None = None,
+) -> Path:
+    """Create the project's full folder structure on the NAS. Idempotent.
 
-    Returns the project dir. Safe to call repeatedly — also heals a folder a
-    user deleted by hand.
+    Builds Goldbox's template tree (`_ALWAYS_FOLDERS` + the received "Mottatt"
+    folder) plus the discipline-conditional Trinn 01 subfolders for whichever
+    of `disciplines` the project has. `disciplines` are the raw Notion labels
+    (Interiør/Eksteriør/Animasjon); unknown/empty values are ignored, so a
+    project with no disciplines just gets the always-folders.
+
+    Create-only and safe to call repeatedly: every folder is mkdir(exist_ok),
+    nothing is enumerated or removed. Re-running after a discipline was ADDED in
+    Notion creates the new branches; a discipline REMOVED in Notion leaves its
+    existing folders untouched (we never delete — they may hold work). Also
+    heals a folder a user deleted by hand. Returns the project dir.
     """
     target = project_dir(project_name, created_time)
-    received = target / settings.nas_received_subfolder
-    received.mkdir(parents=True, exist_ok=True)
-    logger.info("📁 ensured NAS project folder %s (with %s/)", target, settings.nas_received_subfolder)
+    keys = normalize_disciplines(disciplines or [])
+
+    target.mkdir(parents=True, exist_ok=True)
+    (target / settings.nas_received_subfolder).mkdir(parents=True, exist_ok=True)
+    for rel in _planned_folders(keys):
+        (target / Path(rel)).mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "📁 ensured NAS project structure %s (disciplines=%s)",
+        target,
+        ", ".join(sorted(keys)) or "none",
+    )
     return target
 
 
 def rename_project_folder(
-    old_name: str, new_name: str, created_time: str | None
+    old_name: str,
+    new_name: str,
+    created_time: str | None,
+    disciplines: Iterable[str] | None = None,
 ) -> Path:
     """Rename a project's folder in place when its Notion title changed.
 
     Falls back to creating the new folder if the old one is missing (self-heal,
-    mirroring the Gmail label's 404-heal). Returns the new project dir.
+    mirroring the Gmail label's 404-heal). After a successful in-place rename we
+    also re-ensure the structure, so disciplines added in Notion since the last
+    sync get their folders even on a rename. Returns the new project dir.
     """
     old_dir = project_dir(old_name, created_time)
     new_dir = project_dir(new_name, created_time)
 
     if old_dir == new_dir:
-        return ensure_project_folders(new_name, created_time)
+        return ensure_project_folders(new_name, created_time, disciplines)
 
     if not old_dir.exists():
         logger.warning(
             "↳ NAS rename: old folder %s missing; creating %s fresh", old_dir, new_dir
         )
-        return ensure_project_folders(new_name, created_time)
+        return ensure_project_folders(new_name, created_time, disciplines)
 
     # If the destination already exists (e.g. a stale folder under the new name),
     # don't clobber it — fold the rename into an ensure so we never destroy data.
@@ -98,14 +212,15 @@ def rename_project_folder(
             "↳ NAS rename: target %s already exists; leaving both, ensuring target",
             new_dir,
         )
-        return ensure_project_folders(new_name, created_time)
+        return ensure_project_folders(new_name, created_time, disciplines)
 
     new_dir.parent.mkdir(parents=True, exist_ok=True)
     os.rename(old_dir, new_dir)
     logger.info("📁 renamed NAS project folder %s → %s", old_dir, new_dir)
-    # Ensure the received subfolder exists even if the old folder predated it.
-    (new_dir / settings.nas_received_subfolder).mkdir(parents=True, exist_ok=True)
-    return new_dir
+    # Re-ensure the full structure under the new name: keeps the received folder
+    # present even if the old folder predated it, and fills in any discipline
+    # branches added since the folder was first created.
+    return ensure_project_folders(new_name, created_time, disciplines)
 
 
 # Windows/SMB-illegal characters in a filename. Email attachment names come from

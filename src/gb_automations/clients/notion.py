@@ -16,6 +16,7 @@ from gb_automations.config import (
     COMPANIES_PROPS,
     CONTACTS_PROPS,
     EMAILS_PROPS,
+    PROJECTS_DISCIPLINES_PROP,
     PROJECTS_SYNC_PROP,
     SYNC_QUEUE_PROPS,
     settings,
@@ -218,6 +219,17 @@ def extract_page_title(page: dict[str, Any]) -> str | None:
         if prop.get("type") == "title" and prop.get("title"):
             return "".join(t.get("plain_text", "") for t in prop["title"])
     return None
+
+
+def disciplines_from_page(page: dict[str, Any]) -> list[str]:
+    """Read the project's `Disipliner` multi-select labels off a page object.
+
+    Returns the raw Notion option names (e.g. ["Interiør", "Animasjon"]) — the
+    NAS layer normalizes them to canonical keys. Empty list if the property is
+    absent (the Projects DB is operator-managed; not every workspace has it).
+    """
+    prop = (page.get("properties") or {}).get(PROJECTS_DISCIPLINES_PROP) or {}
+    return [o.get("name", "") for o in (prop.get("multi_select") or []) if o.get("name")]
 
 
 def extract_database_title(db: dict[str, Any]) -> str:
