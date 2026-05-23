@@ -1193,6 +1193,14 @@ async def _sync_single_message(
         body=cleaned_body,
     )
     if content_hit is not None:
+        # The cached page may have been archived since the dedup entry was
+        # written (typical: rebuild_thread archives all rows in Notion before
+        # re-syncing). Check liveness first; if stale, drop the entry and let
+        # the normal create path below run instead of trying to re-link to an
+        # archived page (which 400s and would silently lose the row).
+        if await _evict_if_stale_content_dedup(session, content_hit):
+            content_hit = None
+    if content_hit is not None:
         logger.info(
             "    dedup hit (content) %r from %s — re-linking to %s",
             msg.subject or "(no subject)",
@@ -1497,6 +1505,14 @@ async def _sync_extracted_message(
         body=display_body,
     )
     if content_hit is not None:
+        # Same stale-page self-heal as the regular path: rebuild_thread
+        # archives the old rows before this re-sync runs, so any dedup entry
+        # written by a previous sync now points at an archived page. Evict
+        # the stale entry and let the create path below run, instead of
+        # 400'ing on the patch and silently losing the row.
+        if await _evict_if_stale_content_dedup(session, content_hit):
+            content_hit = None
+    if content_hit is not None:
         logger.info(
             "    dedup hit (content, extracted) %r from %s — re-linking to %s",
             inner.subject or "(no subject)",
@@ -1734,6 +1750,39 @@ async def _evict_if_stale_email_row(
     logger.info(
         "    cache was stale for msg %s (page %s gone/archived) — re-resolving",
         message_id,
+        cached.notion_page_id,
+    )
+    await session.delete(cached)
+    await session.flush()
+    return True
+
+
+async def _evict_if_stale_content_dedup(
+    session: AsyncSession, cached: EmailContentDedup
+) -> bool:
+    """If the dedup entry's Notion page is gone/archived, evict it. Returns evicted?
+
+    Mirrors `_evict_if_stale_email_row` for the (project, sender, body_hash) →
+    page mapping. Without this, a `rebuild_thread` (which archives all rows for
+    a thread before re-creating them) leaves dedup entries pointing at the
+    just-archived pages — the next sync's content-dedup branch would then try
+    to re-link to an archived page and 400, then `return (0, 1)` without
+    creating a replacement row. Net result: rows silently disappear from Notion.
+
+    Self-healing: drop the stale entry, fall through to the normal create path,
+    which will write a fresh row AND a fresh dedup entry pointing at it. A
+    transient (non-stale) error re-raises, so we never throw away a good entry
+    over a network blip.
+    """
+    try:
+        live = await notion_client.page_is_live(cached.notion_page_id)
+    except Exception:
+        return False
+    if live:
+        return False
+    logger.info(
+        "    content-dedup entry stale (page %s gone/archived) — evicting, "
+        "will create a fresh row",
         cached.notion_page_id,
     )
     await session.delete(cached)
