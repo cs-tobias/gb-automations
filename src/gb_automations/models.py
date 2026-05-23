@@ -223,6 +223,31 @@ class ProjectFolder(Base):
     )
 
 
+class TaskFolder(Base):
+    """Notion task ("Oppgaver") page ↔ folders on the office NAS.
+
+    A task is one Notion row that ends up as one folder under each of the
+    project's 5 discipline-conditional parents matching the task's discipline.
+    We don't store the paths themselves — they're derived on each sync from the
+    project's current name/created_time and the task's current discipline. We
+    DO store `current_name` and `current_discipline` so a rename or discipline
+    change can be detected and moved in place rather than orphaned.
+
+    The project_page_id is denormalized for indexed lookups (e.g. "all tasks
+    for project X" when a project is renamed in the future).
+    """
+
+    __tablename__ = "task_folders"
+
+    notion_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_page_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    current_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    current_discipline: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class EmailsDbCache(Base):
     """Year → Notion DB ID for the year-partitioned Emails databases.
 
@@ -251,9 +276,10 @@ SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
 # What unit of work a row represents. 'thread' is the original (and default):
 # one Gmail thread → Notion rows via sync_thread. 'label_sync' is "reconcile +
 # create this project's Gmail label across every active mailbox" — a different
-# unit (keyed on project, no thread), dispatched on in the worker. New types go
-# here + the CHECK below + a branch in jobs/queue_worker._process.
-SYNC_TASK_TYPES = ("thread", "label_sync")
+# unit (keyed on project, no thread). 'task_folder_sync' provisions NAS folders
+# for one Notion task page (Oppgaver DB). New types go here + the CHECK below
+# + a branch in jobs/queue_worker._process.
+SYNC_TASK_TYPES = ("thread", "label_sync", "task_folder_sync")
 
 
 class SyncTask(Base):

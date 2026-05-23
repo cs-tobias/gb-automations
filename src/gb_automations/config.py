@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # parent isn't this database. If empty, the parent check is skipped (the button
     # is only placed on the Projects DB template anyway).
     projects_db_id: str = ""
+    # Optional: Notion "Oppgaver" (Tasks) DB. When set, the Notion button webhook
+    # also accepts clicks from pages in this DB and treats them as task-folder
+    # provisioning (a single task page → NAS folders under the project's
+    # discipline branches). Empty → task button clicks are rejected like before.
+    tasks_db_id: str = ""
     # Optional: live mirror of the durable sync queue so the client can watch
     # what's queued / processing / failed in Notion. If empty, the mirror is a
     # no-op (the Postgres queue still works, observable via /debug/queue).
@@ -298,10 +303,11 @@ PROJECTS_LABEL_PREFIX = "Prosjekt"
 
 
 # Project disciplines — which branches of Goldbox's NAS folder template get
-# created for a project. Read from a multi-select property on the Projects DB.
-PROJECTS_DISCIPLINES_PROP = "Disipliner"
+# created for a project. Derived as the union of `Type` values across this
+# project's tasks (Oppgaver DB), so a project has no separate discipline
+# property to maintain — the tasks are the single source of truth.
 
-# Notion multi-select label (lowercased) → canonical discipline key.
+# Notion select label (lowercased) → canonical discipline key.
 DISCIPLINE_KEYS = {
     "interiør": "interior",
     "eksteriør": "exterior",
@@ -320,6 +326,17 @@ DISCIPLINE_FOLDER_MEDIA = {
     "interior": "Interioer",
     "exterior": "Eksterioer",
     "animation": "Animasjon",
+}
+
+
+# Names of the properties on the Oppgaver (Tasks) database. The `Type`
+# single-select holds the discipline label per task (Interiør / Eksteriør /
+# Animasjon); DISCIPLINE_KEYS normalizes those to the canonical keys
+# (interior/exterior/animation) that the NAS folder code uses everywhere.
+TASKS_PROPS = {
+    "name": "Navn",          # title
+    "project": "Prosjekt",   # relation → Projects DB
+    "discipline": "Type",    # single_select: Interiør / Eksteriør / Animasjon
 }
 
 

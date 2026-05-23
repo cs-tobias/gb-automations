@@ -16,9 +16,9 @@ from gb_automations.config import (
     COMPANIES_PROPS,
     CONTACTS_PROPS,
     EMAILS_PROPS,
-    PROJECTS_DISCIPLINES_PROP,
     PROJECTS_SYNC_PROP,
     SYNC_QUEUE_PROPS,
+    TASKS_PROPS,
     settings,
 )
 
@@ -221,15 +221,39 @@ def extract_page_title(page: dict[str, Any]) -> str | None:
     return None
 
 
-def disciplines_from_page(page: dict[str, Any]) -> list[str]:
-    """Read the project's `Disipliner` multi-select labels off a page object.
+def read_relation_ids(page: dict[str, Any], prop_name: str) -> list[str]:
+    """Read the related page IDs from a relation property on `page`."""
+    prop = (page.get("properties") or {}).get(prop_name) or {}
+    return [r.get("id", "") for r in (prop.get("relation") or []) if r.get("id")]
 
-    Returns the raw Notion option names (e.g. ["Interiør", "Animasjon"]) — the
-    NAS layer normalizes them to canonical keys. Empty list if the property is
-    absent (the Projects DB is operator-managed; not every workspace has it).
+
+def task_project_id(page: dict[str, Any]) -> str | None:
+    """Return the single project page id a task is related to, or None.
+
+    A task should belong to exactly one project; if Notion has more than one
+    related page we log and use the first — Notion's UI doesn't prevent it.
     """
-    prop = (page.get("properties") or {}).get(PROJECTS_DISCIPLINES_PROP) or {}
-    return [o.get("name", "") for o in (prop.get("multi_select") or []) if o.get("name")]
+    ids = read_relation_ids(page, TASKS_PROPS["project"])
+    if len(ids) > 1:
+        logger.warning(
+            "task %s has %d Prosjekt relations; using the first (%s)",
+            page.get("id"),
+            len(ids),
+            ids[0],
+        )
+    return ids[0] if ids else None
+
+
+def task_discipline(page: dict[str, Any]) -> str | None:
+    """Return the task's `Type` single-select option name, or None if unset.
+
+    The raw label (e.g. "Interiør") is what callers pass to the NAS layer; it
+    normalizes to a canonical key via DISCIPLINE_KEYS.
+    """
+    prop = (page.get("properties") or {}).get(TASKS_PROPS["discipline"]) or {}
+    sel = prop.get("select") or {}
+    name = sel.get("name")
+    return name or None
 
 
 def extract_database_title(db: dict[str, Any]) -> str:
@@ -289,6 +313,44 @@ async def _query_projects_db(db_id: str) -> list[dict[str, Any]]:
                 break
             start_cursor = payload.get("next_cursor")
             if not start_cursor:  # defensive: has_more true but no cursor
+                break
+    return [r for r in rows if not r.get("archived") and not r.get("in_trash")]
+
+
+async def tasks_for_project(project_page_id: str) -> list[dict[str, Any]]:
+    """Every non-archived Oppgaver row that relates to this project, paginated.
+
+    Used by the project-button flow to derive which discipline branches to
+    create — the set of disciplines is "the union of Type across this
+    project's tasks", so we don't need a separate discipline field on the
+    project. Returns [] if TASKS_DB_ID is unset (feature disabled) or the
+    project has no tasks yet.
+    """
+    if not settings.tasks_db_id:
+        return []
+    filter_body = {
+        "filter": {
+            "property": TASKS_PROPS["project"],
+            "relation": {"contains": project_page_id},
+        }
+    }
+    rows: list[dict[str, Any]] = []
+    start_cursor: str | None = None
+    async with _client() as client:
+        while True:
+            body: dict[str, Any] = {"page_size": 100, **filter_body}
+            if start_cursor:
+                body["start_cursor"] = start_cursor
+            response = await client.post(
+                f"/databases/{settings.tasks_db_id}/query", json=body
+            )
+            _raise_for_status(response)
+            payload = response.json()
+            rows.extend(payload.get("results", []))
+            if not payload.get("has_more"):
+                break
+            start_cursor = payload.get("next_cursor")
+            if not start_cursor:
                 break
     return [r for r in rows if not r.get("archived") and not r.get("in_trash")]
 

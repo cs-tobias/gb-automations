@@ -265,7 +265,8 @@ async def _sync_nas_folder_for_project(
 ) -> str:
     """Create or rename the project's folder structure on the office NAS.
 
-    `disciplines` are the raw Notion `Disipliner` labels; they decide which
+    `disciplines` are the raw Notion `Type` labels (derived from this
+    project's tasks); they decide which
     discipline-conditional branches get created (the NAS layer normalizes and
     filters them). Re-read from Notion each sync — not persisted — so a
     discipline added in Notion gets its folders on the next sync.
@@ -377,7 +378,24 @@ async def sync_project_labels(project_page_id: str) -> LabelSyncResult:
     else:
         logger.info("↳ gmail label sync skipped (SYNC_GMAIL_LABELS=false)")
 
-    disciplines = notion_client.disciplines_from_page(page)
+    # Project disciplines are DERIVED from this project's tasks (Oppgaver) — the
+    # union of each task's Type select. Single source of truth: tasks own
+    # their own discipline; the project is "the set of disciplines its tasks
+    # have". A project with no tasks yet (tilbud phase) gets always-folders only.
+    # No tasks DB configured / no relation set / Notion query fails → empty list.
+    disciplines: list[str] = []
+    try:
+        task_pages = await notion_client.tasks_for_project(project_page_id)
+        for task_page in task_pages:
+            label = notion_client.task_discipline(task_page)
+            if label:
+                disciplines.append(label)
+    except Exception:
+        logger.exception(
+            "↳ failed to query tasks for project %s; provisioning always-folders only",
+            project_page_id,
+        )
+
     result.nas_action = await _sync_nas_folder_for_project(
         project_page_id, title, created_time, disciplines
     )

@@ -45,7 +45,11 @@ from gb_automations.models import EmailRow, SyncCursor, User
 from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
-from gb_automations.sync.queue import enqueue_label_sync, enqueue_threads
+from gb_automations.sync.queue import (
+    enqueue_label_sync,
+    enqueue_task_folder_sync,
+    enqueue_threads,
+)
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
 
 logger = logging.getLogger(__name__)
@@ -121,6 +125,21 @@ def _page_parented_to_projects_db(page: dict[str, Any]) -> bool:
     parent = page.get("parent") or {}
     parent_db = (parent.get("database_id") or "").replace("-", "").lower()
     target = settings.projects_db_id.replace("-", "").lower()
+    return parent_db == target
+
+
+def _page_parented_to_tasks_db(page: dict[str, Any]) -> bool:
+    """Parent check: page is a row in the configured Tasks (Oppgaver) database.
+
+    Unlike the Projects check, an unset TASKS_DB_ID means "task webhooks
+    disabled" rather than "skip the check" — we never want to misroute a
+    project-button click as a task-folder sync. Returns False if unset.
+    """
+    if not settings.tasks_db_id:
+        return False
+    parent = page.get("parent") or {}
+    parent_db = (parent.get("database_id") or "").replace("-", "").lower()
+    target = settings.tasks_db_id.replace("-", "").lower()
     return parent_db == target
 
 
@@ -327,6 +346,43 @@ async def _notion_webhook_impl(request: Request) -> Response:
     except Exception as err:
         logger.exception("Failed to fetch Notion page %s", page_id)
         raise HTTPException(502, f"Notion fetch failed: {err}") from err
+
+    # Diagnostic: log the parent DB so a misrouted click (e.g. a button on a task
+    # row that's set to send the related Prosjekt page) is obvious in the log
+    # without guessing which DB the click came from.
+    parent_db = (page.get("parent") or {}).get("database_id")
+    logger.info("↳ click parent.database_id=%s page=%s", parent_db, page_id)
+
+    # Tasks DB takes priority: same button on a task row → task-folder sync.
+    # The project-DB check below is a `True` no-op if PROJECTS_DB_ID is unset
+    # (used as "skip the gate" for dev), so we check tasks first to avoid a
+    # task-row click being misrouted as a project sync in that mode.
+    if _page_parented_to_tasks_db(page):
+        title = notion_client.extract_page_title(page)
+        if not title:
+            logger.info("↳ task %s has no title yet, skipping", page_id)
+            return _json(
+                {
+                    "page_id": page_id,
+                    "action": "skipped",
+                    "reason": "task has no title yet",
+                }
+            )
+        inserted = await enqueue_task_folder_sync(page_id)
+        queue_worker.wake()
+        logger.info(
+            "📋 task folder sync requested for %r (page %s) — %s",
+            title,
+            page_id,
+            "enqueued" if inserted else "already queued",
+        )
+        return _json(
+            {
+                "page_id": page_id,
+                "action": "queued" if inserted else "already_queued",
+                "kind": "task_folder_sync",
+            }
+        )
 
     if not _page_parented_to_projects_db(page):
         logger.warning("↳ page %s is not in the Projects DB; rejecting", page_id)

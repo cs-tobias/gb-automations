@@ -33,7 +33,7 @@ from gb_automations.config import (
     DISCIPLINE_KEYS,
     settings,
 )
-from gb_automations.utils.labels import project_path_parts
+from gb_automations.utils.labels import _sanitize_leaf, project_path_parts
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ _DISCIPLINE_PARENTS: tuple[tuple[str, str], ...] = (
 
 
 def normalize_disciplines(labels: Iterable[str]) -> set[str]:
-    """Map Notion 'Disipliner' labels to canonical keys, dropping unknowns.
+    """Map Notion `Type` labels to canonical keys, dropping unknowns.
 
     >>> sorted(normalize_disciplines(["Interiør", " Animasjon "]))
     ['animation', 'interior']
@@ -221,6 +221,150 @@ def rename_project_folder(
     # present even if the old folder predated it, and fills in any discipline
     # branches added since the folder was first created.
     return ensure_project_folders(new_name, created_time, disciplines)
+
+
+# ─── Task folders ───────────────────────────────────────────────────────────
+#
+# A Notion task ("Oppgaver" row) gets one folder per project-discipline parent
+# whose discipline matches the task's. The set of parents IS the project's
+# `_DISCIPLINE_PARENTS` — using them keeps task folders aligned with the project
+# structure for free (and lets Frame.io reuse the same spec later).
+
+
+def _task_parent_dirs(project_dir_path: Path, discipline_key: str) -> list[Path]:
+    """Return the 5 absolute parents a task folder lives under for a discipline.
+
+    `discipline_key` is the canonical key ('interior'/'exterior'/'animation').
+    Each parent dir = <project>/<discipline-parent>/<discipline-folder-name>,
+    where the per-kind name table picks 'Animation' under scenes vs 'Animasjon'
+    under Media (the same location quirk the project layer encodes).
+    """
+    parents: list[Path] = []
+    for parent_rel, kind in _DISCIPLINE_PARENTS:
+        table = DISCIPLINE_FOLDER_SCENES if kind == "scenes" else DISCIPLINE_FOLDER_MEDIA
+        folder = table.get(discipline_key)
+        if folder is None:
+            # discipline_key not in the table is a programming error (caller
+            # should have normalized first). Skip rather than crash.
+            continue
+        parents.append(project_dir_path / Path(parent_rel) / folder)
+    return parents
+
+
+def ensure_task_folders(
+    project_name: str,
+    created_time: str | None,
+    task_name: str,
+    discipline_label: str,
+) -> list[Path]:
+    """Create the task's folders under the project's discipline branches.
+
+    `discipline_label` is the raw Notion `Type` option (e.g. "Interiør");
+    we normalize via DISCIPLINE_KEYS. Unknown/empty disciplines yield an empty
+    list (logged), so the caller can decide whether that's a soft skip. The
+    task name is `_sanitize_leaf`'d to keep SMB-illegal chars off the share —
+    the same sanitizer the project leaf uses, so a task and its folder name
+    stay byte-identical.
+
+    Idempotent: every dir is mkdir(exist_ok). Returns the list of task dirs
+    (created or pre-existing).
+    """
+    keys = normalize_disciplines([discipline_label])
+    if not keys:
+        return []
+    key = next(iter(keys))  # tasks have exactly one discipline
+    leaf = _sanitize_leaf(task_name)
+    if not leaf:
+        logger.warning("task name %r sanitizes to empty; nothing to create", task_name)
+        return []
+    proj_dir = project_dir(project_name, created_time)
+    task_dirs: list[Path] = []
+    for parent in _task_parent_dirs(proj_dir, key):
+        task_dir = parent / leaf
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task_dirs.append(task_dir)
+    logger.info(
+        "📁 ensured %d NAS task folder(s) for %r (discipline=%s) under %s",
+        len(task_dirs),
+        leaf,
+        key,
+        proj_dir.name,
+    )
+    return task_dirs
+
+
+def rename_task_folders(
+    project_name: str,
+    created_time: str | None,
+    old_task_name: str,
+    new_task_name: str,
+    old_discipline_label: str,
+    new_discipline_label: str,
+) -> list[Path]:
+    """Move a task's folders in place when its name and/or discipline changed.
+
+    For each of the 5 NEW parents (driven by `new_discipline_label`):
+      - if the matching OLD folder exists AND the NEW path doesn't → os.rename;
+      - otherwise → mkdir(exist_ok) on the new path.
+    Files in an old folder we couldn't move (e.g. NEW target already exists)
+    are LEFT IN PLACE — we never delete on the live NAS. The old folder is
+    visibly orphaned for the user to deal with; nothing is silently lost.
+
+    Returns the list of new task dirs (the canonical target of each parent).
+    """
+    new_keys = normalize_disciplines([new_discipline_label])
+    if not new_keys:
+        return []
+    new_key = next(iter(new_keys))
+    new_leaf = _sanitize_leaf(new_task_name)
+    if not new_leaf:
+        logger.warning(
+            "new task name %r sanitizes to empty; nothing to do", new_task_name
+        )
+        return []
+    proj_dir = project_dir(project_name, created_time)
+
+    # Compute the matching old-parent for each new-parent so the move is
+    # parent-pair aware. We rely on _DISCIPLINE_PARENTS being a fixed-order
+    # tuple — _task_parent_dirs walks it in the same order both times.
+    old_parents: list[Path] = []
+    old_keys = normalize_disciplines([old_discipline_label])
+    if old_keys:
+        old_key = next(iter(old_keys))
+        old_parents = _task_parent_dirs(proj_dir, old_key)
+    new_parents = _task_parent_dirs(proj_dir, new_key)
+    old_leaf = _sanitize_leaf(old_task_name)
+
+    task_dirs: list[Path] = []
+    for idx, new_parent in enumerate(new_parents):
+        new_task_dir = new_parent / new_leaf
+        old_task_dir = (
+            old_parents[idx] / old_leaf if idx < len(old_parents) and old_leaf else None
+        )
+
+        if (
+            old_task_dir is not None
+            and old_task_dir != new_task_dir
+            and old_task_dir.exists()
+            and not new_task_dir.exists()
+        ):
+            new_task_dir.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(old_task_dir, new_task_dir)
+            logger.info("📁 renamed NAS task folder %s → %s", old_task_dir, new_task_dir)
+        else:
+            new_task_dir.mkdir(parents=True, exist_ok=True)
+            if (
+                old_task_dir is not None
+                and old_task_dir != new_task_dir
+                and old_task_dir.exists()
+            ):
+                logger.warning(
+                    "↳ task rename: target %s already exists; leaving old %s untouched",
+                    new_task_dir,
+                    old_task_dir,
+                )
+        task_dirs.append(new_task_dir)
+    return task_dirs
 
 
 # Windows/SMB-illegal characters in a filename. Email attachment names come from

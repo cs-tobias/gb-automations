@@ -36,6 +36,9 @@ _ACTIVE_PREDICATE = text("status IN ('pending','in_progress')")
 # definitions (and any migration that changes them).
 _ACTIVE_THREAD_PREDICATE = text("status IN ('pending','in_progress') AND task_type = 'thread'")
 _ACTIVE_LABEL_PREDICATE = text("status IN ('pending','in_progress') AND task_type = 'label_sync'")
+_ACTIVE_TASK_FOLDER_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'task_folder_sync'"
+)
 
 
 async def enqueue_threads(
@@ -113,6 +116,36 @@ async def enqueue_label_sync(project_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["project_page_id"],
             index_where=_ACTIVE_LABEL_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_task_folder_sync(task_page_id: str) -> int:
+    """Enqueue a task-folder-sync for a Notion Oppgaver page.
+
+    Like enqueue_label_sync, but keyed on the TASK page id (not the project).
+    gmail_thread_id carries the task page id so the worker can dispatch without
+    a new column; project_page_id is left NULL — the handler resolves it from
+    the task page at process time (and a task can be re-parented without
+    rewriting the queue row). Returns 1 if newly enqueued, 0 if a duplicate.
+    """
+    if not task_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="task_folder_sync",
+            user_email="*",
+            gmail_thread_id=task_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_TASK_FOLDER_PREDICATE,
         )
     )
     async with SessionLocal() as own:

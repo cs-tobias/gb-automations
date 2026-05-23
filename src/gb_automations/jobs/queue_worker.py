@@ -34,6 +34,7 @@ from gb_automations.sync.queue import (
     status_counts,
 )
 from gb_automations.sync.sync_labels import sync_project_labels
+from gb_automations.sync.sync_tasks import sync_task_folder
 from gb_automations.sync.sync_thread import sync_thread
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,40 @@ async def _process_label_sync(claimed: _Claimed, progress: str) -> None:
     await queue_mirror.refresh_project_dot(project_page_id)
 
 
+async def _process_task_folder_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a task_folder_sync task: provision NAS folders for one Oppgaver page.
+
+    The task page id was stashed in gmail_thread_id at enqueue (no real thread).
+    Project resolution happens INSIDE sync_task_folder (off the task's relation),
+    so the queue row's project_page_id is null until the handler discovers it —
+    we refresh the project dot at the end based on what the handler reports.
+    """
+    task_page_id = claimed.gmail_thread_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing task folders for task %s%s", progress, task_page_id, retry_note
+    )
+
+    outcome_error: str | None = None
+    project_page_id: str | None = None
+    try:
+        if not task_page_id:
+            raise ValueError("task_folder_sync task has no task page id (gmail_thread_id)")
+        result = await sync_task_folder(task_page_id)
+        project_page_id = result.project_page_id
+        if result.action == "failed":
+            outcome_error = result.note or "task folder sync failed"
+    except Exception as err:
+        log_api_error(logger, f"task folder sync crashed for task {task_page_id}", err)
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(task_page_id)
+    )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(project_page_id)
+
+
 async def _process(claimed: _Claimed, progress: str) -> None:
     """Dispatch a claimed task by type and record the outcome.
 
@@ -180,6 +215,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
     """
     if claimed.task_type == "label_sync":
         await _process_label_sync(claimed, progress)
+        return
+    if claimed.task_type == "task_folder_sync":
+        await _process_task_folder_sync(claimed, progress)
         return
 
     task_id, email, thread_id, attempts, rebuild = (

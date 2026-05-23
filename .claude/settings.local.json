@@ -18,7 +18,11 @@
       "PowerShell($root = \"X:\\\\gb-nas-test\\\\Mappestruktur\"; if \\(Test-Path $root\\) { Get-ChildItem $root -Recurse -Directory | ForEach-Object { $_.FullName.Substring\\($root.Length\\).TrimStart\\('\\\\'\\) } } else { Write-Output \"NOT FOUND at $root\" })",
       "Read(//x/gb-nas-test/**)",
       "Read(//x/gb-nas-test/Mappestruktur/**)",
-      "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/nas.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)"
+      "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/nas.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)",
+      "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/notion.py src/gb_automations/clients/nas.py src/gb_automations/models.py src/gb_automations/sync/queue.py src/gb_automations/sync/sync_tasks.py src/gb_automations/jobs/queue_worker.py src/gb_automations/routes/webhooks.py migrations/versions/f1a2b3c4d5e6_add_task_folders.py)",
+      "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)",
+      "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/notion.py src/gb_automations/clients/nas.py src/gb_automations/sync/sync_labels.py src/gb_automations/sync/sync_tasks.py)",
+      "Bash(python -m py_compile src/gb_automations/clients/nas.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)"
     ]
   }
 }
