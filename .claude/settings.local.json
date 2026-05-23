@@ -22,7 +22,15 @@
       "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/notion.py src/gb_automations/clients/nas.py src/gb_automations/models.py src/gb_automations/sync/queue.py src/gb_automations/sync/sync_tasks.py src/gb_automations/jobs/queue_worker.py src/gb_automations/routes/webhooks.py migrations/versions/f1a2b3c4d5e6_add_task_folders.py)",
       "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)",
       "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/clients/notion.py src/gb_automations/clients/nas.py src/gb_automations/sync/sync_labels.py src/gb_automations/sync/sync_tasks.py)",
-      "Bash(python -m py_compile src/gb_automations/clients/nas.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)"
+      "Bash(python -m py_compile src/gb_automations/clients/nas.py src/gb_automations/clients/notion.py src/gb_automations/sync/sync_labels.py)",
+      "Bash(find \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\" -type f -name \"*.py\")",
+      "Bash(grep -n \"_sync_message\\\\|_sync_single_message\\\\|_sync_extracted_message\" \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\\\\\\\\src\\\\\\\\gb_automations\\\\\\\\sync\\\\\\\\sync_thread.py\")",
+      "Bash(grep -n \"_build_email_row_properties\\\\|EMAILS_PROPS\\\\|subject\" \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\\\\\\\\src\\\\\\\\gb_automations\\\\\\\\sync\\\\\\\\sync_thread.py\")",
+      "Bash(find \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\" -name \"config.py\" -type f)",
+      "Bash(grep -n \"EMAILS_PROPS\\\\|subject\" \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\\\\\\\\src\\\\\\\\gb_automations\\\\\\\\config.py\")",
+      "Bash(grep -n \"class ThreadAttachmentTracker\\\\|multi.*mailbox\\\\|dual.*mailbox\\\\|two mailbox\\\\|EmailRow.seen_by_email\" \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\\\\\\\\src\\\\\\\\gb_automations\\\\\\\\sync\\\\\\\\sync_thread.py\")",
+      "Bash(find \"C:\\\\\\\\Users\\\\\\\\tobia\\\\\\\\Documents\\\\\\\\Code\\\\\\\\gb-automations\" -name \"notion_emails_db.py\" -o -name \"notion.py\")",
+      "Bash(xargs grep -l \"find_email_row_by_message_id\")"
     ]
   }
 }

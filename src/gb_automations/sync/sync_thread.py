@@ -253,6 +253,7 @@ async def sync_thread(
                     created_count, skipped_count = await _sync_message(
                         msg=msg,
                         extracted=splits.get(msg.message_id, []),
+                        thread_subject=result.thread_subject,
                         project_page_ids=project_page_ids,
                         project_label_paths=project_label_paths,
                         user_email=user_email,
@@ -935,6 +936,7 @@ async def _sync_message(
     *,
     msg: gmail_client.GmailMessage,
     extracted: list[ExtractedMessage],
+    thread_subject: str,
     project_page_ids: list[str],
     project_label_paths: list[str],
     user_email: str,
@@ -979,6 +981,7 @@ async def _sync_message(
     # 1. The regex single-row path runs for every Gmail message.
     created, skipped = await _sync_single_message(
         msg=msg,
+        thread_subject=thread_subject,
         project_page_ids=project_page_ids,
         project_label_paths=project_label_paths,
         user_email=user_email,
@@ -1003,6 +1006,7 @@ async def _sync_message(
         c, s = await _sync_forwarded_chain(
             parent_msg=msg,
             extracted=extracted,
+            thread_subject=thread_subject,
             project_page_ids=project_page_ids,
             project_label_paths=project_label_paths,
             user_email=user_email,
@@ -1021,6 +1025,7 @@ async def _sync_message(
 async def _sync_single_message(
     *,
     msg: gmail_client.GmailMessage,
+    thread_subject: str,
     project_page_ids: list[str],
     project_label_paths: list[str] | None = None,
     user_email: str,
@@ -1162,6 +1167,7 @@ async def _sync_single_message(
     logger.debug("       (message_id=%s)", msg.message_id)
     properties, row_tags = await _build_email_row_properties(
         msg=msg,
+        thread_subject=thread_subject,
         project_page_ids=project_page_ids,
         user_email=user_email,
         emails_db_props=emails_db_props,
@@ -1218,6 +1224,7 @@ async def _sync_forwarded_chain(
     *,
     parent_msg: gmail_client.GmailMessage,
     extracted: list[ExtractedMessage],
+    thread_subject: str,
     project_page_ids: list[str],
     project_label_paths: list[str],
     user_email: str,
@@ -1252,6 +1259,7 @@ async def _sync_forwarded_chain(
             parent_msg=parent_msg,
             inner=inner,
             synthetic_id=synth_id,
+            thread_subject=thread_subject,
             project_page_ids=project_page_ids,
             project_label_paths=project_label_paths,
             user_email=user_email,
@@ -1272,6 +1280,7 @@ async def _sync_extracted_message(
     parent_msg: gmail_client.GmailMessage,
     inner: ExtractedMessage,
     synthetic_id: str,
+    thread_subject: str,
     project_page_ids: list[str],
     project_label_paths: list[str],
     user_email: str,
@@ -1387,6 +1396,7 @@ async def _sync_extracted_message(
         parent_msg=parent_msg,
         inner=inner,
         synthetic_id=synthetic_id,
+        thread_subject=thread_subject,
         project_page_ids=project_page_ids,
         user_email=user_email,
         emails_db_props=emails_db_props,
@@ -1519,6 +1529,7 @@ def _emails_from(raw_field: str) -> list[str]:
 async def _build_email_row_properties(
     *,
     msg: gmail_client.GmailMessage,
+    thread_subject: str,
     project_page_ids: list[str],
     user_email: str,
     emails_db_props: set[str],
@@ -1528,6 +1539,11 @@ async def _build_email_row_properties(
     """Build the Notion properties dict for a single-message Emails-DB row.
 
     Returns (props, tags); see `_assemble_row_props`.
+
+    `thread_subject` is the FIRST message's subject in the thread, reused on
+    every row so all messages in a thread group together in Notion (otherwise
+    each reply's `Re:`/`Sv:`/`Vidr:`/`SV:`/… prefix breaks the grouping). The
+    per-message `msg.subject` is intentionally discarded.
 
     `body` is the already-cleaned text the row should display — callers are
     responsible for running `clean_body` with the right `keep_image_markers`
@@ -1547,7 +1563,7 @@ async def _build_email_row_properties(
 
     return await _assemble_row_props(
         emails_db_props=emails_db_props,
-        subject=msg.subject,
+        subject=thread_subject,
         thread_id=msg.thread_id,
         message_id=msg.message_id,
         project_page_ids=project_page_ids,
@@ -1565,6 +1581,7 @@ async def _build_extracted_row_properties(
     parent_msg: gmail_client.GmailMessage,
     inner: ExtractedMessage,
     synthetic_id: str,
+    thread_subject: str,
     project_page_ids: list[str],
     user_email: str,
     emails_db_props: set[str],
@@ -1574,6 +1591,11 @@ async def _build_extracted_row_properties(
     """Build Notion properties for an LLM-extracted sub-message.
 
     Returns (props, tags); see `_assemble_row_props`.
+
+    `thread_subject` is the first message's subject, reused on every row in
+    the thread (including extracted historical rows) for consistent Notion
+    grouping. `inner.subject` (the per-extracted subject like 'VS:' / 'Vs: VS:')
+    is intentionally discarded.
 
     `body` is the display body the row should carry — caller computes it
     from `inner.raw_body` with the keep-list set to whichever attachment
@@ -1597,7 +1619,7 @@ async def _build_extracted_row_properties(
 
     return await _assemble_row_props(
         emails_db_props=emails_db_props,
-        subject=inner.subject,
+        subject=thread_subject,
         thread_id=parent_msg.thread_id,
         message_id=synthetic_id,
         project_page_ids=project_page_ids,
