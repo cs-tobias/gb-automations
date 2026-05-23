@@ -245,7 +245,12 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         await queue_mirror.mark_processing(thread_id, subject=subject)
         if project_page_id:
             await set_task_project(task_id, project_page_id)
-            await queue_mirror.refresh_project_dot(project_page_id)
+            # Live update: "we're on N/M, working on subject X". The worker's
+            # post-completion call below will overwrite this once the task is
+            # done. `progress` is the same N/M string the worker logs.
+            await queue_mirror.refresh_project_dot(
+                project_page_id, progress=progress, subject=subject
+            )
 
     try:
         if rebuild:
@@ -265,12 +270,15 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         outcome_error = describe_error(err)
         result = None
 
+    # Subject is computed up front so it's in scope for the post-completion
+    # refresh_project_dot below on both success and failure paths.
+    subject = (getattr(result, "thread_subject", None) or "").strip()
+
     async with SessionLocal() as session:
         if outcome_error is None:
             await mark_done(session, task_id)
             await session.commit()
             await queue_mirror.remove(thread_id)
-            subject = (getattr(result, "thread_subject", None) or "").strip()
             logger.info(
                 "✔ task %s done%s",
                 progress,
@@ -312,9 +320,10 @@ async def _process(claimed: _Claimed, progress: str) -> None:
     # (a task failed once but is still retrying) > 🟢 active (siblings running) >
     # ⚪ idle. Prefer the project resolved this run; fall back to the persisted one.
     # `progress` is the worker's authoritative N/M for this batch — passed
-    # through verbatim to the Notion "Sync progress" field.
+    # through verbatim to the Notion "Sync progress" field along with the
+    # subject so the field reads e.g. "5/17 - KG9 korreksjoner".
     project = resolved_project or getattr(result, "project_page_id", None)
-    await queue_mirror.refresh_project_dot(project, progress=progress)
+    await queue_mirror.refresh_project_dot(project, progress=progress, subject=subject)
 
 
 class _TaskStub:

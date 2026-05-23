@@ -736,48 +736,53 @@ async def remove_sync_queue_row(thread_id: str) -> None:
     await archive_page(existing["id"])
 
 
-async def set_project_sync_status(project_page_id: str, option_name: str | None) -> None:
-    """Set (or clear) the at-a-glance sync-status Select on a Projects-DB page.
+_PROGRESS_UNCHANGED = object()  # sentinel: "don't write the progress field this call"
 
-    `option_name` is the literal Notion select option (e.g. "🟢 Active"); None
-    clears the property. Caller is responsible for having created the property
-    and its options in Notion — a missing property surfaces as a Notion 400,
-    which the best-effort caller logs and ignores.
+
+async def set_project_sync_state(
+    project_page_id: str,
+    *,
+    status_option: str | None,
+    progress: str | None | object = _PROGRESS_UNCHANGED,
+) -> None:
+    """Write the project's at-a-glance sync state to Notion in ONE PATCH.
+
+    Combines the icon (PROJECTS_SYNC_PROP Select) and the live "<done>/<total>"
+    counter (PROJECTS_SYNC_PROGRESS_PROP rich_text) into a single request, so
+    Notion commits them atomically — no half-second lag where the icon updates
+    but the counter trails behind.
+
+    Args:
+      status_option: Notion select option name (e.g. "🔄") or None to clear.
+      progress: text like "5/17" to write, None to CLEAR the field, or the
+        sentinel `_PROGRESS_UNCHANGED` (default) to NOT include it in the
+        PATCH at all. The sentinel matters because Notion treats an absent
+        key as "leave alone" but a present key with empty rich_text as
+        "clear this field" — three distinct intents, two payload shapes.
+
+    Caller is responsible for having created both properties in Notion; a
+    missing one surfaces as a 400 which the best-effort caller logs+ignores.
     """
-    value: dict[str, Any] = (
-        {"select": {"name": option_name}} if option_name else {"select": None}
-    )
+    props: dict[str, Any] = {
+        PROJECTS_SYNC_PROP: (
+            {"select": {"name": status_option}} if status_option else {"select": None}
+        ),
+    }
+    if progress is not _PROGRESS_UNCHANGED:
+        if progress:
+            props[PROJECTS_SYNC_PROGRESS_PROP] = {
+                "rich_text": [{"text": {"content": progress}}]  # type: ignore[dict-item]
+            }
+        else:
+            props[PROJECTS_SYNC_PROGRESS_PROP] = {"rich_text": []}
+
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
                 f"/pages/{project_page_id}",
-                json={"properties": {PROJECTS_SYNC_PROP: value}},
+                json={"properties": props},
             ),
-            op_name=f"PATCH /pages/{project_page_id} sync-status",
-        )
-        _raise_for_status(response)
-
-
-async def set_project_sync_progress(project_page_id: str, text: str | None) -> None:
-    """Set (or clear) the live "<done>/<total>" progress text on a Projects-DB page.
-
-    Sibling to set_project_sync_status — the worker writes "11/23" here while a
-    project's sync_tasks are in flight, and clears it (text=None) when the
-    project goes idle. Best-effort: if the user hasn't added the property to
-    Notion, the PATCH 400s and the caller logs+ignores (same pattern as the
-    status writer above).
-    """
-    if text:
-        value: dict[str, Any] = {"rich_text": [{"text": {"content": text}}]}
-    else:
-        value = {"rich_text": []}
-    async with _client() as client:
-        response = await _with_retries(
-            lambda: client.patch(
-                f"/pages/{project_page_id}",
-                json={"properties": {PROJECTS_SYNC_PROGRESS_PROP: value}},
-            ),
-            op_name=f"PATCH /pages/{project_page_id} sync-progress",
+            op_name=f"PATCH /pages/{project_page_id} sync-state",
         )
         _raise_for_status(response)
 
