@@ -46,6 +46,7 @@ from gb_automations.db import SessionLocal
 from gb_automations.models import (
     CompanyCache,
     ContactCache,
+    EmailContentDedup,
     EmailRow,
     ProjectFolder,
     ThreadAttachment,
@@ -1159,6 +1160,62 @@ async def _sync_single_message(
         logger.debug("       (message_id=%s)", msg.message_id)
         return (0, 0)
 
+    # 3.5. Third dedup layer: content. Catches the case Gmail splits one
+    # conversation into multiple threads — the same body would otherwise land
+    # as N separate rows (once for the real Gmail message, once per quoted-
+    # history reconstruction in later threads). Keyed on (project, sender,
+    # cleaned_body); when matched, we patch the existing row's project relation
+    # and re-link its files, exactly like the message_id-dedup branches above.
+    from_email_for_dedup = _addr_to_email(msg.from_field)
+    content_hit = await _find_content_dedup(
+        session,
+        project_page_ids=project_page_ids,
+        from_email=from_email_for_dedup,
+        body=cleaned_body,
+    )
+    if content_hit is not None:
+        logger.info(
+            "    dedup hit (content) %r from %s — re-linking to %s",
+            msg.subject or "(no subject)",
+            from_email_for_dedup or "(unknown)",
+            content_hit.notion_page_id,
+        )
+        try:
+            await notion_client.patch_email_row_project(
+                content_hit.notion_page_id, project_page_ids
+            )
+        except Exception as err:
+            log_api_error(
+                logger,
+                f"    project reconciliation failed for content-dedup'd msg {msg.message_id}",
+                err,
+            )
+        await _relink_existing_row_files(
+            parent_msg=msg,
+            decisions=attachment_decisions,
+            attributed_sender=attributed_sender,
+            row_id=content_hit.notion_page_id,
+            user_email=user_email,
+            session=session,
+            emails_db_props=emails_db_props,
+            thread_tracker=tracker,
+            project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=msg.date,
+        )
+        # Pin THIS message_id to the canonical row too, so a subsequent push
+        # with the same real message_id (e.g. a later mailbox sync) short-
+        # circuits at the cheaper PK-cache layer instead of falling through
+        # to this content-hash branch again.
+        await _cache_email_row(
+            session,
+            message_id=msg.message_id,
+            thread_id=msg.thread_id,
+            notion_page_id=content_hit.notion_page_id,
+            seen_by_email=user_email,
+        )
+        return (0, 1)
+
     # 4. Create the row.
     logger.info(
         "    📝 row (gmail message): %s",
@@ -1176,6 +1233,16 @@ async def _sync_single_message(
     )
     created = await notion_client.create_email_row(properties, db_id)
     row_id = created["id"]
+    # Record (project, from, body_hash) → page mapping so a later thread that
+    # quotes this body hits the content dedup instead of creating a duplicate.
+    await _record_content_dedup(
+        session,
+        project_page_ids=project_page_ids,
+        from_email=from_email_for_dedup,
+        body=cleaned_body,
+        notion_page_id=row_id,
+        gmail_message_id=msg.message_id,
+    )
 
     # Upload attachments to Drive and set the row's Files property. Per-
     # attachment errors are logged and don't block the rest. Row already
@@ -1387,6 +1454,60 @@ async def _sync_extracted_message(
     # path uses. Safe no-op when the hint is absent or doesn't match.
     display_body = _slice_at_signature(display_body, signature_first_line_hint)
 
+    # Third dedup layer (extracted path): same body + same sender + same
+    # project as a row that already exists? Don't create a duplicate. This is
+    # the layer that catches the "Gmail split one conversation into N threads"
+    # case — each later thread's extracted history reconstructs the same body
+    # the original thread already created a row for. See _content_dedup_key.
+    from_email_for_dedup = strict_email_or_empty(inner.from_field)
+    content_hit = await _find_content_dedup(
+        session,
+        project_page_ids=project_page_ids,
+        from_email=from_email_for_dedup,
+        body=display_body,
+    )
+    if content_hit is not None:
+        logger.info(
+            "    dedup hit (content, extracted) %r from %s — re-linking to %s",
+            inner.subject or "(no subject)",
+            from_email_for_dedup or "(unknown)",
+            content_hit.notion_page_id,
+        )
+        try:
+            await notion_client.patch_email_row_project(
+                content_hit.notion_page_id, project_page_ids
+            )
+        except Exception as err:
+            log_api_error(
+                logger,
+                f"    project reconciliation failed for content-dedup'd extracted {synthetic_id}",
+                err,
+            )
+        await _relink_existing_row_files(
+            parent_msg=parent_msg,
+            decisions=decisions,
+            attributed_sender=inner_sender,
+            row_id=content_hit.notion_page_id,
+            user_email=user_email,
+            session=session,
+            emails_db_props=emails_db_props,
+            thread_tracker=tracker,
+            project_label_paths=project_label_paths or [],
+            project_page_ids=project_page_ids or [],
+            email_date=inner.date,
+        )
+        # Pin this synthetic_id to the canonical row so future syncs of the
+        # SAME quoted history short-circuit at the PK cache instead of
+        # recomputing the hash here.
+        await _cache_email_row(
+            session,
+            message_id=synthetic_id,
+            thread_id=parent_msg.thread_id,
+            notion_page_id=content_hit.notion_page_id,
+            seen_by_email=user_email,
+        )
+        return (0, 1)
+
     logger.info(
         "    📝 row (history): %s",
         _format_extraction_preview(inner.from_field, inner.subject, display_body),
@@ -1405,6 +1526,16 @@ async def _sync_extracted_message(
     )
     notion_page = await notion_client.create_email_row(properties, db_id)
     row_id = notion_page["id"]
+    # Record (project, from, body_hash) → page mapping so the same body
+    # extracted from a later thread short-circuits at the dedup layer above.
+    await _record_content_dedup(
+        session,
+        project_page_ids=project_page_ids,
+        from_email=from_email_for_dedup,
+        body=display_body,
+        notion_page_id=row_id,
+        gmail_message_id=synthetic_id,
+    )
 
     # Upload any attachments attributed to THIS historical email. Bytes live
     # on parent_msg (the forwarder's Gmail message); dedup runs against
@@ -1467,6 +1598,83 @@ async def _cache_email_row(
         .on_conflict_do_update(
             index_elements=["gmail_message_id"],
             set_={"notion_page_id": notion_page_id, "seen_by_email": seen_by_email},
+        )
+    )
+    await session.execute(stmt)
+
+
+def _content_dedup_key(
+    *, project_page_ids: list[str], from_email: str, body: str
+) -> tuple[str, str, str] | None:
+    """Build the (project, from, body_hash) lookup key for `email_content_dedup`.
+
+    Returns None when we can't safely dedup:
+    - No project matched: dedup across all projects could collapse unrelated
+      emails. Falls through to normal create.
+    - Empty body: too common a fingerprint (attachment-only / OK / Takk!) for
+      a single-character body to be a stable identity. Falls through.
+    Both cases preserve the existing message_id dedup as the only protection,
+    which is correct — content dedup only adds a layer, never weakens one.
+    """
+    if not project_page_ids or not body or not body.strip():
+        return None
+    project_pk = project_page_ids[0]
+    sender_pk = (from_email or "").strip().lower()
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return (project_pk, sender_pk, body_hash)
+
+
+async def _find_content_dedup(
+    session: AsyncSession,
+    *,
+    project_page_ids: list[str],
+    from_email: str,
+    body: str,
+) -> EmailContentDedup | None:
+    """Look up an existing row by (project, from, body_hash). None if absent."""
+    key = _content_dedup_key(
+        project_page_ids=project_page_ids, from_email=from_email, body=body
+    )
+    if key is None:
+        return None
+    return await session.get(EmailContentDedup, key)
+
+
+async def _record_content_dedup(
+    session: AsyncSession,
+    *,
+    project_page_ids: list[str],
+    from_email: str,
+    body: str,
+    notion_page_id: str,
+    gmail_message_id: str,
+) -> None:
+    """Record the (project, from, body_hash) → notion_page_id mapping.
+
+    Called after a successful row create in BOTH the regular and extracted
+    paths. The user's resync flow (`rebuild_thread`) archives old rows and
+    recreates fresh, so it goes through the create branch and naturally fills
+    the dedup table — no separate backfill on the existing-hit branches needed.
+    `on_conflict_do_nothing` because two threads syncing the same project at
+    once might both try to insert the same key — first writer wins, idempotent.
+    """
+    key = _content_dedup_key(
+        project_page_ids=project_page_ids, from_email=from_email, body=body
+    )
+    if key is None:
+        return
+    project_pk, sender_pk, body_hash = key
+    stmt = (
+        insert(EmailContentDedup)
+        .values(
+            project_page_id=project_pk,
+            from_email=sender_pk,
+            body_hash=body_hash,
+            notion_page_id=notion_page_id,
+            gmail_message_id=gmail_message_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id", "from_email", "body_hash"]
         )
     )
     await session.execute(stmt)

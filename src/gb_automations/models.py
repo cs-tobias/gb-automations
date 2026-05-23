@@ -72,6 +72,45 @@ class EmailRow(Base):
     )
 
 
+class EmailContentDedup(Base):
+    """(project, from_email, body_hash) → notion_page_id of the canonical row.
+
+    Third dedup layer for the case where Gmail splits one conversation into
+    several threads (`KG9: …`, `Svar: KG9: …`, `Svar: Svar: KG9: …`). Each
+    thread arrives independently; `sync_thread` correctly extracts historical
+    rows from quoted bodies. Without this table the same logical email body
+    would land in Notion multiple times — once for the real Gmail message and
+    once per later thread that quoted it.
+
+    The first two layers (EmailRow PK on gmail_message_id and Notion-query on
+    `Message ID`) catch the same physical message arriving in multiple
+    mailboxes. They DON'T catch identical content under different message_ids
+    (real Gmail message vs synthetic id of its extracted-from-quote replica).
+    This table closes that gap, scoped per project so generic short bodies
+    ("Takk!" / "OK") only collapse within the same project.
+
+    PK is `(project_page_id, from_email, body_hash)` — that IS the lookup key,
+    so no separate index needed. body_hash is SHA-256 hex of the SAME cleaned
+    body string we write to Notion's `Melding`; from_email is lower-cased and
+    may be empty for LLM-extracted name-only senders (an empty-empty match
+    across two rows still legitimately means "same body, same project, same
+    nameless sender" — we collapse those too).
+    """
+
+    __tablename__ = "email_content_dedup"
+
+    project_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    from_email: Mapped[str] = mapped_column(String(254), primary_key=True)
+    body_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The Gmail message id (real or synthetic) of the row that won the dedup.
+    # Informational — for debugging which message a duplicate collapsed to.
+    gmail_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class ContactCache(Base):
     """email → Notion contact page ID. Avoids Notion lookups on every sync.
 
