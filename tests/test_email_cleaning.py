@@ -1,6 +1,8 @@
 """Tests for utils/email_cleaning.py — covers English + Norwegian markers and edge cases."""
 
 from gb_automations.utils.email_cleaning import (
+    FORWARD_COMMENT_PREFIX,
+    FORWARD_NO_COMMENT_PLACEHOLDER,
     clean_body,
     count_reply_markers,
     extract_signature_block,
@@ -8,6 +10,7 @@ from gb_automations.utils.email_cleaning import (
     find_reply_boundaries,
     find_signature_start_line,
     has_quoted_history_hint,
+    is_forwarded_subject,
     looks_like_forward_block,
 )
 
@@ -527,3 +530,59 @@ def test_find_reply_boundaries_labels_are_truncated():
     assert len(bounds) == 1
     # Truncated to 120 chars per the helper's contract.
     assert len(bounds[0]) <= 120
+
+
+# ============================================================
+# is_forwarded_subject — subject-level Fwd detection for the Notion-row UX
+# ============================================================
+
+
+def test_is_forwarded_subject_english_prefixes():
+    assert is_forwarded_subject("Fwd: foo")
+    assert is_forwarded_subject("FW: foo")
+    assert is_forwarded_subject("fw: foo")  # case-insensitive
+    assert is_forwarded_subject("FWD: foo")
+
+
+def test_is_forwarded_subject_norwegian_prefixes():
+    assert is_forwarded_subject("Videresend: foo")
+    assert is_forwarded_subject("videresend: foo")
+    assert is_forwarded_subject("Vidr: foo")
+
+
+def test_is_forwarded_subject_leading_whitespace_tolerated():
+    # Some clients pad the subject with whitespace; we strip before matching.
+    assert is_forwarded_subject("  Fwd: foo  ")
+
+
+def test_is_forwarded_subject_only_leading_prefix_counts():
+    # A subject that just *mentions* "Fwd" in the middle is NOT a forward —
+    # the prefix has to lead the subject.
+    assert not is_forwarded_subject("My Fwd: thoughts")
+    assert not is_forwarded_subject("Quick Q about a Fwd: chain")
+
+
+def test_is_forwarded_subject_reply_prefixes_are_not_forwards():
+    assert not is_forwarded_subject("Re: foo")
+    assert not is_forwarded_subject("RE: foo")
+    assert not is_forwarded_subject("Sv: foo")
+    assert not is_forwarded_subject("Svar: foo")  # Norwegian reply, NOT a forward
+    assert not is_forwarded_subject("Antwort: foo")  # German reply, not in our list
+
+
+def test_is_forwarded_subject_empty_and_none():
+    assert not is_forwarded_subject("")
+    assert not is_forwarded_subject(None)
+    assert not is_forwarded_subject("   ")
+
+
+def test_is_forwarded_subject_plain_subjects():
+    assert not is_forwarded_subject("Project kickoff")
+    assert not is_forwarded_subject("KG9: 3D underlag")  # has a colon, but not a Fwd prefix
+
+
+def test_forward_constants_are_what_sync_thread_will_write():
+    # If these strings drift, the documented Notion-side UX changes silently.
+    # Pinning them here makes any future change a deliberate test update.
+    assert FORWARD_NO_COMMENT_PLACEHOLDER == "(videresendt uten kommentar)"
+    assert FORWARD_COMMENT_PREFIX == "Videresendt: "

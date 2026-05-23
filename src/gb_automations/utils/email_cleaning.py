@@ -8,6 +8,57 @@ Handles English + Norwegian markers (the original target audience speaks both).
 import re
 from dataclasses import dataclass
 
+
+# ─── Subject-level forward detection ───────────────────────────────────────
+#
+# "This message is a forward" used to be inferred from the body (the
+# `looks_like_forward_block` heuristic below). For Notion-row UX we also need
+# the cheaper subject-prefix signal, which is what every mail client puts in
+# front of the original subject when the user clicks Forward — same idea as
+# `Re:`/`Sv:` for replies, just for forwards.
+#
+# Used by sync_thread.py to keep Fwd rows from arriving as mystery blank rows:
+# a Fwd with empty cleaned body gets a placeholder, a Fwd with commentary gets
+# a "Videresendt: " prefix so it's labelled as a forwarder's note.
+
+# Subjects starting with these prefixes (case-insensitive, with the colon)
+# indicate a forwarded message across the clients Goldbox uses.
+_FORWARD_SUBJECT_PREFIXES = ("fwd:", "fw:", "videresend:", "vidr:")
+
+
+def is_forwarded_subject(subject: str | None) -> bool:
+    """True when `subject` starts with a forward-prefix the team's clients use.
+
+    >>> is_forwarded_subject("Fwd: foo")
+    True
+    >>> is_forwarded_subject("FW: foo")
+    True
+    >>> is_forwarded_subject("Videresend: foo")
+    True
+    >>> is_forwarded_subject("Re: foo")
+    False
+    >>> is_forwarded_subject("My Fwd: thoughts")
+    False
+    >>> is_forwarded_subject(None)
+    False
+    """
+    if not subject:
+        return False
+    s = subject.strip().lower()
+    return any(s.startswith(p) for p in _FORWARD_SUBJECT_PREFIXES)
+
+
+# Placeholder body for forwards where the forwarder added no commentary of
+# their own — without it, `clean_body` returns "" and Notion shows a mystery
+# blank row. Norwegian phrasing matches the rest of the Notion-facing strings
+# (Emne, Melding, Disipliner, Type, …).
+FORWARD_NO_COMMENT_PLACEHOLDER = "(videresendt uten kommentar)"
+
+# Prefix prepended to the cleaned commentary on a Fwd row, so a row like
+# "Videresendt: FYI - se under" is obviously a forwarder's note.
+FORWARD_COMMENT_PREFIX = "Videresendt: "
+
+
 # Reply markers: indicate the start of a quoted/forwarded section.
 # We cut everything from the first match onwards.
 # Reply-quotation header patterns. The shared semantic shape across email

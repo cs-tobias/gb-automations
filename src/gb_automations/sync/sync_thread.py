@@ -54,10 +54,13 @@ from gb_automations.models import (
 from gb_automations.obs import describe_error, log_api_error
 from gb_automations.sync import watches
 from gb_automations.utils.email_cleaning import (
+    FORWARD_COMMENT_PREFIX,
+    FORWARD_NO_COMMENT_PLACEHOLDER,
     body_before_quotes,
     clean_body,
     extract_signature_block,
     has_quoted_history_hint,
+    is_forwarded_subject,
 )
 from gb_automations.utils.email_splitting import (
     ExtractedMessage,
@@ -1151,6 +1154,22 @@ async def _sync_single_message(
         body_for_row,
         keep_image_markers=_owning_filenames(attachment_decisions),
     )
+
+    # Forward-aware body shaping. Audit of the 1210_Linstow resync showed every
+    # body=0 chars row was a Fwd: with no commentary — clean_body correctly
+    # strips the quoted chain (preserved as extracted historical rows) and
+    # leaves nothing. Two cases now:
+    #   - Fwd with no commentary → write a placeholder so the row is a visible
+    #     timeline marker, not a mystery blank row in Notion.
+    #   - Fwd with commentary → prefix it with "Videresendt: " so it's clearly
+    #     labeled as a forwarder's note (not a normal reply).
+    # Non-Fwd rows are untouched.
+    if is_forwarded_subject(msg.subject):
+        if not cleaned_body:
+            cleaned_body = FORWARD_NO_COMMENT_PLACEHOLDER
+        else:
+            cleaned_body = FORWARD_COMMENT_PREFIX + cleaned_body
+
     if not cleaned_body and not has_potential_attachments:
         logger.info(
             "    ⊘ skipping msg %r: no body content and no real attachments "
@@ -1453,6 +1472,17 @@ async def _sync_extracted_message(
     # also cut at the LLM-located signature first line — the same hint the live
     # path uses. Safe no-op when the hint is absent or doesn't match.
     display_body = _slice_at_signature(display_body, signature_first_line_hint)
+
+    # Same forward-aware shaping as the regular path: extracted rows can also
+    # be forwards (the resync log showed a `Videresend: KG9 korreksjoner` row
+    # land with body=0 chars). Done BEFORE the content-dedup hash below so two
+    # equivalent placeholder rows from the same sender+project still dedup, and
+    # so the body Notion sees is what the dedup key was computed against.
+    if is_forwarded_subject(inner.subject):
+        if not display_body:
+            display_body = FORWARD_NO_COMMENT_PLACEHOLDER
+        else:
+            display_body = FORWARD_COMMENT_PREFIX + display_body
 
     # Third dedup layer (extracted path): same body + same sender + same
     # project as a row that already exists? Don't create a duplicate. This is
