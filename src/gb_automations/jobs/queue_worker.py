@@ -169,7 +169,7 @@ async def _process_label_sync(claimed: _Claimed, progress: str) -> None:
     await _record_outcome(
         claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(project_page_id)
     )
-    await queue_mirror.refresh_project_dot(project_page_id)
+    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
 
 async def _process_task_folder_sync(claimed: _Claimed, progress: str) -> None:
@@ -203,7 +203,7 @@ async def _process_task_folder_sync(claimed: _Claimed, progress: str) -> None:
         claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(task_page_id)
     )
     if project_page_id:
-        await queue_mirror.refresh_project_dot(project_page_id)
+        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
 
 async def _process(claimed: _Claimed, progress: str) -> None:
@@ -311,8 +311,10 @@ async def _process(claimed: _Claimed, progress: str) -> None:
     # Recompute the project dot now this task settled: 🔴 failed > 🟠 retrying
     # (a task failed once but is still retrying) > 🟢 active (siblings running) >
     # ⚪ idle. Prefer the project resolved this run; fall back to the persisted one.
+    # `progress` is the worker's authoritative N/M for this batch — passed
+    # through verbatim to the Notion "Sync progress" field.
     project = resolved_project or getattr(result, "project_page_id", None)
-    await queue_mirror.refresh_project_dot(project)
+    await queue_mirror.refresh_project_dot(project, progress=progress)
 
 
 class _TaskStub:

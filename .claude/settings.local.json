@@ -36,7 +36,8 @@
       "Bash(python -m py_compile src/gb_automations/config.py src/gb_automations/sync/queue.py src/gb_automations/clients/notion.py src/gb_automations/sync/queue_mirror.py)",
       "Bash(python -m py_compile src/gb_automations/sync/queue.py)",
       "Bash(xargs -I{} docker inspect {} --format '{{.HostConfig.Memory}} bytes limit, {{.HostConfig.MemorySwap}} swap')",
-      "Bash(python -m py_compile src/gb_automations/clients/notion.py src/gb_automations/jobs/queue_worker.py)"
+      "Bash(python -m py_compile src/gb_automations/clients/notion.py src/gb_automations/jobs/queue_worker.py)",
+      "Bash(python -m py_compile src/gb_automations/sync/queue.py src/gb_automations/sync/queue_mirror.py src/gb_automations/jobs/queue_worker.py)"
     ]
   }
 }
