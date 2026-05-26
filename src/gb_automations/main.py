@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from gb_automations.config import settings
@@ -73,6 +74,29 @@ def _validate_required_settings() -> None:
             "Set it to the audience configured on the GCP push subscription, "
             "typically https://hub.{your-domain}/webhooks/gmail."
         )
+    # Frame.io sync needs the OAuth identity (refresh token + account/workspace
+    # already required for /debug/frame to work) PLUS a resolved root project to
+    # parent folders under, and a placeholder URL Frame can fetch. Failing at
+    # boot beats a runtime KeyError on the first webhook click.
+    if settings.sync_frame:
+        missing = [
+            name
+            for name, value in (
+                ("FRAME_REFRESH_TOKEN", settings.frame_refresh_token),
+                ("FRAME_ACCOUNT_ID", settings.frame_account_id),
+                ("FRAME_WORKSPACE_ID", settings.frame_workspace_id),
+                ("FRAME_ROOT_PROJECT_ID", settings.frame_root_project_id),
+                ("FRAME_PLACEHOLDER_URL", settings.frame_placeholder_url),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "SYNC_FRAME=true but required Frame.io settings are missing: "
+                + ", ".join(missing)
+                + ". Run `python -m gb_automations.scripts.frame_oauth_bootstrap` "
+                "to seed account/workspace/refresh token + root project id."
+            )
 
 
 _validate_required_settings()
@@ -251,6 +275,14 @@ app = FastAPI(title="gb-automations", version="0.1.0", lifespan=lifespan)
 app.include_router(debug_routes.router)
 app.include_router(oauth_routes.router)
 app.include_router(webhook_routes.router)
+
+# Static assets exposed publicly (through the Cloudflare tunnel as
+# https://hub.<domain>/assets/...). Used by the Frame.io sync to give Frame a
+# fetchable URL for the per-task placeholder file — Frame's create_file_from_url
+# requires a public source URL and serving it ourselves avoids depending on S3
+# or an external CDN. Keep this directory small and non-secret.
+_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
 
 
 @app.get("/health")

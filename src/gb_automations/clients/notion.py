@@ -16,9 +16,11 @@ from gb_automations.config import (
     COMPANIES_PROPS,
     CONTACTS_PROPS,
     EMAILS_PROPS,
+    PROJECTS_FRAME_URL_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
     SYNC_QUEUE_PROPS,
+    TASKS_FRAME_URL_PROP,
     TASKS_PROPS,
     settings,
 )
@@ -607,6 +609,46 @@ async def patch_email_row_project(page_id: str, project_page_ids: list[str]) -> 
         response = await _with_retries(
             lambda: client.patch(f"/pages/{page_id}", json={"properties": props}),
             op_name=f"PATCH /pages/{page_id} project",
+        )
+        _raise_for_status(response)
+
+
+async def set_project_frame_url(project_page_id: str, url: str | None) -> None:
+    """Write the Frame.io URL property on a Projects-DB page. Idempotent.
+
+    Called by sync_frame after the project's Frame folder is created or
+    confirmed live. Pass `url=None` to clear the property (e.g. when the
+    Frame folder has been removed and we're not auto-recreating).
+
+    PATCHing the same value is a no-op on Notion's side; the /webhooks/notion
+    self-write filter swallows the resulting webhook echo so a Frame writeback
+    doesn't loop a label_sync.
+    """
+    props = {PROJECTS_FRAME_URL_PROP: {"url": url}}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{project_page_id} frame_url (project)",
+        )
+        _raise_for_status(response)
+
+
+async def set_task_frame_url(task_page_id: str, url: str | None) -> None:
+    """Write the Frame.io URL property on a Tasks/Oppgaver-DB page. Idempotent.
+
+    Same shape and rationale as set_project_frame_url, just for tasks. Pass
+    `url=None` to clear (e.g. if the task's Frame folder is deleted manually
+    and we want the property to reflect "not provisioned").
+    """
+    props = {TASKS_FRAME_URL_PROP: {"url": url}}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{task_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{task_page_id} frame_url (task)",
         )
         _raise_for_status(response)
 

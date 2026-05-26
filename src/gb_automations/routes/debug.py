@@ -227,6 +227,55 @@ async def debug_frame() -> dict[str, Any]:
     }
 
 
+@router.get("/frame/project")
+async def debug_frame_project() -> dict[str, Any]:
+    """Confirm FRAME_ROOT_PROJECT_ID resolves AND its root folder is reachable.
+
+    Two-call check: GET the Project (auth + id valid) + GET its root_folder
+    children (the path we'll use to find/create the year folder works). Returns
+    the resolved project + a compact summary of its root children. Failure
+    typically means FRAME_ROOT_PROJECT_ID is for a different workspace, or the
+    OAuth user doesn't have access to that project — re-run the bootstrap.
+    """
+    from gb_automations.config import settings
+
+    if not settings.frame_root_project_id:
+        raise HTTPException(
+            400,
+            "FRAME_ROOT_PROJECT_ID is not set — run the bootstrap "
+            "(`python -m gb_automations.scripts.frame_oauth_bootstrap`).",
+        )
+    try:
+        project = await frame_client.get_project(settings.frame_root_project_id)
+        root_folder_id = project.get("root_folder_id") or (
+            project.get("root_folder") or {}
+        ).get("id")
+        if not root_folder_id:
+            raise HTTPException(
+                502,
+                "Project payload has no root_folder_id — Frame V4 response shape "
+                "changed; check clients/frame.py.get_project()",
+            )
+        children = await frame_client.list_folder_children(root_folder_id)
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    return {
+        "ok": True,
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "root_folder_id": root_folder_id,
+        },
+        "root_children_count": len(children),
+        "root_children": [
+            {"id": c.get("id"), "name": c.get("name"), "type": c.get("type")}
+            for c in children[:25]
+        ],
+    }
+
+
 @router.get("/queue")
 async def queue_status() -> dict[str, Any]:
     """Live state of the durable sync queue: counts by status, oldest pending

@@ -2,7 +2,7 @@ Vi må nok sette opp en docker desktop hvor vi bygger alt dette. Virker som det 
 
 [Ref på MCP server - både lage egen og connecte ferdige](https://www.youtube.com/watch?v=GuTcle5edjk&t=160s)
 
-# Bugs og fikses rapportering
+# Bugs og fikses rapportering (BEGGE ER FIKSET)
 
 ### Mail kommer opp med 3 duplikater
 

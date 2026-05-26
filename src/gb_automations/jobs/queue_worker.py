@@ -33,6 +33,7 @@ from gb_automations.sync.queue import (
     set_task_project,
     status_counts,
 )
+from gb_automations.sync.sync_frame import sync_frame_project, sync_frame_task
 from gb_automations.sync.sync_labels import sync_project_labels
 from gb_automations.sync.sync_tasks import sync_task_folder
 from gb_automations.sync.sync_thread import sync_thread
@@ -206,6 +207,91 @@ async def _process_task_folder_sync(claimed: _Claimed, progress: str) -> None:
         await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
 
+async def _process_frame_project_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a frame_project_sync task: mirror the Notion Project to a folder
+    under the shared Frame root project. Lights the Projects-DB dot via the
+    same queue_mirror path label_sync uses — a Frame failure flips the same icon.
+    """
+    project_page_id = claimed.project_page_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing Frame project folder for %s%s",
+        progress,
+        project_page_id,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError("frame_project_sync task has no project_page_id")
+        result = await sync_frame_project(project_page_id)
+        if result.action == "failed":
+            outcome_error = result.note or "frame project sync failed"
+    except Exception as err:
+        log_api_error(
+            logger, f"frame project sync crashed for {project_page_id}", err
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(project_page_id),
+    )
+    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+
+
+async def _process_frame_task_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a frame_task_sync task: mirror the Notion Task to a folder +
+    placeholder file under its project's discipline subfolder in Frame.
+
+    Like _process_task_folder_sync, the queue row's project_page_id starts NULL;
+    sync_frame_task resolves it from the task page and we persist it onto the
+    queue row so the Projects-DB rollup picks it up.
+    """
+    task_page_id = claimed.gmail_thread_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing Frame task folder for %s%s",
+        progress,
+        task_page_id,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    project_page_id: str | None = None
+    try:
+        if not task_page_id:
+            raise ValueError(
+                "frame_task_sync task has no task page id (gmail_thread_id)"
+            )
+        result = await sync_frame_task(task_page_id)
+        project_page_id = result.project_page_id
+        if result.action == "failed":
+            outcome_error = result.note or "frame task sync failed"
+    except Exception as err:
+        log_api_error(logger, f"frame task sync crashed for {task_page_id}", err)
+        outcome_error = describe_error(err)
+
+    if project_page_id:
+        # Persist the resolved project on the queue row so the Projects-DB dot
+        # rollup finds this task even if a transient failure parks it as failed.
+        await set_task_project(claimed.id, project_page_id)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(task_page_id),
+    )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+
+
 async def _process(claimed: _Claimed, progress: str) -> None:
     """Dispatch a claimed task by type and record the outcome.
 
@@ -218,6 +304,12 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "task_folder_sync":
         await _process_task_folder_sync(claimed, progress)
+        return
+    if claimed.task_type == "frame_project_sync":
+        await _process_frame_project_sync(claimed, progress)
+        return
+    if claimed.task_type == "frame_task_sync":
+        await _process_frame_task_sync(claimed, progress)
         return
 
     task_id, email, thread_id, attempts, rebuild = (

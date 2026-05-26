@@ -40,7 +40,20 @@
       "Bash(python -m py_compile src/gb_automations/sync/queue.py src/gb_automations/sync/queue_mirror.py src/gb_automations/jobs/queue_worker.py)",
       "Bash(python -m py_compile src/gb_automations/sync/queue_mirror.py)",
       "Bash(python -m py_compile src/gb_automations/clients/notion.py src/gb_automations/sync/queue_mirror.py)",
-      "Bash(python -m py_compile src/gb_automations/sync/queue_mirror.py src/gb_automations/jobs/queue_worker.py)"
+      "Bash(python -m py_compile src/gb_automations/sync/queue_mirror.py src/gb_automations/jobs/queue_worker.py)",
+      "Bash(ls \"C:/Users/tobia/.claude/plans/\" 2>/dev/null || echo \"no plans dir\")",
+      "Read(//c/Users/tobia/.claude/plans/**)",
+      "PowerShell(uv run pytest tests/test_sync_frame_project.py tests/test_sync_frame_task.py -x --tb=short 2>&1)",
+      "PowerShell(Get-Command python -ErrorAction SilentlyContinue)",
+      "PowerShell(python -m pytest tests/test_sync_frame_project.py tests/test_sync_frame_task.py -x --tb=short 2>&1)",
+      "PowerShell(docker --version 2>&1)",
+      "PowerShell(docker compose ps 2>&1)",
+      "PowerShell(docker compose exec -T api uv run pytest tests/test_sync_frame_project.py tests/test_sync_frame_task.py -x --tb=short 2>&1)",
+      "PowerShell(docker compose up -d --build api 2>&1)",
+      "PowerShell(docker compose exec -T api python -m pytest tests/test_sync_frame_project.py tests/test_sync_frame_task.py --tb=short 2>&1)",
+      "PowerShell(docker compose exec -T api pip install --quiet pytest pytest-asyncio 2>&1)",
+      "PowerShell(docker compose exec -T api pip install --user --quiet pytest pytest-asyncio 2>&1)",
+      "PowerShell(docker compose exec -T -u root api pip install --quiet pytest pytest-asyncio 2>&1)"
     ]
   }
 }

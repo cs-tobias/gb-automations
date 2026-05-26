@@ -46,6 +46,8 @@ from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import (
+    enqueue_frame_project_sync,
+    enqueue_frame_task_sync,
     enqueue_label_sync,
     enqueue_task_folder_sync,
     enqueue_threads,
@@ -369,18 +371,30 @@ async def _notion_webhook_impl(request: Request) -> Response:
                 }
             )
         inserted = await enqueue_task_folder_sync(page_id)
+        frame_inserted = 0
+        if settings.sync_frame:
+            # One Notion click fans out to NAS + Frame. Both are independent
+            # task_types so a Frame failure can't block NAS retries (and vice
+            # versa). The Frame enqueue dedups separately on its own index.
+            frame_inserted = await enqueue_frame_task_sync(page_id)
         queue_worker.wake()
         logger.info(
-            "📋 task folder sync requested for %r (page %s) — %s",
+            "📋 task folder sync requested for %r (page %s) — nas=%s frame=%s",
             title,
             page_id,
             "enqueued" if inserted else "already queued",
+            ("enqueued" if frame_inserted else "already queued")
+            if settings.sync_frame
+            else "off",
         )
         return _json(
             {
                 "page_id": page_id,
                 "action": "queued" if inserted else "already_queued",
                 "kind": "task_folder_sync",
+                "frame": ("queued" if frame_inserted else "already_queued")
+                if settings.sync_frame
+                else "off",
             }
         )
 
@@ -413,17 +427,29 @@ async def _notion_webhook_impl(request: Request) -> Response:
     # The label name is recomputed at processing time from the (possibly renamed)
     # title — see sync.sync_labels.sync_project_labels.
     inserted = await enqueue_label_sync(page_id)
+    frame_inserted = 0
+    if settings.sync_frame:
+        # Fan-out: one Projects-DB button click also enqueues the Frame project
+        # mirror so the same click provisions Gmail labels + NAS folder + Frame
+        # folder. Each is its own task_type, retried independently.
+        frame_inserted = await enqueue_frame_project_sync(page_id)
     queue_worker.wake()
     logger.info(
-        "🏷  label sync requested for %r (page %s) — %s",
+        "🏷  label sync requested for %r (page %s) — labels=%s frame=%s",
         title,
         page_id,
         "enqueued" if inserted else "already queued",
+        ("enqueued" if frame_inserted else "already queued")
+        if settings.sync_frame
+        else "off",
     )
     return _json(
         {
             "page_id": page_id,
             "action": "queued" if inserted else "already_queued",
+            "frame": ("queued" if frame_inserted else "already_queued")
+            if settings.sync_frame
+            else "off",
         }
     )
 

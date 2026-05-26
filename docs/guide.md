@@ -27,3 +27,5 @@ On the **Public Hostnames** step, click **Add a public hostname**:
 
 10. (Optional) Office NAS project folders: mount the shared `W:` drive into the container and set `SYNC_NAS_FOLDERS=true` per [docs/misc/nas-setup.md](misc/nas-setup.md). Leave `SYNC_NAS_FOLDERS=false` to skip.
 
+11. (Optional) Frame.io mirror: run `docker compose exec api python -m gb_automations.scripts.frame_oauth_bootstrap`, paste the printed values into `.env`, then set `SYNC_FRAME=true` and `FRAME_PLACEHOLDER_URL=https://hub.<your-domain>/assets/placeholder.png` and `docker compose up -d --force-recreate api`. The "Sync to Gmail" button now also provisions a Frame folder per project + per task (with a placeholder file). Verify with `curl https://hub.<your-domain>/debug/frame/project`. Full notes in [docs/misc/frame-setup.md](misc/frame-setup.md).
+

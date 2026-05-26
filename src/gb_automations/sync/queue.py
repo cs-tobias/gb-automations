@@ -39,6 +39,12 @@ _ACTIVE_LABEL_PREDICATE = text("status IN ('pending','in_progress') AND task_typ
 _ACTIVE_TASK_FOLDER_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'task_folder_sync'"
 )
+_ACTIVE_FRAME_PROJECT_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_project_sync'"
+)
+_ACTIVE_FRAME_TASK_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_task_sync'"
+)
 
 
 async def enqueue_threads(
@@ -146,6 +152,66 @@ async def enqueue_task_folder_sync(task_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["gmail_thread_id"],
             index_where=_ACTIVE_TASK_FOLDER_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_frame_project_sync(project_page_id: str) -> int:
+    """Enqueue a Frame.io project-folder sync for a Notion Project page.
+
+    Mirrors enqueue_label_sync: project_page_id is the dedup key
+    (uq_sync_tasks_active_frame_project), user_email/gmail_thread_id are
+    placeholders ("*" / project_page_id) so the NOT NULL columns are satisfied.
+    Returns 1 if newly enqueued, 0 if a duplicate was already active.
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="frame_project_sync",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id"],
+            index_where=_ACTIVE_FRAME_PROJECT_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_frame_task_sync(task_page_id: str) -> int:
+    """Enqueue a Frame.io task-folder sync for a Notion Oppgaver page.
+
+    Mirrors enqueue_task_folder_sync — gmail_thread_id carries the task page
+    id as a placeholder and is the dedup key
+    (uq_sync_tasks_active_frame_task). project_page_id is left NULL;
+    sync_frame_task resolves the project from the task page at process time
+    and the worker calls set_task_project so the Projects-DB dot rolls up.
+    """
+    if not task_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="frame_task_sync",
+            user_email="*",
+            gmail_thread_id=task_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_FRAME_TASK_PREDICATE,
         )
     )
     async with SessionLocal() as own:
@@ -409,6 +475,9 @@ async def queue_counts(failed_limit: int = 50) -> dict[str, Any]:
 __all__ = [
     "enqueue_threads",
     "enqueue_label_sync",
+    "enqueue_task_folder_sync",
+    "enqueue_frame_project_sync",
+    "enqueue_frame_task_sync",
     "claim_one",
     "mark_done",
     "mark_failed",

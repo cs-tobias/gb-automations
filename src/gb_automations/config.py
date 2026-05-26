@@ -175,6 +175,22 @@ class Settings(BaseSettings):
     # created via POST /v4/.../webhooks. Empty until the webhook is created;
     # bootstrap script handles creation and stashes the secret here.
     frame_webhook_secret: str = ""
+    # Phase 1 fan-out toggle (mirrors sync_gmail_labels / sync_nas_folders).
+    # OFF by default so a deploy can land the Frame code without flipping the
+    # behavior on. Flip to true once frame_root_project_id + frame_placeholder_url
+    # are configured AND the OAuth bootstrap has run successfully.
+    sync_frame: bool = False
+    # The shared Frame.io Project under settings.frame_workspace_id that holds
+    # every Goldbox project as a top-level folder. Resolved during bootstrap
+    # (the script lists projects in the workspace and prompts for the right
+    # one); empty until bootstrap-extended is run.
+    frame_root_project_id: str = ""
+    # Publicly-fetchable URL Frame.io's create_file_from_url endpoint can GET
+    # to seed the per-task placeholder asset. We host the bytes ourselves at
+    # /assets/placeholder.png (mounted by main.py); set this to the public form,
+    # e.g. https://hub.<domain>/assets/placeholder.png — Frame fetches it over
+    # the existing Cloudflare tunnel, no S3 needed.
+    frame_placeholder_url: str = ""
 
 
 settings = Settings()
@@ -294,6 +310,14 @@ PROJECT_SYNC_OPTION = {
 }
 
 
+# URL properties the Frame.io sync writes back to Notion so a row in the
+# Projects/Oppgaver DB is one click away from the corresponding Frame folder.
+# Both DBs use a URL-type property; rename here if the column header changes
+# in Notion. Empty value (write None) means "Frame not provisioned yet".
+PROJECTS_FRAME_URL_PROP = "Frame.io"
+TASKS_FRAME_URL_PROP = "Frame.io"
+
+
 # Top-level Gmail label namespace for project labels. The full path we create
 # per project is "Prosjekt/<year>/<project-name>" — Gmail uses `/` as the
 # hierarchy separator and auto-creates parent labels on demand. Norwegian
@@ -331,6 +355,17 @@ DISCIPLINE_FOLDER_SCENES = {
 DISCIPLINE_FOLDER_MEDIA = {
     "interior": "Interioer",
     "exterior": "Eksterioer",
+    "animation": "Animasjon",
+}
+
+# Canonical key → on-Frame.io folder name. Unlike the NAS template, Frame.io
+# has no scenes-vs-media split — each project gets one discipline folder per
+# active discipline, with task subfolders directly inside. Norwegian to match
+# what Goldbox sees in Notion's `Type` select; the leaf names line up visually
+# when a team member scans the NAS and Frame side by side.
+FRAME_DISCIPLINE_FOLDER_NAMES = {
+    "interior": "Interiør",
+    "exterior": "Eksteriør",
     "animation": "Animasjon",
 }
 

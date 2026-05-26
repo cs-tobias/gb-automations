@@ -13,17 +13,18 @@ What works end-to-end:
 - Email labeled with a project label in Gmail → Pub/Sub push → the webhook **enqueues a durable `sync_tasks` row** (it does NOT sync inline) → a background **queue worker** processes it: cleaned body, extracted history (split into per-message rows), participants upserted to `Contacts`/`Companies`, attachments uploaded to Drive and linked, multi-select tags by a local Ollama LLM (taxonomy in [config.py](src/gb_automations/config.py) `EMAIL_TAGS`), written to a year-partitioned `Emails` DB.
 - **The queue is the guarantee:** a labeled thread will reach Notion — crash-safe, retry-with-backoff, terminal failures parked as `failed` (visible at `/debug/queue`, never silently lost). Per-project status shows as an icon on the Projects DB; stale Notion ids self-heal. See [docs/misc/gotchas.md](docs/misc/gotchas.md) entry 16.
 
-## Next up: Frame.io integration (week of 2026-05-18)
+## Frame.io — Phase 1 shipped (May 2026); Phase 2 next
 
-Expected to be **~2× the size of the Gmail+Notion work combined**. Scope from the client brief:
-- Project created & marked Active in Notion → mirror to Frame.io (including renames).
-- Task structure in Notion (e.g. 3 exteriors + 4 interiors) → folder + placeholder file structure in Frame.io.
-- Frame.io comments → sync into Notion as a `Corrections` database, linked to project + task.
-- Auto-create "korreksjon runde N" sub-tasks under the parent task when a new correction round arrives.
-- Eventually: AI drafts replies to Frame.io comments using mail/brief context, project manager approves before sending.
+**Phase 1 done**: Notion → Frame mirror. The "Sync to Gmail" button now also enqueues `frame_project_sync` / `frame_task_sync` (when `SYNC_FRAME=true`). Per-project folder + per-task folder + placeholder file land under a single shared Frame Project (`FRAME_ROOT_PROJECT_ID`). Frame URLs are written back to the Projects/Oppgaver rows. Renames mirror in place (folder id stable). Self-heals when a folder is trashed in Frame. Same trigger as NAS — no Active-status gating yet (will revisit after client meeting). Setup: [docs/misc/frame-setup.md](docs/misc/frame-setup.md). Engine: [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py).
+
+**Phase 2 (next)** — comments + Corrections DB:
+
+- Frame.io webhooks → sync comments into a new Notion `Corrections` database, linked to project + task (joined back via `FrameTaskFolder.frame_placeholder_file_id`, which Phase 1 persists for exactly this).
+- Auto-create "korreksjon runde N" sub-tasks under the parent task on a new correction round.
+- Eventually: AI drafts replies using mail/brief context, project manager approves before sending.
 - Project marked finished in Notion → set inactive in Frame.io.
 
-After Frame: Toggl (daily aggregated hours → Notion), Fiken (accounting), meeting transcripts, then MCP server + RAG.
+After Frame Phase 2: Toggl (daily aggregated hours → Notion), Fiken (accounting), meeting transcripts, then MCP server + RAG.
 
 ## Architecture in one diagram
 
@@ -143,7 +144,16 @@ docker compose up -d --build
 # tail application logs (filter out the /health noise)
 docker compose logs -f api | grep -v "GET /health"
 
-# run tests
+# run tests — ON THE HOST, NOT IN THE CONTAINER.
+# `uv run pytest` builds (or reuses) a host-side .venv with dev deps and runs
+# the suite against the source tree directly. Don't try to run pytest inside
+# `docker compose exec api`: the production image is built with `uv sync
+# --frozen --no-dev --no-editable`, so pytest is intentionally NOT in
+# /app/.venv. Installing it ad-hoc inside the container also breaks subtly
+# (the container has two Pythons: /usr/local/bin/python and /app/.venv/bin/
+# python — `pip install` lands in the wrong one, then `python -m pytest`
+# can't find it. And it's all wiped on the next --build anyway.) Tests don't
+# need the container; they run against the source tree.
 uv run pytest
 
 # reload .env (restart does NOT reload it — must --force-recreate)
@@ -180,6 +190,9 @@ curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20ti
 | "What does a synced row look like in Notion?" | `EMAILS_PROPS` in [config.py](src/gb_automations/config.py) — property names, types, and order |
 | "What tags can the LLM apply?" | `EMAIL_TAGS` in [config.py](src/gb_automations/config.py); prompt body in [prompts/](prompts/) |
 | "How are re-carried attachments kept off every reply row?" | `ThreadAttachmentTracker` (`attached_this_pass`) in [sync/sync_thread.py](src/gb_automations/sync/sync_thread.py); gotchas.md attachment notes |
+| "How does a Frame.io folder get created?" | `SYNC_FRAME=true` flag in [config.py](src/gb_automations/config.py); same Notion button enqueues `frame_project_sync` / `frame_task_sync` in [routes/webhooks.py](src/gb_automations/routes/webhooks.py) → worker runs [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py) `sync_frame_project` / `sync_frame_task` |
+| "How are Frame URLs written back to Notion?" | `set_project_frame_url` / `set_task_frame_url` in [clients/notion.py](src/gb_automations/clients/notion.py); `PROJECTS_FRAME_URL_PROP` / `TASKS_FRAME_URL_PROP` in [config.py](src/gb_automations/config.py) |
+| "Frame.io setup / bootstrap?" | [docs/misc/frame-setup.md](docs/misc/frame-setup.md); script in [scripts/frame_oauth_bootstrap.py](src/gb_automations/scripts/frame_oauth_bootstrap.py); smoke tests at `GET /debug/frame` + `GET /debug/frame/project` |
 | "Why isn't my new integration working?" | [docs/misc/gotchas.md](docs/misc/gotchas.md) first, then the relevant client wrapper in `clients/` |
 | "What's the full deployment story for a fresh workspace?" | [docs/guide.md](docs/guide.md) → [google-setup.md](docs/misc/google-setup.md) + [scripts/gcp-bootstrap.sh](scripts/gcp-bootstrap.sh) + [notion-setup.md](docs/misc/notion-setup.md) + [cloudflare-setup.md](docs/misc/cloudflare-setup.md) |
 | "What does the client actually want long-term?" | [docs/reference/client-brief.md](docs/reference/client-brief.md) |
