@@ -1,22 +1,28 @@
-"""Project / Task → Frame.io folder mirror.
+"""Project / Task → Frame.io mirror.
 
-Phase 1 of the Frame.io integration. Notion is the source of truth; this
-module reconciles the corresponding folder structure inside the shared root
-Frame.io Project (`FRAME_ROOT_PROJECT_ID`):
+Notion is the source of truth; this module reconciles the corresponding
+**Frame Project** (one per Notion project, at the workspace level) and the
+folder structure inside it:
 
-    <root project>/<year>/<project leaf>/<discipline>/<task leaf>/placeholder.png
+    <workspace>/<ProjectName> (Frame Project)
+                 └── (project's root_folder_id, auto-created by Frame)
+                     ├── Interiør/
+                     │   └── Task A/placeholder.png
+                     └── Eksteriør/
+                         └── Task B/placeholder.png
 
-Same `(year, leaf)` split as the NAS layer (utils.labels.project_path_parts),
-so a team member can match a NAS folder to a Frame folder by name without
-translating anything. Discipline folders are lazily created from each task's
+Each Notion Project is its own top-level Frame Project, visible in Frame V4's
+"Active Projects" view. Discipline folders are lazily created from each task's
 `Type` select (Interiør/Eksteriør/Animasjon); a project with zero tasks gets
 no discipline folders.
 
 Idempotent and self-healing, mirroring sync_thread:
   - re-runs are no-ops on Frame's side (rename only when name actually changed),
-  - a cached folder/file id that now 404s on Frame is evicted and re-created
-    on the next sync (the `frame.get_folder` 404 is the "stale" signal —
-    parallel to `notion_client.page_is_live` for Notion ids in sync_thread).
+  - a cached project/folder/file id that now 404s on Frame is evicted and
+    re-created on the next sync (the `frame.get_*` 404 is the "stale" signal —
+    parallel to `notion_client.page_is_live` for Notion ids in sync_thread),
+  - a Frame Project pre-created in the UI with the same name as a Notion
+    project is ADOPTED rather than duplicated (same for nested folders).
 
 The queue worker calls `sync_frame_project` for a `frame_project_sync` task
 and `sync_frame_task` for `frame_task_sync`. Both fan out from the existing
@@ -45,66 +51,70 @@ from gb_automations.utils.labels import project_path_parts
 logger = logging.getLogger(__name__)
 
 
-# Per-worker-pass lookup for "year folder under the root project" and
-# "discipline folder under a project folder". Both are tiny, and a project
-# resync triggers many task syncs back-to-back; without caching we'd LIST the
-# root_folder / project folder children once per task. Reset on every public
-# entry point so a long-running worker can pick up changes made outside the
-# system (e.g. a year folder renamed in Frame's UI).
-_year_folder_cache: dict[str, str] = {}
+# Per-worker-pass lookup for "discipline folder under a project's root folder".
+# A project resync triggers many task syncs back-to-back; without caching
+# we'd LIST the same root folder's children once per task. Reset on every
+# public entry point so a long-running worker picks up changes made outside
+# the system (e.g. a discipline folder renamed in Frame's UI).
 _discipline_folder_cache: dict[tuple[str, str], str] = {}
 
 
-PLACEHOLDER_FILE_NAME = "placeholder.png"
+def _placeholder_filename(project_name: str, task_name: str) -> str:
+    """Build the per-task placeholder filename.
 
-# Frame's V4 API returns a canonical `view_url` on every folder/file response,
-# so we just persist what Frame gives us instead of building URLs from a template.
-# That sidesteps any drift in the web-UI URL shape and means a folder opened from
-# Notion always lands where Frame itself would link.
+    Shape: `<project>_<studio>_<task>_V00.png` — e.g.
+    `1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png`. The placeholder
+    is always V00; the team's first real delivery uploads on top as V01 in
+    Frame's version stack.
 
-# Cached root_folder_id for the configured FRAME_ROOT_PROJECT_ID. The project
-# payload includes `root_folder_id` and that id is immutable for the lifetime
-# of the Project, so one lookup per worker process is enough.
-_root_folder_id_cache: str | None = None
+    The studio slot comes from settings.frame_filename_studio (default
+    "Goldbox.no"). Renaming the studio in .env affects only NEW placeholders
+    — existing uploads keep their filename (Frame's version stack is keyed
+    by file slot, not name).
+    """
+    studio = settings.frame_filename_studio or "Goldbox.no"
+    return f"{project_name}_{studio}_{task_name}_V00.png"
+
+# Frame's V4 API returns a canonical `view_url` on every project/folder/file
+# response, so we just persist what Frame gives us instead of building URLs
+# from a template. That sidesteps any drift in the web-UI URL shape and
+# means a link opened from Notion always lands where Frame itself would link.
 
 
-def _view_url(folder_obj: dict, fallback_folder_id: str) -> str:
-    """Prefer Frame's own view_url (returned on every folder/file response) and
-    fall back to a hand-built URL if absent. The fallback shape was confirmed
-    against a live Frame UI URL; it stays here only as a defensive default if
-    a future V4 response shape ever omits the field."""
+def _project_view_url(project_obj: dict, project_id: str) -> str:
+    """URL of a Frame Project page in the web UI. Prefer the project's own
+    `view_url` when present; fall back to the canonical shape.
+
+    Folders inside a project use a different URL shape (see _folder_view_url
+    below) — splitting the two helpers keeps each fallback honest."""
+    url = project_obj.get("view_url") if isinstance(project_obj, dict) else None
+    if url:
+        return url
+    return f"https://next.frame.io/project/{project_id}"
+
+
+def _folder_view_url(
+    folder_obj: dict, folder_id: str, project_id: str
+) -> str:
+    """URL of a folder inside a Frame Project. Frame returns `view_url` on
+    every folder response in practice, so the fallback rarely fires —
+    but if it does, we still need a project_id to scope the `/view/...`
+    path under, which the caller passes in.
+    """
     url = folder_obj.get("view_url") if isinstance(folder_obj, dict) else None
     if url:
         return url
-    return (
-        f"https://next.frame.io/project/{settings.frame_root_project_id}"
-        f"/view/{fallback_folder_id}"
-    )
-
-
-async def _resolve_root_folder_id() -> str:
-    global _root_folder_id_cache
-    if _root_folder_id_cache:
-        return _root_folder_id_cache
-    project = await frame_client.get_project(settings.frame_root_project_id)
-    root_id = project.get("root_folder_id") or (
-        project.get("root_folder") or {}
-    ).get("id")
-    if not root_id:
-        raise RuntimeError(
-            "Could not resolve root_folder_id for Frame project "
-            f"{settings.frame_root_project_id}. Verify FRAME_ROOT_PROJECT_ID via "
-            "/debug/frame/project."
-        )
-    _root_folder_id_cache = root_id
-    return root_id
+    return f"https://next.frame.io/project/{project_id}/view/{folder_id}"
 
 
 @dataclass
 class FrameProjectResult:
     project_page_id: str
-    action: str = "skipped"  # created | renamed | unchanged | skipped | failed
-    frame_folder_id: str | None = None
+    # adopted = a Frame Project with the same name already existed in the
+    # workspace and we matched it instead of creating a duplicate.
+    action: str = "skipped"  # created | adopted | renamed | unchanged | skipped | failed
+    frame_project_id: str | None = None
+    frame_folder_id: str | None = None  # the Project's root_folder_id
     frame_url: str | None = None
     note: str | None = None
 
@@ -113,7 +123,10 @@ class FrameProjectResult:
 class FrameTaskResult:
     task_page_id: str
     project_page_id: str | None = None
-    action: str = "skipped"  # created | renamed | unchanged | skipped | failed
+    # adopted = a sibling task folder with the same name already existed under
+    # the discipline folder and we matched it instead of creating a duplicate
+    # (and reused its placeholder.png if one was present).
+    action: str = "skipped"  # created | adopted | renamed | unchanged | skipped | failed
     frame_folder_id: str | None = None
     frame_placeholder_file_id: str | None = None
     frame_url: str | None = None
@@ -130,20 +143,25 @@ def _is_404(err: Exception) -> bool:
 async def _evict_if_stale_project(
     session: AsyncSession, row: FrameProjectFolder
 ) -> bool:
-    """Return True if `row.frame_folder_id` is gone from Frame and was evicted.
+    """Return True if `row.frame_project_id` is gone from Frame and was evicted.
 
     Mirrors `_evict_if_stale_email_row` in sync_thread: trust the cache on any
     non-404 error (transient/auth), only treat a clean "gone" as stale. Caller
     falls through to the create path when this returns True.
+
+    Checks the Project endpoint (not the folder) because the Project is the
+    load-bearing entity — if it's been archived/deleted in Frame, our entire
+    cache row needs to go. A live Project's root_folder is guaranteed to
+    exist by Frame's invariants.
     """
     try:
-        await frame_client.get_folder(row.frame_folder_id)
+        await frame_client.get_project(row.frame_project_id)
     except frame_client.FrameAPIError as err:
         if not _is_404(err):
             return False
         logger.info(
-            "frame project folder %s for page %s is gone — evicting cache",
-            row.frame_folder_id,
+            "frame project %s for page %s is gone — evicting cache",
+            row.frame_project_id,
             row.notion_page_id,
         )
         await session.delete(row)
@@ -175,70 +193,117 @@ async def _evict_if_stale_task(
     return False
 
 
-async def _ensure_year_folder(year: str) -> str:
-    """Return the Frame folder id for `<root project>/<year>/`, creating it if
-    absent. Cached for the lifetime of one worker pass.
+async def _find_child_folder_by_name(
+    parent_folder_id: str, name: str
+) -> dict | None:
+    """Return the child folder object whose `name` matches, or None.
 
-    Implementation: resolve the project's root_folder_id once, then list its
-    children to find an existing year folder (cheap dedup), creating a new one
-    only if missing. Both operations use the standard `/v4/accounts/{aid}/
-    folders/{fid}/...` endpoints — there is NO project-scoped "root folder
-    children" endpoint in V4 (we tried; it 404s).
+    Centralizes the match-by-name dance used at every folder level (discipline,
+    task). Frame.io allows sibling folders with identical names, so any
+    "create folder X under Y" path that doesn't pre-check ends up with
+    duplicates whenever a folder by that name already exists — created
+    manually in the UI, or left behind by a past cache wipe.
+
+    Type filter `(None, "folder")`: not every V4 response carries `type` on
+    every child, but when it does folders use "folder" and files use
+    something else.
     """
-    cached = _year_folder_cache.get(year)
-    if cached:
-        return cached
-    root_folder_id = await _resolve_root_folder_id()
-    children = await frame_client.list_folder_children(root_folder_id)
+    children = await frame_client.list_folder_children(parent_folder_id)
     for child in children:
-        if child.get("name") == year and child.get("type") in (None, "folder"):
-            folder_id = child["id"]
-            _year_folder_cache[year] = folder_id
-            return folder_id
-    new_folder = await frame_client.create_folder(root_folder_id, year)
-    folder_id = new_folder["id"]
-    _year_folder_cache[year] = folder_id
-    return folder_id
+        if child.get("name") == name and child.get("type") in (None, "folder"):
+            return child
+    return None
+
+
+async def _find_child_file_by_name(
+    parent_folder_id: str, name: str
+) -> dict | None:
+    """Return the child file object whose `name` matches, or None.
+
+    Mirror of _find_child_folder_by_name for the placeholder.png lookup —
+    same list_folder_children call returns folders AND files, we just
+    filter the opposite way. We accept any non-folder type because the
+    exact V4 file type string isn't pinned anywhere in our wrapper; the
+    only sibling of a placeholder.png that would slip past this is another
+    folder named "placeholder.png", which is nonsensical.
+    """
+    children = await frame_client.list_folder_children(parent_folder_id)
+    for child in children:
+        if child.get("name") == name and child.get("type") not in (None, "folder"):
+            return child
+    return None
+
+
+async def _find_workspace_project_by_name(
+    workspace_id: str, name: str
+) -> dict | None:
+    """Return the Frame Project object whose `name` matches, or None.
+
+    Parallel to _find_child_folder_by_name but at the workspace level —
+    Frame allows duplicate-name siblings at every tier, including Project
+    siblings under a workspace. We use this in sync_frame_project's create
+    branch to adopt a pre-existing same-name project (manually created in
+    the UI, or left behind after a cache wipe) instead of duplicating it.
+    """
+    projects = await frame_client.list_projects(
+        settings.frame_account_id, workspace_id
+    )
+    for project in projects:
+        if project.get("name") == name:
+            return project
+    return None
+
+
+def _root_folder_id_of(project_obj: dict) -> str | None:
+    """Extract the project's root_folder_id from a Project response, tolerating
+    both shapes V4 has returned in practice (top-level field vs nested under
+    `root_folder.id`)."""
+    return project_obj.get("root_folder_id") or (
+        project_obj.get("root_folder") or {}
+    ).get("id")
 
 
 async def _ensure_discipline_folder(
     project_folder_id: str, discipline_key: str
 ) -> str:
-    """Find or create the discipline subfolder under a project folder."""
+    """Find or create the discipline subfolder under a Project's root folder."""
     cache_key = (project_folder_id, discipline_key)
     cached = _discipline_folder_cache.get(cache_key)
     if cached:
         return cached
     name = FRAME_DISCIPLINE_FOLDER_NAMES[discipline_key]
-    children = await frame_client.list_folder_children(project_folder_id)
-    for child in children:
-        if child.get("name") == name and child.get("type") in (None, "folder"):
-            folder_id = child["id"]
-            _discipline_folder_cache[cache_key] = folder_id
-            return folder_id
-    new_folder = await frame_client.create_folder(project_folder_id, name)
-    folder_id = new_folder["id"]
+    existing = await _find_child_folder_by_name(project_folder_id, name)
+    if existing is not None:
+        folder_id = existing["id"]
+    else:
+        new_folder = await frame_client.create_folder(project_folder_id, name)
+        folder_id = new_folder["id"]
     _discipline_folder_cache[cache_key] = folder_id
     return folder_id
 
 
 def _reset_caches() -> None:
-    _year_folder_cache.clear()
     _discipline_folder_cache.clear()
 
 
 async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
-    """Mirror one Notion Project page to a Frame.io folder under the root
-    project. Idempotent + self-healing. Called by the queue worker for a
-    `frame_project_sync` task; safe to re-run on every button click.
+    """Mirror one Notion Project page to a Frame.io Project under the
+    configured workspace. Idempotent + self-healing. Called by the queue
+    worker for a `frame_project_sync` task; safe to re-run on every button
+    click.
+
+    Re-fetches the page so the project name reflects the title AT PROCESSING
+    TIME (a rename between click and processing is picked up). Renaming a
+    Frame Project preserves both its project_id and its root_folder_id, so
+    cached child folders + Notion URLs all stay valid.
     """
     result = FrameProjectResult(project_page_id=project_page_id)
 
     if not settings.sync_frame:
         result.note = "SYNC_FRAME=false"
         return result
-    if not settings.frame_root_project_id:
-        result.note = "FRAME_ROOT_PROJECT_ID not set"
+    if not settings.frame_workspace_id:
+        result.note = "FRAME_WORKSPACE_ID not set"
         return result
 
     try:
@@ -256,8 +321,13 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
         result.note = "no title yet"
         return result
 
+    # We still go through project_path_parts to apply leaf sanitization
+    # (illegal-char replacement) — the year half of the tuple is ignored
+    # because the Frame layout no longer has a year tier. Keeping the same
+    # sanitization as Gmail/NAS means the project name is byte-identical
+    # across all three systems.
     created_time = page.get("created_time")
-    year, leaf = project_path_parts(title, created_time)
+    _year, leaf = project_path_parts(title, created_time)
 
     try:
         async with SessionLocal() as session:
@@ -267,31 +337,74 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
                 row = None  # fall through to the create branch
 
             if row is None:
-                year_folder_id = await _ensure_year_folder(year)
-                new_folder = await frame_client.create_folder(year_folder_id, leaf)
-                folder_id = new_folder["id"]
-                url = _view_url(new_folder, folder_id)
+                # Look for an existing Frame Project in this workspace with
+                # the matching name BEFORE creating a new one. Same dedup
+                # intent as the folder-level adoption: Frame allows
+                # duplicate-name projects, so without this check a project
+                # pre-created in the UI (or left over from a cache wipe)
+                # would silently get a sibling.
+                existing = await _find_workspace_project_by_name(
+                    settings.frame_workspace_id, leaf
+                )
+                if existing is not None:
+                    project_id = existing["id"]
+                    root_folder_id = _root_folder_id_of(existing)
+                    # list_projects may not include view_url or root_folder_id
+                    # on every entry; fetch the project explicitly when either
+                    # is missing so the cached URL is real and downstream
+                    # task-folder creation has the right parent.
+                    if not existing.get("view_url") or not root_folder_id:
+                        adopted = await frame_client.get_project(project_id)
+                        root_folder_id = root_folder_id or _root_folder_id_of(
+                            adopted
+                        )
+                    else:
+                        adopted = existing
+                    if not root_folder_id:
+                        raise RuntimeError(
+                            f"adopted frame project {project_id} returned no "
+                            "root_folder_id"
+                        )
+                    url = _project_view_url(adopted, project_id)
+                    action = "adopted"
+                else:
+                    new_project = await frame_client.create_project(
+                        settings.frame_workspace_id, leaf
+                    )
+                    project_id = new_project["id"]
+                    root_folder_id = _root_folder_id_of(new_project)
+                    if not root_folder_id:
+                        # Defensive: every create_project response we've seen
+                        # carries root_folder_id, but if Frame ever changes
+                        # shape we'd silently break task-folder creation
+                        # downstream. Raise loudly here.
+                        raise RuntimeError(
+                            f"create_project for {leaf!r} returned no "
+                            "root_folder_id"
+                        )
+                    url = _project_view_url(new_project, project_id)
+                    action = "created"
                 session.add(
                     FrameProjectFolder(
                         notion_page_id=project_page_id,
-                        frame_folder_id=folder_id,
-                        frame_parent_id=year_folder_id,
+                        frame_project_id=project_id,
+                        frame_folder_id=root_folder_id,
                         current_name=leaf,
-                        current_year=year,
                         frame_url=url,
                     )
                 )
-                action = "created"
             elif row.current_name != leaf:
-                renamed = await frame_client.rename_folder(row.frame_folder_id, leaf)
-                folder_id = row.frame_folder_id
-                url = _view_url(renamed, folder_id)
+                renamed = await frame_client.rename_project(
+                    row.frame_project_id, leaf
+                )
+                project_id = row.frame_project_id
+                url = _project_view_url(renamed, project_id)
                 row.current_name = leaf
                 row.frame_url = url
                 await session.merge(row)
                 action = "renamed"
             else:
-                folder_id = row.frame_folder_id
+                project_id = row.frame_project_id
                 url = row.frame_url
                 action = "unchanged"
 
@@ -302,7 +415,7 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
         return result
 
     # Best-effort: a Notion writeback failure shouldn't fail the whole task —
-    # the folder exists in Frame and the cache row records the URL, so the
+    # the project exists in Frame and the cache row records the URL, so the
     # next run will retry the patch.
     try:
         await notion_client.set_project_frame_url(project_page_id, url)
@@ -312,14 +425,24 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
         )
 
     result.action = action
-    result.frame_folder_id = folder_id
+    result.frame_project_id = project_id
     result.frame_url = url
+    # frame_folder_id (the project's root_folder_id) is informational on the
+    # result. Read it back from the cache row for unchanged/renamed paths; in
+    # the create/adopt branches the local variable is already set above.
+    if action in ("renamed", "unchanged"):
+        async with SessionLocal() as session:
+            row = await session.get(FrameProjectFolder, project_page_id)
+            if row is not None:
+                result.frame_folder_id = row.frame_folder_id
+    else:
+        result.frame_folder_id = root_folder_id
     logger.info(
-        "frame project sync %s for %r (page %s) → %s",
+        "frame project sync %s for %r (page %s) → project=%s",
         action,
         leaf,
         project_page_id,
-        folder_id,
+        project_id,
     )
     return result
 
@@ -335,8 +458,8 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
     if not settings.sync_frame:
         result.note = "SYNC_FRAME=false"
         return result
-    if not settings.frame_root_project_id:
-        result.note = "FRAME_ROOT_PROJECT_ID not set"
+    if not settings.frame_workspace_id:
+        result.note = "FRAME_WORKSPACE_ID not set"
         return result
 
     try:
@@ -397,8 +520,30 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
             result.note = "parent project not provisioned"
             return result
 
+        # frame_folder_id on the project row IS the Project's root_folder_id —
+        # so this is unchanged from before the refactor (the semantics shifted
+        # but the column we pass in is the same).
         discipline_folder_id = await _ensure_discipline_folder(
             project_row.frame_folder_id, discipline_key
+        )
+        # Carry the project_id so we can scope the fallback view_url for any
+        # task folder that comes back without one.
+        project_id_for_url = project_row.frame_project_id
+
+        # Per-task placeholder filename, e.g.
+        #   "1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png"
+        # Computed from the project's CURRENT cached name plus the task's
+        # title + the configured studio slot. The "_V00" marks this as the
+        # placeholder version; the team's first real delivery uploads on
+        # top of it as V01 in Frame's version stack.
+        #
+        # Renames in Notion (project or task) won't auto-rename an existing
+        # uploaded placeholder file — Frame's version stack keys on file
+        # slot id, not name, so the stale filename is purely cosmetic and
+        # the upload-on-top workflow still functions. If we ever want to
+        # rename the file too, that's a separate enhancement.
+        placeholder_filename = _placeholder_filename(
+            project_row.current_name, task_name
         )
 
         async with SessionLocal() as session:
@@ -408,15 +553,47 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
                 row = None
 
             if row is None:
-                new_folder = await frame_client.create_folder(
+                # Same adopt-or-create dance as sync_frame_project: a manually
+                # pre-created task folder (or a folder left over after a cache
+                # wipe) gets adopted instead of duplicated. If we adopt, also
+                # look for an existing placeholder.png inside it — Frame allows
+                # duplicate file names, so without the lookup an adopted folder
+                # that already had a placeholder would end up with two.
+                existing_folder = await _find_child_folder_by_name(
                     discipline_folder_id, task_name
                 )
-                folder_id = new_folder["id"]
-                placeholder = await frame_client.create_file_from_url(
-                    folder_id, PLACEHOLDER_FILE_NAME, settings.frame_placeholder_url
-                )
-                placeholder_id = placeholder["id"]
-                url = _view_url(new_folder, folder_id)
+                if existing_folder is not None:
+                    folder_id = existing_folder["id"]
+                    adopted = (
+                        existing_folder
+                        if existing_folder.get("view_url")
+                        else await frame_client.get_folder(folder_id)
+                    )
+                    url = _folder_view_url(adopted, folder_id, project_id_for_url)
+                    existing_placeholder = await _find_child_file_by_name(
+                        folder_id, placeholder_filename
+                    )
+                    if existing_placeholder is not None:
+                        placeholder_id = existing_placeholder["id"]
+                    else:
+                        placeholder = await frame_client.create_file_from_url(
+                            folder_id,
+                            placeholder_filename,
+                            settings.frame_placeholder_url,
+                        )
+                        placeholder_id = placeholder["id"]
+                    action = "adopted"
+                else:
+                    new_folder = await frame_client.create_folder(
+                        discipline_folder_id, task_name
+                    )
+                    folder_id = new_folder["id"]
+                    placeholder = await frame_client.create_file_from_url(
+                        folder_id, placeholder_filename, settings.frame_placeholder_url
+                    )
+                    placeholder_id = placeholder["id"]
+                    url = _folder_view_url(new_folder, folder_id, project_id_for_url)
+                    action = "created"
                 session.add(
                     FrameTaskFolder(
                         notion_page_id=task_page_id,
@@ -428,7 +605,6 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
                         frame_url=url,
                     )
                 )
-                action = "created"
             elif row.current_name != task_name:
                 # Discipline change is logged but not re-parented in Phase 1 —
                 # cross-folder move requires a V4 endpoint we haven't verified
@@ -447,7 +623,7 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
                 renamed = await frame_client.rename_folder(row.frame_folder_id, task_name)
                 folder_id = row.frame_folder_id
                 placeholder_id = row.frame_placeholder_file_id
-                url = _view_url(renamed, folder_id)
+                url = _folder_view_url(renamed, folder_id, project_id_for_url)
                 row.current_name = task_name
                 row.current_discipline = discipline_label
                 row.frame_url = url
@@ -485,5 +661,3 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
         folder_id,
     )
     return result
-
-

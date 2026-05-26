@@ -1,11 +1,16 @@
 """Project → Gmail label sync engine.
 
-Reconcile + create a project's Gmail label across every active mailbox, plus the
-NAS folder for the project. This is the work the Projects-DB "Sync to Gmail"
-button used to do INLINE in the webhook — which intermittently exceeded Notion's
-button-webhook timeout and showed "failed to execute". It now runs in the durable
-queue worker (a `label_sync` task), so the button just enqueues and returns. See
+Reconcile + create a project's Gmail label across every active mailbox. This
+is the work the Projects-DB "Sync to Gmail" button used to do INLINE in the
+webhook — which intermittently exceeded Notion's button-webhook timeout and
+showed "failed to execute". It now runs in the durable queue worker (a
+`label_sync` task), so the button just enqueues and returns. See
 docs/misc/gotchas.md and CLAUDE.md "sync work is queued, not inline".
+
+NAS folder provisioning used to live here too; it's been split into its own
+`nas_folder_sync` task (sync/sync_nas.py) so each system has independent
+retry/failure surface and its own per-system Notion button. The Initialize
+button fans out to label_sync + nas_folder_sync + frame_project_sync.
 
 Idempotent and self-healing, like sync_thread: re-running fixes drift (Notion
 rename, Gmail-side rename, label deleted) and creates anything missing.
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
@@ -25,11 +31,10 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
-from gb_automations.clients import nas as nas_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import settings
 from gb_automations.db import SessionLocal
-from gb_automations.models import ProjectFolder, ProjectLabel, User
+from gb_automations.models import ProjectLabel, User
 from gb_automations.utils.labels import project_label_path
 
 logger = logging.getLogger(__name__)
@@ -53,7 +58,7 @@ class LabelSyncResult:
     patched: list[str] = field(default_factory=list)
     healed: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
-    nas_action: str = "skipped"
+    gmail_url: str | None = None  # PATCHed onto the Projects-DB "Gmail" property
     note: str | None = None  # set when there's nothing to do (e.g. no title)
 
 
@@ -257,84 +262,34 @@ async def _reconcile_label_for_all_users(
     }
 
 
-async def _sync_nas_folder_for_project(
-    notion_page_id: str,
-    title: str,
-    created_time: str | None,
-    disciplines: list[str] | None = None,
-) -> str:
-    """Create or rename the project's folder structure on the office NAS.
+def _gmail_label_view_url(label_path: str) -> str:
+    """Build a Gmail URL that opens this label in whichever Goldbox mailbox
+    the team member is currently signed into.
 
-    `disciplines` are the raw Notion `Type` labels (derived from this
-    project's tasks); they decide which
-    discipline-conditional branches get created (the NAS layer normalizes and
-    filters them). Re-read from Notion each sync — not persisted — so a
-    discipline added in Notion gets its folders on the next sync.
-
-    Best-effort and fully decoupled from the Gmail-label step: a down or
-    unmounted share (or any filesystem error) is logged and reported, never
-    raised. Returns: "created" | "renamed" | "unchanged" | "skipped" | "failed".
+    `/u/0/` is Gmail's "first signed-in account in this browser" slot — so a
+    single project-level URL works regardless of which mailbox the user
+    happens to have active. The label path is URL-encoded with `safe=""` so
+    forward slashes (Gmail's label-nesting separator) become `%2F` exactly
+    as Gmail's own UI builds these URLs.
     """
-    if not (settings.sync_nas_folders and settings.nas_projects_root):
-        return "skipped"
-
-    if not await asyncio.to_thread(nas_client.nas_available):
-        logger.warning(
-            "↳ NAS unavailable (root %r not a writable dir); skipping folder sync",
-            settings.nas_projects_root,
-        )
-        return "failed"
-
-    try:
-        async with SessionLocal() as session:
-            row = await session.get(ProjectFolder, notion_page_id)
-
-            if row is None:
-                target = await asyncio.to_thread(
-                    nas_client.ensure_project_folders, title, created_time, disciplines
-                )
-                outcome = "created"
-            elif row.current_name != title:
-                target = await asyncio.to_thread(
-                    nas_client.rename_project_folder,
-                    row.current_name,
-                    title,
-                    created_time,
-                    disciplines,
-                )
-                outcome = "renamed"
-            else:
-                # Unchanged name — still ensure the structure exists, so a folder
-                # a user deleted by hand (or a discipline added in Notion since
-                # the last sync) gets healed/created on the next click.
-                target = await asyncio.to_thread(
-                    nas_client.ensure_project_folders, title, created_time, disciplines
-                )
-                outcome = "unchanged"
-
-            await session.merge(
-                ProjectFolder(
-                    notion_page_id=notion_page_id,
-                    current_path=str(target),
-                    current_name=title,
-                )
-            )
-            await session.commit()
-        logger.info("↳ NAS folder %s: %s", outcome, target)
-        return outcome
-    except Exception:
-        logger.exception("↳ NAS folder sync failed for project %r", title)
-        return "failed"
+    return (
+        "https://mail.google.com/mail/u/0/#label/"
+        + urllib.parse.quote(label_path, safe="")
+    )
 
 
 async def sync_project_labels(project_page_id: str) -> LabelSyncResult:
-    """Reconcile + create this project's Gmail label across every active mailbox,
-    then sync the NAS folder. The durable queue worker calls this for a
-    `label_sync` task; idempotent, so retries and re-clicks are safe.
+    """Reconcile + create this project's Gmail label across every active
+    mailbox. The durable queue worker calls this for a `label_sync` task;
+    idempotent, so retries and re-clicks are safe.
 
-    Re-fetches the page so the label name reflects the title AT PROCESSING TIME
-    (a rename between click and processing is picked up). The year segment comes
-    from Notion's immutable created_time, so renames only change the leaf.
+    Re-fetches the page so the label name reflects the title AT PROCESSING
+    TIME (a rename between click and processing is picked up). The year
+    segment comes from Notion's immutable created_time, so renames only
+    change the leaf.
+
+    NAS folder provisioning is a separate task type (`nas_folder_sync`);
+    this function no longer touches the NAS layer.
     """
     page = await notion_client.get_page(project_page_id)
 
@@ -375,31 +330,20 @@ async def sync_project_labels(project_page_id: str) -> LabelSyncResult:
             len(result.healed),
             len(result.failed),
         )
+
+        # Best-effort writeback: a Notion patch failure shouldn't fail the
+        # whole task — the labels exist in Gmail and the next run will retry.
+        # We write the URL even on `unchanged` so a project provisioned before
+        # the Gmail URL column existed gets backfilled on its next sync.
+        gmail_url = _gmail_label_view_url(label_name)
+        result.gmail_url = gmail_url
+        try:
+            await notion_client.set_project_gmail_url(project_page_id, gmail_url)
+        except Exception:
+            logger.exception(
+                "↳ failed to patch Gmail URL on project page %s", project_page_id
+            )
     else:
         logger.info("↳ gmail label sync skipped (SYNC_GMAIL_LABELS=false)")
-
-    # Project disciplines are DERIVED from this project's tasks (Oppgaver) — the
-    # union of each task's Type select. Single source of truth: tasks own
-    # their own discipline; the project is "the set of disciplines its tasks
-    # have". A project with no tasks yet (tilbud phase) gets always-folders only.
-    # No tasks DB configured / no relation set / Notion query fails → empty list.
-    disciplines: list[str] = []
-    try:
-        task_pages = await notion_client.tasks_for_project(project_page_id)
-        for task_page in task_pages:
-            label = notion_client.task_discipline(task_page)
-            if label:
-                disciplines.append(label)
-    except Exception:
-        logger.exception(
-            "↳ failed to query tasks for project %s; provisioning always-folders only",
-            project_page_id,
-        )
-
-    result.nas_action = await _sync_nas_folder_for_project(
-        project_page_id, title, created_time, disciplines
-    )
-    if result.nas_action != "skipped":
-        logger.info("↳ NAS folder %s", result.nas_action)
 
     return result

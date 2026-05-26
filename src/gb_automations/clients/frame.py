@@ -223,9 +223,11 @@ async def list_workspaces(account_id: str) -> list[dict[str, Any]]:
 async def list_projects(account_id: str, workspace_id: str) -> list[dict[str, Any]]:
     """Frame.io Projects inside a workspace.
 
-    Called from the bootstrap script to let the operator pick which Project
-    will host all Goldbox folders (FRAME_ROOT_PROJECT_ID). Returns the raw
-    `data` array — each item has at least `id` and `name`.
+    sync_frame uses this to find existing same-name projects before creating
+    a duplicate (adopt-by-name pattern). Each Notion project corresponds to
+    one Frame Project, listed here in the workspace's Active Projects view.
+    Returns the raw `data` array — each item has at least `id` and `name`,
+    plus typically `root_folder_id` and `view_url`.
     """
     token = await frame_auth.get_access_token()
     async with await _client(access_token=token) as client:
@@ -237,6 +239,60 @@ async def list_projects(account_id: str, workspace_id: str) -> list[dict[str, An
         )
         _raise_for_status(response)
         return response.json().get("data", [])
+
+
+async def create_project(workspace_id: str, name: str) -> dict[str, Any]:
+    """Create a top-level Frame Project under a workspace. Returns the new
+    project object (including id, name, root_folder_id, view_url).
+
+    V4 endpoint: POST /v4/accounts/{aid}/workspaces/{wid}/projects.
+
+    The response carries a `root_folder_id` (the auto-created root folder
+    that becomes the parent of every folder we provision inside this
+    project). It's immutable for the lifetime of the Project and is what
+    sync_frame_task uses as the parent when creating discipline subfolders.
+    """
+    token = await frame_auth.get_access_token()
+    body = {"data": {"name": name}}
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.post(
+                f"/accounts/{_account_id()}/workspaces/{workspace_id}/projects",
+                json=body,
+            ),
+            op_name="create_project",
+        )
+        _raise_for_status(response)
+        project = _unwrap(response.json())
+        logger.info(
+            "frame project created %r in workspace %s (id=%s)",
+            name,
+            workspace_id,
+            project.get("id"),
+        )
+        return project
+
+
+async def rename_project(project_id: str, new_name: str) -> dict[str, Any]:
+    """Rename a Frame Project in place. The project id (and its root_folder_id)
+    are preserved, so cached child-folder ids underneath stay valid.
+
+    V4 endpoint: PATCH /v4/accounts/{aid}/projects/{pid}. Same body shape as
+    rename_folder."""
+    token = await frame_auth.get_access_token()
+    body = {"data": {"name": new_name}}
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/accounts/{_account_id()}/projects/{project_id}",
+                json=body,
+            ),
+            op_name="rename_project",
+        )
+        _raise_for_status(response)
+        project = _unwrap(response.json())
+        logger.info("frame project renamed %s → %s", project_id, new_name)
+        return project
 
 
 # ============================================================
@@ -271,8 +327,10 @@ def _unwrap(payload: Any) -> Any:
 
 
 async def get_project(project_id: str) -> dict[str, Any]:
-    """Fetch a Frame.io Project. Used by /debug/frame/project to confirm
-    FRAME_ROOT_PROJECT_ID resolves on Goldbox's tenant."""
+    """Fetch a Frame.io Project. Used by sync_frame for self-heal (a 404 here
+    on a cached project id means the project was archived/deleted in Frame
+    and the cache row must be evicted) and for fetching missing view_url /
+    root_folder_id on adopted projects."""
     token = await frame_auth.get_access_token()
     async with await _client(access_token=token) as client:
         response = await _with_retries(

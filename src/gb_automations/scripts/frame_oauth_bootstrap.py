@@ -20,10 +20,15 @@ Flow (run inside the api container):
      share the container's /tmp).
   5. This script polls that file, reads the refresh token, calls /me +
      /accounts + /accounts/{id}/workspaces to confirm the token works and
-     to let you pick the right workspace.
+     to let you pick the right account + workspace.
   6. Prints the lines to paste into .env. (We don't write .env directly
      because the file lives on the host, not in the container — copy-
      paste is more transparent than a host-mount round-trip.)
+
+Each Notion project becomes its own top-level Frame Project under the chosen
+workspace — created on demand by sync_frame_project the first time a Notion
+project is provisioned. There is no shared "root project" to pick during
+bootstrap.
 """
 
 from __future__ import annotations
@@ -147,31 +152,22 @@ async def main() -> None:
         _die(f"Account {account['name']!r} has no workspaces.")
     workspace = _pick("workspace", workspaces)
 
-    # Resolve the shared Frame Project that the Notion → Frame sync will use as
-    # the parent for every Goldbox project folder. Goldbox normally has one
-    # ("Goldbox") inside the workspace; if there are several, the operator picks.
-    # Stashing the resolved IDs in `settings` so list_projects works against the
-    # right scope on the next call. Errors here are non-fatal — auth-only setup
-    # still completes; Phase 1 just won't have a root project until re-bootstrapped.
+    # Stash the resolved IDs in `settings` so subsequent Frame calls (e.g. the
+    # debug listing below) work against the right scope.
     settings.frame_account_id = account["id"]
     settings.frame_workspace_id = workspace["id"]
 
-    print()
-    print("Step 5 — Picking the shared Frame Project (parent for all Goldbox folders)…")
-
-    root_project: dict | None = None
+    # Optional sanity check: list current projects in the workspace so the
+    # operator sees what's there. Non-fatal — if it errors we just skip.
     try:
         projects = await frame.list_projects(account["id"], workspace["id"])
+        print()
+        print(f"  Workspace currently contains {len(projects)} project(s).")
+        if projects:
+            preview = ", ".join(p.get("name", "(no name)") for p in projects[:5])
+            print(f"  First few: {preview}{'…' if len(projects) > 5 else ''}")
     except frame.FrameAPIError as err:
-        print(f"  ⚠  Could not list projects: {err}")
-        print(
-            "  You can set FRAME_ROOT_PROJECT_ID by hand later, or re-run the "
-            "bootstrap once the permissions issue is resolved."
-        )
-        projects = []
-
-    if projects:
-        root_project = _pick("project", projects)
+        print(f"  (Could not list projects for preview: {err}; non-fatal.)")
 
     print()
     print("=" * 76)
@@ -181,23 +177,19 @@ async def main() -> None:
     print(f"FRAME_REFRESH_TOKEN={refresh_token}")
     print(f"FRAME_ACCOUNT_ID={account['id']}")
     print(f"FRAME_WORKSPACE_ID={workspace['id']}")
-    if root_project is not None:
-        print(f"FRAME_ROOT_PROJECT_ID={root_project['id']}")
-    else:
-        print("# FRAME_ROOT_PROJECT_ID=<not resolved — pick a Project later>")
     print()
-    print("To enable Phase 1 (Notion → Frame folder mirror), also set:")
+    print("To enable Phase 1 (Notion → Frame Project + folder mirror), also set:")
     print("  SYNC_FRAME=true")
-    print("  FRAME_PLACEHOLDER_URL=https://hub.<your-domain>/assets/placeholder.png")
+    print("  FRAME_PLACEHOLDER_URL=https://hub.<your-domain>/assets/Goldbox_Logo_White.png")
     print()
     print("Then on the host:")
     print("  docker compose up -d --force-recreate api")
     print()
     print(
-        "Test with: curl https://hub.{your-domain}/debug/frame          "
+        "Test with: curl https://hub.{your-domain}/debug/frame             "
         "→ {\"ok\": true, ...}\n"
-        "          curl https://hub.{your-domain}/debug/frame/project  "
-        "→ confirms FRAME_ROOT_PROJECT_ID"
+        "          curl https://hub.{your-domain}/debug/frame/workspace   "
+        "→ lists existing projects in the workspace"
     )
     print()
 

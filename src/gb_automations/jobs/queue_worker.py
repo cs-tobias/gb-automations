@@ -35,6 +35,7 @@ from gb_automations.sync.queue import (
 )
 from gb_automations.sync.sync_frame import sync_frame_project, sync_frame_task
 from gb_automations.sync.sync_labels import sync_project_labels
+from gb_automations.sync.sync_nas import sync_nas_folder
 from gb_automations.sync.sync_tasks import sync_task_folder
 from gb_automations.sync.sync_thread import sync_thread
 
@@ -154,6 +155,16 @@ async def _process_label_sync(claimed: _Claimed, progress: str) -> None:
         "▶ task %s — syncing labels for project %s%s", progress, project_page_id, retry_note
     )
 
+    # Mid-task progress write: state is still 'active' (the task is in_progress),
+    # so the "N/M - Gmail labels" string lands in the Notion field. The
+    # post-completion refresh_project_dot at the bottom of this function will
+    # then clear it once the queue goes idle, so a fast per-system click flashes
+    # briefly visible and disappears once done — the visibility the operator
+    # wanted on single-button clicks.
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Gmail labels"
+    )
+
     outcome_error: str | None = None
     try:
         if not project_page_id:
@@ -169,6 +180,46 @@ async def _process_label_sync(claimed: _Claimed, progress: str) -> None:
 
     await _record_outcome(
         claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(project_page_id)
+    )
+    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+
+
+async def _process_nas_folder_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a nas_folder_sync task: provision the project's folder structure on
+    the office NAS share, write the Windows-facing path back to the Projects-DB
+    "NAS" URL column, and light the project dot via the same queue_mirror path
+    label_sync uses.
+    """
+    project_page_id = claimed.project_page_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing NAS folder for project %s%s",
+        progress,
+        project_page_id,
+        retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="NAS folder"
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError("nas_folder_sync task has no project_page_id")
+        result = await sync_nas_folder(project_page_id)
+        if result.action == "failed":
+            outcome_error = result.note or "nas folder sync failed"
+    except Exception as err:
+        log_api_error(logger, f"nas folder sync crashed for {project_page_id}", err)
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(project_page_id),
     )
     await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
@@ -219,6 +270,10 @@ async def _process_frame_project_sync(claimed: _Claimed, progress: str) -> None:
         progress,
         project_page_id,
         retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Frame.io folder"
     )
 
     outcome_error: str | None = None
@@ -301,6 +356,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
     """
     if claimed.task_type == "label_sync":
         await _process_label_sync(claimed, progress)
+        return
+    if claimed.task_type == "nas_folder_sync":
+        await _process_nas_folder_sync(claimed, progress)
         return
     if claimed.task_type == "task_folder_sync":
         await _process_task_folder_sync(claimed, progress)

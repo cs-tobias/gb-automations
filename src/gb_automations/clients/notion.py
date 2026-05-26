@@ -17,6 +17,8 @@ from gb_automations.config import (
     CONTACTS_PROPS,
     EMAILS_PROPS,
     PROJECTS_FRAME_URL_PROP,
+    PROJECTS_GMAIL_URL_PROP,
+    PROJECTS_NAS_URL_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
     SYNC_QUEUE_PROPS,
@@ -649,6 +651,45 @@ async def set_task_frame_url(task_page_id: str, url: str | None) -> None:
                 f"/pages/{task_page_id}", json={"properties": props}
             ),
             op_name=f"PATCH /pages/{task_page_id} frame_url (task)",
+        )
+        _raise_for_status(response)
+
+
+async def set_project_gmail_url(project_page_id: str, url: str | None) -> None:
+    """Write the Gmail URL property on a Projects-DB page. Idempotent.
+
+    Called by sync_project_labels once the project's Gmail label is created or
+    confirmed live across mailboxes. The URL points at the generic /u/0/ label
+    path, so it opens for whichever Goldbox mailbox the team member happens to
+    be signed into. Pass `url=None` to clear (e.g. for an "unprovisioned"
+    visual when the label was deleted in every mailbox).
+    """
+    props = {PROJECTS_GMAIL_URL_PROP: {"url": url}}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{project_page_id} gmail_url (project)",
+        )
+        _raise_for_status(response)
+
+
+async def set_project_nas_url(project_page_id: str, url: str | None) -> None:
+    """Write the NAS path property on a Projects-DB page. Idempotent.
+
+    Despite the name, this is a plain URL property in Notion — Notion accepts
+    arbitrary text in URL fields, including Windows-style `W:\\Prosjekt\\...`
+    paths. The team can copy the value and paste it straight into File
+    Explorer. Pass `url=None` to clear.
+    """
+    props = {PROJECTS_NAS_URL_PROP: {"url": url}}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{project_page_id} nas_url (project)",
         )
         _raise_for_status(response)
 

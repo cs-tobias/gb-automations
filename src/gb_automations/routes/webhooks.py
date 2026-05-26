@@ -49,6 +49,7 @@ from gb_automations.sync.queue import (
     enqueue_frame_project_sync,
     enqueue_frame_task_sync,
     enqueue_label_sync,
+    enqueue_nas_folder_sync,
     enqueue_task_folder_sync,
     enqueue_threads,
 )
@@ -318,6 +319,174 @@ async def notion_resync_project(request: Request) -> Response:
         return await _resync_project_impl(request)
 
 
+async def _resolve_project_button_click(request: Request) -> tuple[str, str]:
+    """Shared front-half of the per-system Projects-DB buttons.
+
+    Verifies the bearer token, extracts the page id from the Notion envelope,
+    fetches the page, checks it's a Projects-DB row, and reads its title.
+    Returns (page_id, title); raises HTTPException on any validation failure
+    (the FastAPI handler then surfaces the right status code automatically).
+
+    Factored out because the three per-system endpoints
+    (/webhooks/notion/sync-gmail | sync-nas | sync-frame) all share this
+    pre-flight — the only thing that varies is which enqueue_* they call.
+    """
+    if not _verify_bearer(request.headers.get("Authorization")):
+        logger.warning(
+            "Notion button auth failed (NOTION_WEBHOOK_SECRET set: %s)",
+            bool(settings.notion_webhook_secret),
+        )
+        raise HTTPException(401, "Bad or missing bearer token")
+
+    raw_body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body") from None
+
+    page_id = ((payload.get("data") or {}).get("id") or "").strip()
+    if not page_id:
+        raise HTTPException(400, "Missing data.id in Notion button payload")
+
+    try:
+        page = await notion_client.get_page(page_id)
+    except Exception as err:
+        logger.exception("Failed to fetch Notion page %s", page_id)
+        raise HTTPException(502, f"Notion fetch failed: {err}") from err
+
+    if not _page_parented_to_projects_db(page):
+        logger.warning("↳ page %s is not in the Projects DB; rejecting", page_id)
+        raise HTTPException(
+            400, "page is not in the configured Projects DB"
+        )
+
+    title = notion_client.extract_page_title(page)
+    if not title:
+        raise HTTPException(400, "page has no title yet")
+    return page_id, title
+
+
+async def _sync_gmail_impl(request: Request) -> Response:
+    page_id, title = await _resolve_project_button_click(request)
+    inserted = await enqueue_label_sync(page_id)
+    queue_worker.wake()
+    logger.info(
+        "🏷  gmail-only sync requested for %r (page %s) — %s",
+        title,
+        page_id,
+        "enqueued" if inserted else "already queued",
+    )
+    return _json(
+        {
+            "page_id": page_id,
+            "kind": "label_sync",
+            "action": "queued" if inserted else "already_queued",
+        }
+    )
+
+
+async def _sync_nas_impl(request: Request) -> Response:
+    page_id, title = await _resolve_project_button_click(request)
+    if not (settings.sync_nas_folders and settings.nas_projects_root):
+        logger.info(
+            "↳ NAS sync click for %r ignored — sync_nas_folders=%s nas_projects_root=%r",
+            title,
+            settings.sync_nas_folders,
+            settings.nas_projects_root,
+        )
+        return _json(
+            {
+                "page_id": page_id,
+                "kind": "nas_folder_sync",
+                "action": "skipped",
+                "reason": "NAS sync is disabled or unconfigured",
+            }
+        )
+    inserted = await enqueue_nas_folder_sync(page_id)
+    queue_worker.wake()
+    logger.info(
+        "📁 nas-only sync requested for %r (page %s) — %s",
+        title,
+        page_id,
+        "enqueued" if inserted else "already queued",
+    )
+    return _json(
+        {
+            "page_id": page_id,
+            "kind": "nas_folder_sync",
+            "action": "queued" if inserted else "already_queued",
+        }
+    )
+
+
+async def _sync_frame_impl(request: Request) -> Response:
+    page_id, title = await _resolve_project_button_click(request)
+    if not settings.sync_frame:
+        logger.info("↳ Frame sync click for %r ignored — SYNC_FRAME=false", title)
+        return _json(
+            {
+                "page_id": page_id,
+                "kind": "frame_project_sync",
+                "action": "skipped",
+                "reason": "SYNC_FRAME=false",
+            }
+        )
+    inserted = await enqueue_frame_project_sync(page_id)
+    queue_worker.wake()
+    logger.info(
+        "🎬 frame-only sync requested for %r (page %s) — %s",
+        title,
+        page_id,
+        "enqueued" if inserted else "already queued",
+    )
+    return _json(
+        {
+            "page_id": page_id,
+            "kind": "frame_project_sync",
+            "action": "queued" if inserted else "already_queued",
+        }
+    )
+
+
+@router.post("/notion/sync-gmail")
+async def notion_sync_gmail(request: Request) -> Response:
+    """Per-system "Sync Gmail labels" button receiver (on the Projects DB).
+
+    Enqueues a single `label_sync` task for the clicked project — no NAS, no
+    Frame.io fan-out. Idempotent: a project already being label-synced is a
+    no-op (dedup'd via uq_sync_tasks_active_label). Pair with the global
+    Initialize button when the team wants to (re)provision just one system.
+    """
+    with request_scope("sync-gmail"):
+        return await _sync_gmail_impl(request)
+
+
+@router.post("/notion/sync-nas")
+async def notion_sync_nas(request: Request) -> Response:
+    """Per-system "Sync NAS" button receiver (on the Projects DB).
+
+    Enqueues a single `nas_folder_sync` task for the clicked project — no
+    Gmail, no Frame.io fan-out. Idempotent. Returns `skipped` when NAS is
+    disabled (sync_nas_folders=false) or unconfigured (no NAS_PROJECTS_ROOT)
+    so the Notion-side automation surface is obvious without the click
+    silently doing nothing.
+    """
+    with request_scope("sync-nas"):
+        return await _sync_nas_impl(request)
+
+
+@router.post("/notion/sync-frame")
+async def notion_sync_frame(request: Request) -> Response:
+    """Per-system "Sync Frame.io" button receiver (on the Projects DB).
+
+    Enqueues a single `frame_project_sync` task for the clicked project — no
+    Gmail, no NAS fan-out. Idempotent. Returns `skipped` when Frame
+    integration is off (SYNC_FRAME=false).
+    """
+    with request_scope("sync-frame"):
+        return await _sync_frame_impl(request)
+
+
 async def _notion_webhook_impl(request: Request) -> Response:
     logger.info("📓 Notion button click received")
 
@@ -419,26 +588,33 @@ async def _notion_webhook_impl(request: Request) -> Response:
             }
         )
 
-    # Enqueue + return — do NOT do the Gmail/NAS work inline. That work is many
-    # sequential Gmail calls per mailbox; doing it on the request path made this
-    # button intermittently exceed Notion's webhook timeout ("failed to execute",
-    # button auto-paused). The durable queue worker now runs it (a `label_sync`
-    # task) with retries/backoff/visibility, exactly like the resync buttons.
-    # The label name is recomputed at processing time from the (possibly renamed)
-    # title — see sync.sync_labels.sync_project_labels.
+    # Enqueue + return — do NOT do the Gmail/NAS/Frame work inline. That work
+    # is many sequential external API calls; doing it on the request path made
+    # this button intermittently exceed Notion's webhook timeout ("failed to
+    # execute", button auto-paused). The durable queue worker now runs each
+    # task type independently with retries/backoff/visibility, exactly like
+    # the resync buttons. Names are recomputed at processing time from the
+    # (possibly renamed) title — see each sync engine.
     inserted = await enqueue_label_sync(page_id)
+    nas_inserted = 0
+    if settings.sync_nas_folders and settings.nas_projects_root:
+        # Fan-out: same click also enqueues the NAS provisioner so Initialize
+        # still provisions all three systems with one button. Independent
+        # task_type means a NAS failure no longer blocks Gmail retries (and a
+        # Gmail failure no longer hides a successful NAS run).
+        nas_inserted = await enqueue_nas_folder_sync(page_id)
     frame_inserted = 0
     if settings.sync_frame:
-        # Fan-out: one Projects-DB button click also enqueues the Frame project
-        # mirror so the same click provisions Gmail labels + NAS folder + Frame
-        # folder. Each is its own task_type, retried independently.
         frame_inserted = await enqueue_frame_project_sync(page_id)
     queue_worker.wake()
     logger.info(
-        "🏷  label sync requested for %r (page %s) — labels=%s frame=%s",
+        "🏷  initialize requested for %r (page %s) — labels=%s nas=%s frame=%s",
         title,
         page_id,
         "enqueued" if inserted else "already queued",
+        ("enqueued" if nas_inserted else "already queued")
+        if (settings.sync_nas_folders and settings.nas_projects_root)
+        else "off",
         ("enqueued" if frame_inserted else "already queued")
         if settings.sync_frame
         else "off",
@@ -447,6 +623,9 @@ async def _notion_webhook_impl(request: Request) -> Response:
         {
             "page_id": page_id,
             "action": "queued" if inserted else "already_queued",
+            "nas": ("queued" if nas_inserted else "already_queued")
+            if (settings.sync_nas_folders and settings.nas_projects_root)
+            else "off",
             "frame": ("queued" if frame_inserted else "already_queued")
             if settings.sync_frame
             else "off",

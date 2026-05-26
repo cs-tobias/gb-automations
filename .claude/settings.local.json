@@ -53,7 +53,23 @@
       "PowerShell(docker compose exec -T api python -m pytest tests/test_sync_frame_project.py tests/test_sync_frame_task.py --tb=short 2>&1)",
       "PowerShell(docker compose exec -T api pip install --quiet pytest pytest-asyncio 2>&1)",
       "PowerShell(docker compose exec -T api pip install --user --quiet pytest pytest-asyncio 2>&1)",
-      "PowerShell(docker compose exec -T -u root api pip install --quiet pytest pytest-asyncio 2>&1)"
+      "PowerShell(docker compose exec -T -u root api pip install --quiet pytest pytest-asyncio 2>&1)",
+      "PowerShell(uv run pytest -x --tb=short 2>&1)",
+      "PowerShell(python -m venv .venv-test)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pip install -q pytest pydantic-settings sqlalchemy httpx 2>&1)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -c \"import pytest, sqlalchemy, pydantic_settings; print\\('OK'\\)\")",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest tests\\\\test_sync_nas.py tests\\\\test_label_sync.py --tb=short 2>&1)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pip install -e . 2>&1)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest --tb=short 2>&1)",
+      "PowerShell(git stash)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest tests\\\\test_project_picking.py tests\\\\test_health.py --tb=line 2>&1)",
+      "PowerShell(git stash pop)",
+      "Bash(powershell -NoProfile -Command \"Get-Content .env | Select-String '^NAS_'\")",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pip install -q pytest -e . 2>&1)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest tests\\\\test_sync_frame_project.py tests\\\\test_sync_frame_task.py --tb=short 2>&1)",
+      "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest --tb=line 2>&1)",
+      "Bash(dir \"src\\\\gb_automations\\\\assets\")",
+      "PowerShell(if \\(-not \\(Test-Path \"X:\\\\gb-nas-test\\\\Goldbox_Logo_White.png\"\\)\\) { Write-Output \"SOURCE_MISSING\"; exit 1 }; Copy-Item -Path \"X:\\\\gb-nas-test\\\\Goldbox_Logo_White.png\" -Destination \"src\\\\gb_automations\\\\assets\\\\Goldbox_Logo_White.png\" -Force; \\(Get-Item \"src\\\\gb_automations\\\\assets\\\\Goldbox_Logo_White.png\" | Select-Object Name, Length | Format-List | Out-String\\).Trim\\(\\))"
     ]
   }
 }

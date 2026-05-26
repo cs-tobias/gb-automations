@@ -20,9 +20,9 @@ import gb_automations.sync.sync_labels as sl
 
 
 def _patch_engine(
-    monkeypatch, *, reconcile, topup, nas="skipped", title="Acme", sync_gmail=True
+    monkeypatch, *, reconcile, topup, title="Acme", sync_gmail=True
 ):
-    """Stub sync_labels' Notion fetch + the two per-user phases + NAS."""
+    """Stub sync_labels' Notion fetch + the two per-user phases + URL patch."""
     monkeypatch.setattr(
         sl.notion_client, "get_page", _aval({"created_time": "2026-01-01T00:00:00Z"})
     )
@@ -31,7 +31,7 @@ def _patch_engine(
     monkeypatch.setattr(sl.settings, "sync_gmail_labels", sync_gmail)
     monkeypatch.setattr(sl, "_reconcile_label_for_all_users", _aval(reconcile))
     monkeypatch.setattr(sl, "_create_label_for_all_users", _aval(topup))
-    monkeypatch.setattr(sl, "_sync_nas_folder_for_project", _aval(nas))
+    monkeypatch.setattr(sl.notion_client, "set_project_gmail_url", _aval(None))
 
 
 def _aval(value):
@@ -172,3 +172,78 @@ def test_enqueue_label_conflict_matches_index():
     import gb_automations.sync.queue as q
 
     assert str(q._ACTIVE_LABEL_PREDICATE) == _index_predicate("uq_sync_tasks_active_label")
+
+
+def test_enqueue_nas_folder_conflict_matches_index():
+    import gb_automations.sync.queue as q
+
+    assert str(q._ACTIVE_NAS_FOLDER_PREDICATE) == _index_predicate(
+        "uq_sync_tasks_active_nas_folder"
+    )
+
+
+# --------------------------------------------------------------------------
+# Gmail URL writeback: the new "Gmail" column on the Projects DB
+# --------------------------------------------------------------------------
+
+
+def test_gmail_url_is_url_encoded_with_slash_percent_2f():
+    """`/` inside the label path must encode to `%2F` so Gmail accepts the
+    URL — the bare `/` between path segments breaks the fragment-based label
+    routing in Gmail's UI."""
+    url = sl._gmail_label_view_url("Prosjekt/2026/Name with spaces")
+    assert url == (
+        "https://mail.google.com/mail/u/0/#label/"
+        "Prosjekt%2F2026%2FName%20with%20spaces"
+    )
+
+
+def test_gmail_url_written_back_on_successful_sync(monkeypatch):
+    """The Gmail URL is PATCHed onto the Projects-DB row whenever the label
+    layer ran (created / synced / unchanged) — so a re-click on an already-
+    provisioned project backfills the column."""
+    _patch_engine(
+        monkeypatch,
+        reconcile={
+            "patched": [],
+            "healed": [],
+            "unchanged": ["a@x.no"],
+            "failed": [],
+        },
+        topup={"created": [], "already_present": ["a@x.no"], "failed": []},
+    )
+
+    captured: dict = {}
+
+    async def fake_set_url(page_id, url):
+        captured["page_id"] = page_id
+        captured["url"] = url
+
+    monkeypatch.setattr(sl.notion_client, "set_project_gmail_url", fake_set_url)
+
+    result = asyncio.run(sl.sync_project_labels("p1"))
+    assert captured["page_id"] == "p1"
+    assert captured["url"].startswith("https://mail.google.com/mail/u/0/#label/")
+    assert "Prosjekt%2F2026%2FAcme" in captured["url"]
+    assert result.gmail_url == captured["url"]
+
+
+def test_no_gmail_url_writeback_when_sync_disabled(monkeypatch):
+    """SYNC_GMAIL_LABELS=false short-circuits before the URL patch — we don't
+    want to store a Gmail URL for a project whose labels were never created."""
+    _patch_engine(
+        monkeypatch,
+        reconcile={},
+        topup={},
+        sync_gmail=False,
+    )
+    calls = 0
+
+    async def fake_set_url(page_id, url):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(sl.notion_client, "set_project_gmail_url", fake_set_url)
+    result = asyncio.run(sl.sync_project_labels("p1"))
+    assert calls == 0
+    assert result.gmail_url is None

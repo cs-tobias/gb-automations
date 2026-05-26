@@ -26,11 +26,13 @@ from gb_automations.clients import frame as frame_client
 
 @dataclass
 class _FakeProjectRow:
+    # frame_folder_id here is the Project's root_folder_id (the parent
+    # passed to _ensure_discipline_folder). Same column name as before the
+    # workspace-Project refactor, slightly different semantics.
     notion_page_id: str
+    frame_project_id: str = "projID"
     frame_folder_id: str = "projF"
-    frame_parent_id: str = "yearF"
     current_name: str = "Acme"
-    current_year: str = "2026"
     frame_url: str = "u"
 
 
@@ -97,8 +99,10 @@ def _patch_session_factory(monkeypatch, sessions: list[_FakeSession]):
 
 def _patch_settings(monkeypatch):
     monkeypatch.setattr(sf.settings, "sync_frame", True)
-    monkeypatch.setattr(sf.settings, "frame_root_project_id", "rootP")
+    monkeypatch.setattr(sf.settings, "frame_workspace_id", "wsP")
+    monkeypatch.setattr(sf.settings, "frame_account_id", "aP")
     monkeypatch.setattr(sf.settings, "frame_placeholder_url", "http://x/p.png")
+    monkeypatch.setattr(sf.settings, "frame_filename_studio", "Goldbox.no")
 
 
 def _aval(v):
@@ -115,7 +119,6 @@ def _patch_notion_task(monkeypatch, *, title="Fasade Nord", project="p1", disc="
 
 
 def _reset_caches():
-    sf._year_folder_cache.clear()
     sf._discipline_folder_cache.clear()
 
 
@@ -187,6 +190,8 @@ def test_first_sync_creates_task_folder_and_placeholder(monkeypatch):
     monkeypatch.setattr(sf.frame_client, "create_folder", fake_create_folder)
     monkeypatch.setattr(sf.frame_client, "create_file_from_url", fake_create_file_from_url)
     monkeypatch.setattr(sf, "_ensure_discipline_folder", fake_ensure_disc)
+    # No sibling task folder exists → adoption finds nothing → fresh create.
+    monkeypatch.setattr(sf, "_find_child_folder_by_name", _aval(None))
     monkeypatch.setattr(sf.notion_client, "set_task_frame_url", fake_set_url)
     monkeypatch.setattr(sf.frame_client, "get_folder", _aval({"id": "x"}))
 
@@ -204,7 +209,13 @@ def test_first_sync_creates_task_folder_and_placeholder(monkeypatch):
     assert result.frame_folder_id == "newTaskF"
     assert result.frame_placeholder_file_id == "newFileF"
     assert create_calls == [("discF", "Fasade Nord")]
-    assert file_calls == [("newTaskF", "placeholder.png", "http://x/p.png")]
+    # The placeholder filename now embeds the project name + studio + task
+    # name + V00 version marker. With _FakeProjectRow's default current_name
+    # ("Acme") + the task title "Fasade Nord" + the configured studio
+    # "Goldbox.no", we expect this exact string.
+    assert file_calls == [
+        ("newTaskF", "Acme_Goldbox.no_Fasade Nord_V00.png", "http://x/p.png")
+    ]
     assert len(sessions[1].added) == 1
     assert sessions[1].commits == 1
 
@@ -319,6 +330,7 @@ def test_self_heal_evicts_stale_task(monkeypatch):
     monkeypatch.setattr(sf.frame_client, "create_folder", fake_create_folder)
     monkeypatch.setattr(sf.frame_client, "create_file_from_url", fake_file)
     monkeypatch.setattr(sf, "_ensure_discipline_folder", _aval("discF"))
+    monkeypatch.setattr(sf, "_find_child_folder_by_name", _aval(None))
     monkeypatch.setattr(sf.notion_client, "set_task_frame_url", _aval(None))
 
     task_row = _FakeTaskRow("t1")
@@ -360,6 +372,7 @@ def test_missing_parent_project_is_provisioned_recursively(monkeypatch):
 
     monkeypatch.setattr(sf, "sync_frame_project", fake_sync_frame_project)
     monkeypatch.setattr(sf, "_ensure_discipline_folder", _aval("discF"))
+    monkeypatch.setattr(sf, "_find_child_folder_by_name", _aval(None))
     monkeypatch.setattr(sf.frame_client, "create_folder", _aval({"id": "T"}))
     monkeypatch.setattr(sf.frame_client, "create_file_from_url", _aval({"id": "F"}))
     monkeypatch.setattr(sf.frame_client, "get_folder", _aval({"id": "T"}))
@@ -376,6 +389,164 @@ def test_missing_parent_project_is_provisioned_recursively(monkeypatch):
 
     assert project_calls == ["p1"]
     assert result.action == "created"
+
+
+# --------------------------------------------------------------------------
+# Adoption branch — sibling task folder with the same name already exists
+# --------------------------------------------------------------------------
+
+
+def test_adopts_existing_task_folder_with_existing_placeholder(monkeypatch):
+    """A pre-existing task folder under the discipline + an existing
+    placeholder.png inside it must be adopted: neither create_folder nor
+    create_file_from_url runs, and the cache row picks up both existing ids."""
+    _reset_caches()
+    _patch_settings(monkeypatch)
+    _patch_notion_task(monkeypatch)
+
+    create_folder_calls = 0
+    create_file_calls = 0
+
+    async def fake_create_folder(*a, **k):
+        nonlocal create_folder_calls
+        create_folder_calls += 1
+        return {"id": "should-not-be-called"}
+
+    async def fake_create_file(*a, **k):
+        nonlocal create_file_calls
+        create_file_calls += 1
+        return {"id": "should-not-be-called"}
+
+    async def fake_find_folder(parent, name):
+        assert (parent, name) == ("discF", "Fasade Nord")
+        return {
+            "id": "preExistingTask",
+            "name": name,
+            "view_url": "https://next.frame.io/project/p/view/preExistingTask",
+        }
+
+    async def fake_find_file(parent, name):
+        # The placeholder filename is now per-task: <project>_<studio>_<task>_V00.png
+        # — built from _FakeProjectRow.current_name ("Acme") + the task title
+        # ("Fasade Nord") + the configured studio ("Goldbox.no").
+        assert (parent, name) == (
+            "preExistingTask",
+            "Acme_Goldbox.no_Fasade Nord_V00.png",
+        )
+        return {"id": "preExistingPlaceholder", "name": name}
+
+    monkeypatch.setattr(sf, "_ensure_discipline_folder", _aval("discF"))
+    monkeypatch.setattr(sf, "_find_child_folder_by_name", fake_find_folder)
+    monkeypatch.setattr(sf, "_find_child_file_by_name", fake_find_file)
+    monkeypatch.setattr(sf.frame_client, "create_folder", fake_create_folder)
+    monkeypatch.setattr(sf.frame_client, "create_file_from_url", fake_create_file)
+    monkeypatch.setattr(sf.frame_client, "get_folder", _aval({"id": "x"}))
+    monkeypatch.setattr(sf.notion_client, "set_task_frame_url", _aval(None))
+
+    sessions = [
+        _FakeSession({("FrameProjectFolder", "p1"): _FakeProjectRow("p1")}),
+        _FakeSession({("FrameProjectFolder", "p1"): _FakeProjectRow("p1")}),
+    ]
+    _patch_session_factory(monkeypatch, sessions)
+
+    result = asyncio.run(sf.sync_frame_task("t1"))
+
+    assert result.action == "adopted"
+    assert result.frame_folder_id == "preExistingTask"
+    assert result.frame_placeholder_file_id == "preExistingPlaceholder"
+    assert create_folder_calls == 0
+    assert create_file_calls == 0
+    assert (
+        result.frame_url
+        == "https://next.frame.io/project/p/view/preExistingTask"
+    )
+
+
+def test_adopts_existing_task_folder_uploads_placeholder_when_missing(monkeypatch):
+    """Adopted task folder with NO placeholder.png inside: we still adopt the
+    folder (no create_folder call) but we DO upload a fresh placeholder so the
+    Phase 2 "first upload = V2 of placeholder" workflow stays intact."""
+    _reset_caches()
+    _patch_settings(monkeypatch)
+    _patch_notion_task(monkeypatch)
+
+    create_folder_calls = 0
+    upload_calls: list[tuple] = []
+
+    async def fake_create_folder(*a, **k):
+        nonlocal create_folder_calls
+        create_folder_calls += 1
+        return {"id": "should-not-be-called"}
+
+    async def fake_create_file(folder_id, name, url):
+        upload_calls.append((folder_id, name, url))
+        return {"id": "freshPlaceholder"}
+
+    monkeypatch.setattr(sf, "_ensure_discipline_folder", _aval("discF"))
+    monkeypatch.setattr(
+        sf,
+        "_find_child_folder_by_name",
+        _aval(
+            {
+                "id": "preExistingTask",
+                "view_url": "https://next.frame.io/project/p/view/preExistingTask",
+            }
+        ),
+    )
+    monkeypatch.setattr(sf, "_find_child_file_by_name", _aval(None))
+    monkeypatch.setattr(sf.frame_client, "create_folder", fake_create_folder)
+    monkeypatch.setattr(sf.frame_client, "create_file_from_url", fake_create_file)
+    monkeypatch.setattr(sf.frame_client, "get_folder", _aval({"id": "x"}))
+    monkeypatch.setattr(sf.notion_client, "set_task_frame_url", _aval(None))
+
+    sessions = [
+        _FakeSession({("FrameProjectFolder", "p1"): _FakeProjectRow("p1")}),
+        _FakeSession({("FrameProjectFolder", "p1"): _FakeProjectRow("p1")}),
+    ]
+    _patch_session_factory(monkeypatch, sessions)
+
+    result = asyncio.run(sf.sync_frame_task("t1"))
+
+    assert result.action == "adopted"
+    assert result.frame_folder_id == "preExistingTask"
+    assert result.frame_placeholder_file_id == "freshPlaceholder"
+    assert create_folder_calls == 0
+    # Per-task placeholder filename. See test_first_sync_creates_task_folder_and_placeholder
+    # for the derivation rule (project + studio + task + V00).
+    assert upload_calls == [
+        ("preExistingTask", "Acme_Goldbox.no_Fasade Nord_V00.png", "http://x/p.png")
+    ]
+
+
+# --------------------------------------------------------------------------
+# Placeholder filename builder (pure function)
+# --------------------------------------------------------------------------
+
+
+def test_placeholder_filename_shape(monkeypatch):
+    """Pin the exact filename shape so a future config-name change doesn't
+    silently shift it. The order matters: <project>_<studio>_<task>_V00.png."""
+    monkeypatch.setattr(sf.settings, "frame_filename_studio", "Goldbox.no")
+    out = sf._placeholder_filename(
+        "1230_Metropolis_Orangeriet", "Vinkel 1"
+    )
+    assert out == "1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png"
+
+
+def test_placeholder_filename_uses_configured_studio(monkeypatch):
+    """The studio slot is configurable — changing FRAME_FILENAME_STUDIO
+    flows straight through to new uploads."""
+    monkeypatch.setattr(sf.settings, "frame_filename_studio", "OtherStudio")
+    out = sf._placeholder_filename("Proj", "Task")
+    assert out == "Proj_OtherStudio_Task_V00.png"
+
+
+def test_placeholder_filename_falls_back_when_studio_empty(monkeypatch):
+    """A blank studio setting would produce a malformed filename
+    ('Proj__Task_V00.png'); fall back to 'Goldbox.no' as the default."""
+    monkeypatch.setattr(sf.settings, "frame_filename_studio", "")
+    out = sf._placeholder_filename("Proj", "Task")
+    assert out == "Proj_Goldbox.no_Task_V00.png"
 
 
 if __name__ == "__main__":

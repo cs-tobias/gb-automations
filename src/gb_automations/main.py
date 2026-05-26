@@ -75,9 +75,9 @@ def _validate_required_settings() -> None:
             "typically https://hub.{your-domain}/webhooks/gmail."
         )
     # Frame.io sync needs the OAuth identity (refresh token + account/workspace
-    # already required for /debug/frame to work) PLUS a resolved root project to
-    # parent folders under, and a placeholder URL Frame can fetch. Failing at
-    # boot beats a runtime KeyError on the first webhook click.
+    # so create_project knows where to land each Notion project) plus the
+    # placeholder URL Frame can fetch. Failing at boot beats a runtime
+    # KeyError on the first webhook click.
     if settings.sync_frame:
         missing = [
             name
@@ -85,7 +85,6 @@ def _validate_required_settings() -> None:
                 ("FRAME_REFRESH_TOKEN", settings.frame_refresh_token),
                 ("FRAME_ACCOUNT_ID", settings.frame_account_id),
                 ("FRAME_WORKSPACE_ID", settings.frame_workspace_id),
-                ("FRAME_ROOT_PROJECT_ID", settings.frame_root_project_id),
                 ("FRAME_PLACEHOLDER_URL", settings.frame_placeholder_url),
             )
             if not value

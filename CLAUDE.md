@@ -15,14 +15,14 @@ What works end-to-end:
 
 ## Frame.io — Phase 1 shipped (May 2026); Phase 2 next
 
-**Phase 1 done**: Notion → Frame mirror. The "Sync to Gmail" button now also enqueues `frame_project_sync` / `frame_task_sync` (when `SYNC_FRAME=true`). Per-project folder + per-task folder + placeholder file land under a single shared Frame Project (`FRAME_ROOT_PROJECT_ID`). Frame URLs are written back to the Projects/Oppgaver rows. Renames mirror in place (folder id stable). Self-heals when a folder is trashed in Frame. Same trigger as NAS — no Active-status gating yet (will revisit after client meeting). Setup: [docs/misc/frame-setup.md](docs/misc/frame-setup.md). Engine: [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py).
+**Phase 1 done**: Notion → Frame mirror. The "Initialize" button enqueues `frame_project_sync` / `frame_task_sync` (when `SYNC_FRAME=true`). Each Notion project becomes its own **top-level Frame Project** under `FRAME_WORKSPACE_ID` (visible in Frame V4's Active Projects view); per-task folder + placeholder file land under the Project's discipline subfolders. Frame URLs are written back to the Projects/Oppgaver rows. Renames mirror in place (project_id + root_folder_id stable). Self-heals when a Project is deleted in Frame; adopts a pre-existing same-name Project instead of duplicating. Setup: [docs/misc/frame-setup.md](docs/misc/frame-setup.md). Engine: [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py).
 
 **Phase 2 (next)** — comments + Corrections DB:
 
 - Frame.io webhooks → sync comments into a new Notion `Corrections` database, linked to project + task (joined back via `FrameTaskFolder.frame_placeholder_file_id`, which Phase 1 persists for exactly this).
 - Auto-create "korreksjon runde N" sub-tasks under the parent task on a new correction round.
 - Eventually: AI drafts replies using mail/brief context, project manager approves before sending.
-- Project marked finished in Notion → set inactive in Frame.io.
+- Project marked finished in Notion → set inactive in Frame.io (one PATCH on the Frame Project entity — now trivial since each Notion project IS a Frame Project).
 
 After Frame Phase 2: Toggl (daily aggregated hours → Notion), Fiken (accounting), meeting transcripts, then MCP server + RAG.
 
@@ -192,7 +192,7 @@ curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20ti
 | "How are re-carried attachments kept off every reply row?" | `ThreadAttachmentTracker` (`attached_this_pass`) in [sync/sync_thread.py](src/gb_automations/sync/sync_thread.py); gotchas.md attachment notes |
 | "How does a Frame.io folder get created?" | `SYNC_FRAME=true` flag in [config.py](src/gb_automations/config.py); same Notion button enqueues `frame_project_sync` / `frame_task_sync` in [routes/webhooks.py](src/gb_automations/routes/webhooks.py) → worker runs [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py) `sync_frame_project` / `sync_frame_task` |
 | "How are Frame URLs written back to Notion?" | `set_project_frame_url` / `set_task_frame_url` in [clients/notion.py](src/gb_automations/clients/notion.py); `PROJECTS_FRAME_URL_PROP` / `TASKS_FRAME_URL_PROP` in [config.py](src/gb_automations/config.py) |
-| "Frame.io setup / bootstrap?" | [docs/misc/frame-setup.md](docs/misc/frame-setup.md); script in [scripts/frame_oauth_bootstrap.py](src/gb_automations/scripts/frame_oauth_bootstrap.py); smoke tests at `GET /debug/frame` + `GET /debug/frame/project` |
+| "Frame.io setup / bootstrap?" | [docs/misc/frame-setup.md](docs/misc/frame-setup.md); script in [scripts/frame_oauth_bootstrap.py](src/gb_automations/scripts/frame_oauth_bootstrap.py); smoke tests at `GET /debug/frame` + `GET /debug/frame/workspace` |
 | "Why isn't my new integration working?" | [docs/misc/gotchas.md](docs/misc/gotchas.md) first, then the relevant client wrapper in `clients/` |
 | "What's the full deployment story for a fresh workspace?" | [docs/guide.md](docs/guide.md) → [google-setup.md](docs/misc/google-setup.md) + [scripts/gcp-bootstrap.sh](scripts/gcp-bootstrap.sh) + [notion-setup.md](docs/misc/notion-setup.md) + [cloudflare-setup.md](docs/misc/cloudflare-setup.md) |
 | "What does the client actually want long-term?" | [docs/reference/client-brief.md](docs/reference/client-brief.md) |

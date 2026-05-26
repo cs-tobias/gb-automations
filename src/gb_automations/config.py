@@ -140,11 +140,18 @@ class Settings(BaseSettings):
     # Office NAS (the shared `W:` drive). The Docker host is an office
     # workstation on the same LAN as the NAS, so the share is mounted into the
     # container and these are plain filesystem paths — no SMB client needed.
-    # nas_projects_root: mounted root that maps to W:\Prosjekt, e.g.
+    # nas_host_path: the Windows-side path of the share root, e.g.
+    #   "X:\gb-nas-test" or "W:". docker-compose.yml binds this to /mnt/nas
+    #   inside the container; we also read it here so the NAS sync can write
+    #   a Windows-style path back to the Projects-DB "NAS" URL column (so the
+    #   team can click and open it in File Explorer). Empty → no Notion
+    #   writeback (the folder still gets created, the URL column stays blank).
+    # nas_projects_root: mounted root inside the container, e.g.
     #   "/mnt/nas/Prosjekt". The NAS step is inert unless this is set AND
     #   sync_nas_folders is true.
-    # nas_received_subfolder: subfolder created inside each project for incoming
-    #   client/email files. Goldbox calls it "Mottatt" (Received).
+    # nas_received_subfolder: subfolder created inside each project for
+    #   incoming client/email files. Goldbox calls it "Mottatt" (Received).
+    nas_host_path: str = ""
     nas_projects_root: str = ""
     nas_received_subfolder: str = "Mottatt"
 
@@ -177,20 +184,27 @@ class Settings(BaseSettings):
     frame_webhook_secret: str = ""
     # Phase 1 fan-out toggle (mirrors sync_gmail_labels / sync_nas_folders).
     # OFF by default so a deploy can land the Frame code without flipping the
-    # behavior on. Flip to true once frame_root_project_id + frame_placeholder_url
+    # behavior on. Flip to true once frame_workspace_id + frame_placeholder_url
     # are configured AND the OAuth bootstrap has run successfully.
+    #
+    # Each Notion project becomes its own top-level Frame Project under
+    # settings.frame_workspace_id — there is no shared "Goldbox" parent
+    # project, so no FRAME_ROOT_PROJECT_ID setting. (An earlier design did
+    # use one; if you still have it in .env it's silently ignored.)
     sync_frame: bool = False
-    # The shared Frame.io Project under settings.frame_workspace_id that holds
-    # every Goldbox project as a top-level folder. Resolved during bootstrap
-    # (the script lists projects in the workspace and prompts for the right
-    # one); empty until bootstrap-extended is run.
-    frame_root_project_id: str = ""
     # Publicly-fetchable URL Frame.io's create_file_from_url endpoint can GET
     # to seed the per-task placeholder asset. We host the bytes ourselves at
-    # /assets/placeholder.png (mounted by main.py); set this to the public form,
-    # e.g. https://hub.<domain>/assets/placeholder.png — Frame fetches it over
-    # the existing Cloudflare tunnel, no S3 needed.
+    # /assets/Goldbox_Logo_White.png (mounted by main.py); set this to the
+    # public form, e.g. https://hub.<domain>/assets/Goldbox_Logo_White.png —
+    # Frame fetches it over the existing Cloudflare tunnel, no S3 needed.
+    # Swap the asset under /assets/ to change the image without redeploying.
     frame_placeholder_url: str = ""
+    # The studio identifier baked into every Frame placeholder filename:
+    #   <project>_<studio>_<task>_V00.png
+    # Renaming the studio later only affects NEW placeholders — existing
+    # uploads keep their old filename (Frame's version stack is keyed by file
+    # slot, not name, so re-naming after the fact is purely cosmetic).
+    frame_filename_studio: str = "Goldbox.no"
 
 
 settings = Settings()
@@ -310,10 +324,20 @@ PROJECT_SYNC_OPTION = {
 }
 
 
-# URL properties the Frame.io sync writes back to Notion so a row in the
-# Projects/Oppgaver DB is one click away from the corresponding Frame folder.
-# Both DBs use a URL-type property; rename here if the column header changes
-# in Notion. Empty value (write None) means "Frame not provisioned yet".
+# URL properties each provisioner writes back to the Projects DB so a row is
+# one click away from the corresponding system. All three columns share the
+# same pattern: filled iff the project has been provisioned in that system,
+# empty otherwise — so the row itself is the "has this been wired up?"
+# indicator. Rename here if a column header changes in Notion.
+#   "Gmail"    URL — opens the project's Gmail label in whichever Goldbox
+#              mailbox the user is signed into.
+#   "NAS"      URL (text-style; Notion accepts non-http schemes) — Windows path
+#              to the project folder on the office share, e.g. W:\Prosjekt\...
+#              Filled only when NAS_PROJECTS_DISPLAY_ROOT is configured.
+#   "Frame.io" URL — Frame.io view URL for the project folder.
+# Both Projects and Tasks DBs have a Frame.io column (one per row of each).
+PROJECTS_GMAIL_URL_PROP = "Gmail"
+PROJECTS_NAS_URL_PROP = "NAS"
 PROJECTS_FRAME_URL_PROP = "Frame.io"
 TASKS_FRAME_URL_PROP = "Frame.io"
 

@@ -288,28 +288,40 @@ class TaskFolder(Base):
 
 
 class FrameProjectFolder(Base):
-    """Notion project page ↔ Frame.io folder, one row per project.
+    """Notion project page ↔ Frame.io Project, one row per project.
 
-    Mirrors ProjectFolder but for Frame.io: one project becomes a folder under
-    the shared root Frame Project (FRAME_ROOT_PROJECT_ID), parented by a year
-    folder. The Frame folder id is stable across Notion renames — we PATCH the
-    name in place, never archive+recreate, so any per-task placeholder files
-    underneath keep their ids (which Phase 2 comment polling will key on).
+    Each Notion project provisions its own top-level Frame Project under the
+    configured workspace (frame_workspace_id). The Project's auto-created
+    root_folder_id is the parent under which discipline + task folders nest.
 
-    `frame_url` is cached so the worker doesn't recompute it on idempotent runs
-    and Phase 2 can attach a correction back to a known URL without re-resolving.
+    Two distinct Frame ids live here:
+      - frame_project_id: the Project entity itself. What we rename via
+        PATCH /projects/{id} and (future work) toggle active/inactive on.
+      - frame_folder_id: the Project's root_folder_id. The parent we pass
+        to create_folder when provisioning discipline subfolders.
+
+    Both are stable across Notion renames — rename_project preserves both
+    ids — so any per-task placeholder files underneath keep their ids
+    (which Phase 2 comment polling will key on).
+
+    `frame_url` is cached so the worker doesn't recompute it on idempotent
+    runs and Phase 2 can attach a correction back to a known URL without
+    re-resolving.
     """
 
     __tablename__ = "frame_project_folders"
 
     notion_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # The Frame Project id (top-level entity in the workspace). What we
+    # rename/archive/inactivate. Distinct from frame_folder_id because Frame's
+    # Project entity exposes its own endpoints (PATCH /projects/{id}, archive,
+    # active/inactive flag) that don't apply to folders.
+    frame_project_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The Project's root_folder_id — the parent under which discipline and
+    # task folders live. Returned at project create/get time; stable for the
+    # lifetime of the Project.
     frame_folder_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    # The year folder this project sits under. Stored to make a year-bucket
-    # change cheap to detect; we don't re-parent in Phase 1 because
-    # `created_time` is immutable, but the column is here for symmetry with NAS.
-    frame_parent_id: Mapped[str] = mapped_column(String(64), nullable=False)
     current_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    current_year: Mapped[str] = mapped_column(String(4), nullable=False)
     frame_url: Mapped[str] = mapped_column(String(512), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -370,15 +382,19 @@ SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
 # What unit of work a row represents. 'thread' is the original (and default):
 # one Gmail thread → Notion rows via sync_thread. 'label_sync' is "reconcile +
 # create this project's Gmail label across every active mailbox" — a different
-# unit (keyed on project, no thread). 'task_folder_sync' provisions NAS folders
-# for one Notion task page (Oppgaver DB). 'frame_project_sync' and
-# 'frame_task_sync' do the same for Frame.io — kept separate from the NAS task
-# types because Frame I/O is slower (placeholder upload) and gated by its own
-# SYNC_FRAME toggle, so a Frame outage shouldn't tie up NAS/label retries.
+# unit (keyed on project, no thread). 'nas_folder_sync' provisions the project
+# folder structure on the office NAS (split out of label_sync so each system
+# has its own retry/failure surface and its own per-system button).
+# 'task_folder_sync' provisions NAS folders for one Notion task page (Oppgaver
+# DB). 'frame_project_sync' and 'frame_task_sync' do the same for Frame.io —
+# kept separate from the NAS task types because Frame I/O is slower
+# (placeholder upload) and gated by its own SYNC_FRAME toggle, so a Frame
+# outage shouldn't tie up NAS/label retries.
 # New types go here + the CHECK below + a branch in jobs/queue_worker._process.
 SYNC_TASK_TYPES = (
     "thread",
     "label_sync",
+    "nas_folder_sync",
     "task_folder_sync",
     "frame_project_sync",
     "frame_task_sync",
@@ -451,8 +467,8 @@ class SyncTask(Base):
             name="ck_sync_tasks_status",
         ),
         CheckConstraint(
-            "task_type IN ('thread','label_sync','task_folder_sync',"
-            "'frame_project_sync','frame_task_sync')",
+            "task_type IN ('thread','label_sync','nas_folder_sync',"
+            "'task_folder_sync','frame_project_sync','frame_task_sync')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -478,6 +494,19 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'label_sync'"
+            ),
+        ),
+        # At most one ACTIVE nas_folder_sync per project. Mirrors the label_sync
+        # dedup; collapsing both task types on `project_page_id` is fine because
+        # each index is scoped to its own task_type via the partial predicate,
+        # so a project can have one active label_sync AND one active
+        # nas_folder_sync simultaneously without collision.
+        Index(
+            "uq_sync_tasks_active_nas_folder",
+            "project_page_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'nas_folder_sync'"
             ),
         ),
         # At most one ACTIVE frame_project_sync per project (same dedup intent

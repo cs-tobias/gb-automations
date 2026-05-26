@@ -36,6 +36,9 @@ _ACTIVE_PREDICATE = text("status IN ('pending','in_progress')")
 # definitions (and any migration that changes them).
 _ACTIVE_THREAD_PREDICATE = text("status IN ('pending','in_progress') AND task_type = 'thread'")
 _ACTIVE_LABEL_PREDICATE = text("status IN ('pending','in_progress') AND task_type = 'label_sync'")
+_ACTIVE_NAS_FOLDER_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'nas_folder_sync'"
+)
 _ACTIVE_TASK_FOLDER_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'task_folder_sync'"
 )
@@ -122,6 +125,39 @@ async def enqueue_label_sync(project_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["project_page_id"],
             index_where=_ACTIVE_LABEL_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_nas_folder_sync(project_page_id: str) -> int:
+    """Enqueue a NAS-folder-sync task for a project. Returns 1 if newly
+    enqueued, 0 if one was already active (idempotent — backs the "Sync NAS"
+    button so a double-click collapses to one task).
+
+    Mirrors enqueue_label_sync: a nas_folder_sync row has no real thread;
+    user_email/gmail_thread_id are NOT NULL placeholders (the dedup index
+    `uq_sync_tasks_active_nas_folder` keys on project_page_id instead). We
+    stash the page id in gmail_thread_id so the worker has it without a
+    second column, and "*" in user_email as a sentinel.
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="nas_folder_sync",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id"],
+            index_where=_ACTIVE_NAS_FOLDER_PREDICATE,
         )
     )
     async with SessionLocal() as own:
