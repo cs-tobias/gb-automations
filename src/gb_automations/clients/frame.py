@@ -467,6 +467,28 @@ async def get_file(file_id: str) -> dict[str, Any]:
         return _unwrap(response.json())
 
 
+async def rename_file(file_id: str, new_name: str) -> dict[str, Any]:
+    """Rename a file in place. Same `PATCH /accounts/{aid}/files/{id}` shape as
+    `rename_folder` — Frame V4 keeps the file id stable, so its membership in a
+    version stack and any cached references survive the rename. Used by the
+    flattened Leveranse layout where the placeholder filename IS the visible
+    label in Frame's UI (no wrapping folder)."""
+    token = await frame_auth.get_access_token()
+    body = {"data": {"name": new_name}}
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/accounts/{_account_id()}/files/{file_id}",
+                json=body,
+            ),
+            op_name="rename_file",
+        )
+        _raise_for_status(response)
+        file_obj = _unwrap(response.json())
+        logger.info("frame file renamed %s → %s", file_id, new_name)
+        return file_obj
+
+
 async def list_version_stack_children(stack_id: str) -> list[dict[str, Any]]:
     """List the files inside a version stack, in Frame's stable ordering.
 

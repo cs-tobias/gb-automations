@@ -329,29 +329,43 @@ class FrameProjectFolder(Base):
 
 
 class FrameLeveranseFolder(Base):
-    """Notion Leveranse page ↔ Frame.io task folder + its placeholder file.
+    """Notion Leveranse page ↔ Frame.io placeholder file (under its discipline folder).
 
     Phase 2 reframed what this table represents: a row in the (formerly
     "Oppgaver", now "Leveranser") Notion DB is a deliverable *entity* — one
-    image / render — not a task. Each row provisions its own Frame folder
-    under the project's discipline subfolder, plus a V00 placeholder file
-    that becomes the base of Frame's version stack (V01 = first real
-    delivery, V02 = revision after round 1, etc.).
+    image / render — not a task. Each row provisions a V00 placeholder file
+    under the project's discipline subfolder; that file becomes the base of
+    Frame's version stack (V01 = first real delivery, V02 = revision after
+    round 1, etc.).
 
-    The placeholder file id (`frame_placeholder_file_id`) is what makes
-    "first delivery uploads as V01 on top" work in Frame's UI; we persist
-    it so:
+    Layout shift (post-flatten): there is no longer a per-leveranse wrapping
+    folder. The placeholder file sits directly under the discipline folder,
+    and the filename (`<project>_<studio>_<leveranse>_V00.png`) IS the visible
+    label in Frame's UI. As a consequence:
+      - `frame_folder_id` now holds the SHARED discipline folder id —
+        multiple FrameLeveranseFolder rows in the same discipline-of-project
+        legitimately reference the same id here. Self-heal does NOT key off
+        this column anymore (a missing discipline folder isn't a per-leveranse
+        signal); the load-bearing per-leveranse anchor is the placeholder
+        file id.
+      - `frame_placeholder_file_id` is the per-leveranse anchor and is what
+        the stale-check, comment sync, and version sync all key on.
+
+    The placeholder file id makes "first delivery uploads as V01 on top" work
+    in Frame's UI; we persist it so:
     (a) Phase 2 comment polling joins comment.file_id → this row →
         Notion Leveranse page, and
     (b) a Leveranse rename preserves the placeholder rather than
-        recreating it (and losing the version stack).
+        recreating it (and losing the version stack). Under the flattened
+        layout, a Notion rename also PATCHes the file's name in Frame so
+        the visible label stays in sync.
 
     `project_page_id` denormalized for "all Frame folders for project X"
     lookups (e.g. when a project's folder id is re-resolved after
     self-heal). Column names are kept as-is across the
-    frame_task_folders → frame_leveranse_folders table rename — the
-    semantic shift is "what does a row mean", not "what does each column
-    hold".
+    frame_task_folders → frame_leveranse_folders table rename and across
+    the post-flatten semantic shift — the row meaning evolved, the column
+    storage didn't.
     """
 
     __tablename__ = "frame_leveranse_folders"

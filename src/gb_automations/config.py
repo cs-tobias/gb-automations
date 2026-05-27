@@ -434,6 +434,7 @@ DISCIPLINE_KEYS = {
     "interiør": "interior",
     "eksteriør": "exterior",
     "animasjon": "animation",
+    "annet": "other",
 }
 
 # Canonical key → on-disk folder name. The template spells the animation folder
@@ -443,22 +444,26 @@ DISCIPLINE_FOLDER_SCENES = {
     "interior": "Interioer",
     "exterior": "Eksterioer",
     "animation": "Animation",
+    "other": "Annet",
 }
 DISCIPLINE_FOLDER_MEDIA = {
     "interior": "Interioer",
     "exterior": "Eksterioer",
     "animation": "Animasjon",
+    "other": "Annet",
 }
 
 # Canonical key → on-Frame.io folder name. Unlike the NAS template, Frame.io
 # has no scenes-vs-media split — each project gets one discipline folder per
-# active discipline, with task subfolders directly inside. Norwegian to match
-# what Goldbox sees in Notion's `Type` select; the leaf names line up visually
-# when a team member scans the NAS and Frame side by side.
+# active discipline, with placeholders sitting directly inside (no per-leveranse
+# wrapping folder). Norwegian to match what Goldbox sees in Notion's `Type`
+# select; the leaf names line up visually when a team member scans the NAS and
+# Frame side by side.
 FRAME_DISCIPLINE_FOLDER_NAMES = {
     "interior": "Interiør",
     "exterior": "Eksteriør",
     "animation": "Animasjon",
+    "other": "Annet",
 }
 
 

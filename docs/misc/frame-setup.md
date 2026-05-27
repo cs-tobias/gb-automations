@@ -42,7 +42,7 @@ The "Initialize" button on Projects fans out: it provisions Gmail labels + NAS f
    curl https://hub.<your-domain>/debug/frame/workspace    # lists projects in workspace
    curl https://hub.<your-domain>/assets/placeholder.png -o /tmp/p.png
    ```
-   Then click **Initialize** on a fresh test Project in Notion. In Frame's web UI, open the workspace's Active Projects view; the new project appears as a top-level entry. Click into it: discipline subfolders nest inside. Add a task with Type=Eksteriør, click its button, expect `Eksteriør/<task name>/placeholder.png`. Both Notion rows should have their `Frame.io` URL populated.
+   Then click **Initialize** on a fresh test Project in Notion. In Frame's web UI, open the workspace's Active Projects view; the new project appears as a top-level entry. Click into it: discipline subfolders nest inside. Add a leveranse with Type=Eksteriør, click its button, expect `Eksteriør/<project>_..._<leveranse>_V00.png` (the placeholder sits directly under the discipline folder — no per-leveranse wrapping folder). Both Notion rows should have their `Frame.io` URL populated; the Leveranse URL opens directly to the placeholder file's view in Frame.
 
 ## Layout
 
@@ -50,26 +50,30 @@ The "Initialize" button on Projects fans out: it provisions Gmail labels + NAS f
 Frame.io workspace (FRAME_WORKSPACE_ID)
 ├─ 1234 Heimdal Solsletta bygg D     ← top-level Frame Project (FrameProjectFolder)
 │  └─ (project's root_folder_id, auto-created)
-│     ├─ Eksteriør/                  ← discipline folder, lazy
-│     │  └─ Fasade Nord/             ← task folder (FrameTaskFolder)
-│     │     └─ placeholder.png       ← FrameTaskFolder.frame_placeholder_file_id
+│     ├─ Eksteriør/                  ← discipline folder, lazy & shared
+│     │  ├─ 1234_..._Fasade Nord_V00.png   ← placeholder, FrameLeveranseFolder.frame_placeholder_file_id
+│     │  └─ 1234_..._Fasade Sør_V00.png
 │     ├─ Interiør/...
-│     └─ Animasjon/...
+│     ├─ Animasjon/...
+│     └─ Annet/...
 ├─ <ProjectName2>
 │  └─ ...
 ```
 
 Each Notion project becomes its own Frame Project entity (with its own `project_id`, its own `root_folder_id`, and its own active/inactive flag visible in Frame's UI). Discipline folder names live in `FRAME_DISCIPLINE_FOLDER_NAMES` (`config.py`); the placeholder file is the 69-byte 1×1 PNG checked into `src/gb_automations/assets/placeholder.png` and served by the FastAPI app over the Cloudflare tunnel.
 
-The cache row stores BOTH the Frame Project id (`frame_project_id`) and its root folder id (`frame_folder_id`). The Project id is what we rename via `PATCH /projects/{id}` and what future active/inactive automation will toggle on; the root folder id is what discipline subfolders parent under.
+Placeholder files sit DIRECTLY under the discipline folder — there is no per-leveranse wrapping folder. The placeholder filename embeds the leveranse name (`<project>_<studio>_<leveranse>_V00.png`), which both guarantees uniqueness within a shared discipline folder and provides the visible label in Frame's UI. A leveranse rename in Notion PATCHes the file's name in Frame to match (the file id is preserved, so the version stack and cached comment joins survive the rename).
+
+The cache row stores BOTH the Frame Project id (`frame_project_id`) and its root folder id (`frame_folder_id`). The Project id is what we rename via `PATCH /projects/{id}` and what future active/inactive automation will toggle on; the root folder id is what discipline subfolders parent under. On `FrameLeveranseFolder`, `frame_folder_id` holds the (shared) discipline folder id and `frame_placeholder_file_id` is the per-leveranse anchor that comment-sync, version-sync, and the stale-check all key on.
 
 ## Operations
 
 - **Status**: every Frame task lights the same Projects-DB status dot as the existing label/NAS flows — 🔄 active, ⚠️ retrying, 🛑 failed, ✅ idle. A Frame outage shows up as a yellow/red dot on the affected projects.
 - **Queue visibility**: `GET /debug/queue` lists pending/in-progress/failed task counts and surfaces the last error per failed task; task types are `frame_project_sync` and `frame_task_sync`.
 - **Retry a stuck task**: `docker compose exec api python -m gb_automations.scripts.retry_failed` flips every `failed` Frame task back to `pending`. Or click the Notion button again — idempotent.
-- **Self-heal**: if you delete a Frame Project by hand, the next sync detects the stale id (a 404 on `get_project`), evicts the cache row, and recreates the Project from scratch. The cached placeholder file id is preserved across renames; cross-discipline moves are not yet implemented (a discipline change logs a warning and renames in place).
-- **Adoption**: if a Frame Project with the matching name already exists in the workspace (e.g. someone created it by hand in Frame's UI before clicking Initialize), the sync ADOPTS it instead of creating a duplicate. Same adoption logic applies to discipline and task folders.
+- **Self-heal**: if you delete a Frame Project by hand, the next sync detects the stale id (a 404 on `get_project`), evicts the cache row, and recreates the Project from scratch. Per-leveranse self-heal keys on the placeholder file (a 404 on `get_file` evicts the row). Cross-discipline moves are not yet implemented (a discipline change logs a warning and renames the placeholder in place).
+- **Adoption**: if a Frame Project with the matching name already exists in the workspace (e.g. someone created it by hand in Frame's UI before clicking Initialize), the sync ADOPTS it instead of creating a duplicate. Same adoption logic applies to discipline folders and to placeholder files (matched by filename).
+- **Legacy wrapping folders**: leveranses provisioned before the flatten still have an orphaned per-leveranse folder sitting alongside the placeholder under the discipline folder. The cache row's `frame_folder_id` still points at the old wrapper (not the discipline folder), but no code path keys on that column anymore (the stale-check uses the placeholder file id; comment + version syncs use the placeholder file id). The orphaned wrappers are cosmetic debris — safe to delete by hand in Frame's UI.
 
 ## Re-running the bootstrap
 

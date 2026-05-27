@@ -7,14 +7,19 @@ folder structure inside it:
     <workspace>/<ProjectName> (Frame Project)
                  └── (project's root_folder_id, auto-created by Frame)
                      ├── Interiør/
-                     │   └── Leveranse A/placeholder.png
+                     │   ├── <project>_..._<LeveranseA>_V00.png
+                     │   └── <project>_..._<LeveranseB>_V00.png
                      └── Eksteriør/
-                         └── Leveranse B/placeholder.png
+                         └── <project>_..._<LeveranseC>_V00.png
 
 Each Notion Project is its own top-level Frame Project, visible in Frame V4's
 "Active Projects" view. Discipline folders are lazily created from each
-Leveranse's `Type` select (Interiør/Eksteriør/Animasjon); a project with no
-Leveranser gets no discipline folders.
+Leveranse's `Type` select (Interiør/Eksteriør/Animasjon/Annet); a project
+with no Leveranser gets no discipline folders. Placeholder files sit
+DIRECTLY under the discipline folder — there is no per-leveranse wrapping
+folder. The placeholder filename embeds the leveranse name so filenames
+remain unique within a shared discipline folder; the filename itself is
+the visible label in Frame's UI.
 
 Idempotent and self-healing, mirroring sync_thread:
   - re-runs are no-ops on Frame's side (rename only when name actually changed),
@@ -113,6 +118,20 @@ def _folder_view_url(
     return f"https://next.frame.io/project/{project_id}/view/{folder_id}"
 
 
+def _file_view_url(
+    file_obj: dict, file_id: str, project_id: str
+) -> str:
+    """URL of a file inside a Frame Project. Same shape as `_folder_view_url`
+    — Frame's `/view/{id}` route resolves to either a folder or a file in V4.
+    Under the flattened Leveranse layout, the placeholder file IS the
+    leveranse's anchor in Frame, so this is what we write back to Notion.
+    """
+    url = file_obj.get("view_url") if isinstance(file_obj, dict) else None
+    if url:
+        return url
+    return f"https://next.frame.io/project/{project_id}/view/{file_id}"
+
+
 @dataclass
 class FrameProjectResult:
     project_page_id: str
@@ -181,14 +200,20 @@ async def _evict_if_stale_project(
 async def _evict_if_stale_leveranse(
     session: AsyncSession, row: FrameLeveranseFolder
 ) -> bool:
+    """Return True if this leveranse's placeholder file is gone from Frame and
+    was evicted. Under the flattened layout, `frame_folder_id` points at the
+    SHARED discipline folder (not a per-leveranse folder), so a missing
+    discipline folder is not a per-leveranse signal; the placeholder file is
+    the leveranse's load-bearing anchor. Mirror of _evict_if_stale_project.
+    """
     try:
-        await frame_client.get_folder(row.frame_folder_id)
+        await frame_client.get_file(row.frame_placeholder_file_id)
     except frame_client.FrameAPIError as err:
         if not _is_404(err):
             return False
         logger.info(
-            "frame leveranse folder %s for page %s is gone — evicting cache",
-            row.frame_folder_id,
+            "frame leveranse placeholder %s for page %s is gone — evicting cache",
+            row.frame_placeholder_file_id,
             row.notion_page_id,
         )
         await session.delete(row)
@@ -609,52 +634,43 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
                 row = None
 
             if row is None:
-                # Same adopt-or-create dance as sync_frame_project: a manually
-                # pre-created leveranse folder (or a folder left over after a
-                # cache wipe) gets adopted instead of duplicated. If we adopt,
-                # also look for an existing placeholder.png inside it — Frame
-                # allows duplicate file names, so without the lookup an adopted
-                # folder that already had a placeholder would end up with two.
-                existing_folder = await _find_child_folder_by_name(
-                    discipline_folder_id, leveranse_name
+                # Flattened layout: the placeholder file sits directly under
+                # the discipline folder — no per-leveranse wrapping folder.
+                # Adopt-or-create the placeholder by filename. Filenames carry
+                # the project + leveranse name + studio + V00 suffix, so
+                # collisions across leveranses in the same discipline aren't
+                # possible by construction.
+                existing_placeholder = await _find_child_file_by_name(
+                    discipline_folder_id, placeholder_filename
                 )
-                if existing_folder is not None:
-                    folder_id = existing_folder["id"]
+                if existing_placeholder is not None:
+                    placeholder_id = existing_placeholder["id"]
                     adopted = (
-                        existing_folder
-                        if existing_folder.get("view_url")
-                        else await frame_client.get_folder(folder_id)
+                        existing_placeholder
+                        if existing_placeholder.get("view_url")
+                        else await frame_client.get_file(placeholder_id)
                     )
-                    url = _folder_view_url(adopted, folder_id, project_id_for_url)
-                    existing_placeholder = await _find_child_file_by_name(
-                        folder_id, placeholder_filename
-                    )
-                    if existing_placeholder is not None:
-                        placeholder_id = existing_placeholder["id"]
-                    else:
-                        placeholder = await frame_client.create_file_from_url(
-                            folder_id,
-                            placeholder_filename,
-                            settings.frame_placeholder_url,
-                        )
-                        placeholder_id = placeholder["id"]
+                    url = _file_view_url(adopted, placeholder_id, project_id_for_url)
                     action = "adopted"
                 else:
-                    new_folder = await frame_client.create_folder(
-                        discipline_folder_id, leveranse_name
-                    )
-                    folder_id = new_folder["id"]
                     placeholder = await frame_client.create_file_from_url(
-                        folder_id, placeholder_filename, settings.frame_placeholder_url
+                        discipline_folder_id,
+                        placeholder_filename,
+                        settings.frame_placeholder_url,
                     )
                     placeholder_id = placeholder["id"]
-                    url = _folder_view_url(new_folder, folder_id, project_id_for_url)
+                    url = _file_view_url(placeholder, placeholder_id, project_id_for_url)
                     action = "created"
+                # `frame_folder_id` now stores the SHARED discipline folder id
+                # (multiple leveranses in the same discipline legitimately
+                # share this value). The per-leveranse anchor is
+                # `frame_placeholder_file_id` — comment + version syncs key
+                # on it, and so does the stale-check.
                 session.add(
                     FrameLeveranseFolder(
                         notion_page_id=leveranse_page_id,
                         project_page_id=project_page_id,
-                        frame_folder_id=folder_id,
+                        frame_folder_id=discipline_folder_id,
                         frame_placeholder_file_id=placeholder_id,
                         current_name=leveranse_name,
                         current_discipline=discipline_label,
@@ -662,11 +678,12 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
                     )
                 )
             elif row.current_name != leveranse_name:
-                # Discipline change is logged but not re-parented in Phase 1 —
-                # cross-folder move requires a V4 endpoint we haven't verified
-                # safe yet; the folder stays under its original discipline and
-                # only the name is updated. Revisit once the Frame UI behavior
-                # of stale parented folders is observed.
+                # Discipline change is logged but not re-parented — moving the
+                # placeholder file across discipline folders requires a V4
+                # endpoint we haven't verified safe yet. The placeholder stays
+                # under its original discipline and only the filename is
+                # updated. Revisit once Frame UI behavior of stale parented
+                # files is observed.
                 if row.current_discipline != discipline_label:
                     logger.warning(
                         "frame: leveranse %s discipline changed %r→%r — renaming "
@@ -676,17 +693,22 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
                         row.current_discipline,
                         discipline_label,
                     )
-                renamed = await frame_client.rename_folder(row.frame_folder_id, leveranse_name)
-                folder_id = row.frame_folder_id
+                # Under the flattened layout, the placeholder filename IS the
+                # visible label in Frame's UI, so a leveranse rename in Notion
+                # must rename the file too. The file id is preserved by
+                # Frame's PATCH, so the version stack (and cached comment
+                # joins) survive the rename.
+                renamed = await frame_client.rename_file(
+                    row.frame_placeholder_file_id, placeholder_filename
+                )
                 placeholder_id = row.frame_placeholder_file_id
-                url = _folder_view_url(renamed, folder_id, project_id_for_url)
+                url = _file_view_url(renamed, placeholder_id, project_id_for_url)
                 row.current_name = leveranse_name
                 row.current_discipline = discipline_label
                 row.frame_url = url
                 await session.merge(row)
                 action = "renamed"
             else:
-                folder_id = row.frame_folder_id
                 placeholder_id = row.frame_placeholder_file_id
                 url = row.frame_url
                 action = "unchanged"
@@ -711,15 +733,18 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
     await _ensure_oppstart_oppgave(leveranse_page_id, leveranse_name)
 
     result.action = action
-    result.frame_folder_id = folder_id
+    # `frame_folder_id` on the result now records the (shared) discipline
+    # folder the placeholder lives in; the load-bearing per-leveranse id is
+    # the placeholder file.
+    result.frame_folder_id = discipline_folder_id
     result.frame_placeholder_file_id = placeholder_id
     result.frame_url = url
     logger.info(
-        "frame leveranse sync %s for %r (page %s, discipline %s) → %s",
+        "frame leveranse sync %s for %r (page %s, discipline %s) → file=%s",
         action,
         leveranse_name,
         leveranse_page_id,
         discipline_label,
-        folder_id,
+        placeholder_id,
     )
     return result
