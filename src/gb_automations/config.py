@@ -1,8 +1,18 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Lets Field(validation_alias=...) read alternate env-var names while
+        # the Python attribute keeps its canonical name. Used for the
+        # Phase 2 TASKS_DB_ID → LEVERANSER_DB_ID rename so legacy .env
+        # files keep working until they're migrated.
+        populate_by_name=True,
+    )
 
     env: str = "dev"
     database_url: str = "postgresql+asyncpg://gb:gb@db:5432/gb"
@@ -51,11 +61,26 @@ class Settings(BaseSettings):
     # parent isn't this database. If empty, the parent check is skipped (the button
     # is only placed on the Projects DB template anyway).
     projects_db_id: str = ""
-    # Optional: Notion "Oppgaver" (Tasks) DB. When set, the Notion button webhook
-    # also accepts clicks from pages in this DB and treats them as task-folder
-    # provisioning (a single task page → NAS folders under the project's
-    # discipline branches). Empty → task button clicks are rejected like before.
-    tasks_db_id: str = ""
+    # Notion "Leveranser" DB — one row per deliverable entity (image / render).
+    # Renamed in Phase 2 from "Oppgaver"/`tasks_db_id`: the current rows in
+    # this DB are images that go through Frame's version stack, not work
+    # items. The DB id itself doesn't change on a Notion rename — operators
+    # set this env var to the same id the legacy TASKS_DB_ID held.
+    # When set, the Notion button webhook accepts clicks from pages in this
+    # DB and treats them as Leveranse provisioning (one row → NAS folders +
+    # Frame folder + V00 placeholder file under the project's discipline).
+    # Reads LEVERANSER_DB_ID, falling back to TASKS_DB_ID for backwards
+    # compatibility with .env files that haven't been migrated yet.
+    leveranser_db_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("LEVERANSER_DB_ID", "TASKS_DB_ID"),
+    )
+    # New in Phase 2: Notion "Oppgaver" DB — the actual tasks (Oppstart,
+    # Korreksjonsrunde N). Auto-populated by the Frame comments engine: a
+    # webhook on `comment.created` creates a Korreksjonsrunde row keyed off
+    # the file's version stack. Empty during rollout = features that need
+    # to write here log and skip.
+    oppgaver_db_id: str = ""
     # Optional: live mirror of the durable sync queue so the client can watch
     # what's queued / processing / failed in Notion. If empty, the mirror is a
     # no-op (the Postgres queue still works, observable via /debug/queue).
@@ -339,7 +364,7 @@ PROJECT_SYNC_OPTION = {
 PROJECTS_GMAIL_URL_PROP = "Gmail"
 PROJECTS_NAS_URL_PROP = "NAS"
 PROJECTS_FRAME_URL_PROP = "Frame.io"
-TASKS_FRAME_URL_PROP = "Frame.io"
+LEVERANSER_FRAME_URL_PROP = "Frame.io"
 
 
 # Top-level Gmail label namespace for project labels. The full path we create
@@ -394,15 +419,36 @@ FRAME_DISCIPLINE_FOLDER_NAMES = {
 }
 
 
-# Names of the properties on the Oppgaver (Tasks) database. The `Type`
-# single-select holds the discipline label per task (Interiør / Eksteriør /
-# Animasjon); DISCIPLINE_KEYS normalizes those to the canonical keys
-# (interior/exterior/animation) that the NAS folder code uses everywhere.
-TASKS_PROPS = {
+# Names of the properties on the Leveranser database (renamed from
+# "Oppgaver" in Phase 2 — every row here is a deliverable entity, not a
+# task). The `Type` single-select holds the discipline label per Leveranse
+# (Interiør / Eksteriør / Animasjon); DISCIPLINE_KEYS normalizes those to
+# the canonical keys (interior/exterior/animation) that the NAS folder
+# code uses everywhere.
+LEVERANSER_PROPS = {
     "name": "Navn",          # title
     "project": "Prosjekt",   # relation → Projects DB
     "discipline": "Type",    # single_select: Interiør / Eksteriør / Animasjon
 }
+
+
+# Names of the properties on the (new in Phase 2) Oppgaver DB — the actual
+# tasks: an "Oppstart" row per Leveranse for pre-delivery work, and
+# "Korreksjonsrunde N" rows auto-created when Frame comments arrive on a
+# version Vn. Each Oppgave links back to its Leveranse via a single
+# relation; the Kind select tells the engine + the team what the row is.
+OPPGAVER_PROPS = {
+    "name": "Navn",            # title — e.g. "Oppstart" or "Korreksjonsrunde 1"
+    "leveranse": "Leveranse",  # relation → Leveranser DB (single page)
+    "kind": "Type",            # single_select: see OPPGAVE_KIND_* constants
+    "round": "Runde",          # number — round N; null/empty for Oppstart
+}
+
+# Allowed `Type` values on Oppgaver. The Frame comments engine creates rows
+# with kind=Korreksjonsrunde and writes the round number; the Leveranse
+# Initialize button creates kind=Oppstart with no round number.
+OPPGAVE_KIND_OPPSTART = "Oppstart"
+OPPGAVE_KIND_KORREKSJON = "Korreksjonsrunde"
 
 
 # Notion's multi-select API supports exactly these 10 colors. "default" is the

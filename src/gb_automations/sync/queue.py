@@ -45,8 +45,11 @@ _ACTIVE_TASK_FOLDER_PREDICATE = text(
 _ACTIVE_FRAME_PROJECT_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_project_sync'"
 )
-_ACTIVE_FRAME_TASK_PREDICATE = text(
-    "status IN ('pending','in_progress') AND task_type = 'frame_task_sync'"
+_ACTIVE_FRAME_LEVERANSE_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_leveranse_sync'"
+)
+_ACTIVE_FRAME_COMMENT_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_comment_sync'"
 )
 
 
@@ -226,28 +229,65 @@ async def enqueue_frame_project_sync(project_page_id: str) -> int:
         return result.rowcount or 0
 
 
-async def enqueue_frame_task_sync(task_page_id: str) -> int:
-    """Enqueue a Frame.io task-folder sync for a Notion Oppgaver page.
+async def enqueue_frame_leveranse_sync(leveranse_page_id: str) -> int:
+    """Enqueue a Frame.io leveranse-folder sync for a Notion Leveranser page.
 
-    Mirrors enqueue_task_folder_sync — gmail_thread_id carries the task page
-    id as a placeholder and is the dedup key
-    (uq_sync_tasks_active_frame_task). project_page_id is left NULL;
-    sync_frame_task resolves the project from the task page at process time
-    and the worker calls set_task_project so the Projects-DB dot rolls up.
+    Mirrors enqueue_task_folder_sync — gmail_thread_id carries the Leveranse
+    page id as a placeholder and is the dedup key
+    (uq_sync_tasks_active_frame_leveranse). project_page_id is left NULL;
+    sync_frame_leveranse resolves the project from the leveranse page at
+    process time and the worker calls set_task_project so the Projects-DB
+    dot rolls up.
     """
-    if not task_page_id:
+    if not leveranse_page_id:
         return 0
 
     stmt = (
         pg_insert(SyncTask)
         .values(
-            task_type="frame_task_sync",
+            task_type="frame_leveranse_sync",
             user_email="*",
-            gmail_thread_id=task_page_id,
+            gmail_thread_id=leveranse_page_id,
         )
         .on_conflict_do_nothing(
             index_elements=["gmail_thread_id"],
-            index_where=_ACTIVE_FRAME_TASK_PREDICATE,
+            index_where=_ACTIVE_FRAME_LEVERANSE_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_frame_comment_sync(comment_id: str) -> int:
+    """Enqueue processing of one Frame.io comment id.
+
+    Used by the POST /webhooks/frame receiver: the webhook payload only
+    carries the comment id (Frame doesn't include the body in webhook
+    events — we GET /comments/{id} during processing). Mirrors
+    enqueue_frame_leveranse_sync — gmail_thread_id carries the Frame
+    comment UUID as a placeholder and is the dedup key
+    (uq_sync_tasks_active_frame_comment), so a webhook redelivery while
+    the prior task is still pending collapses to one row.
+
+    project_page_id is left NULL; sync_frame_comment resolves it from
+    file_id → FrameLeveranseFolder.project_page_id at process time and
+    the worker calls set_task_project for the Projects-DB dot.
+    """
+    if not comment_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="frame_comment_sync",
+            user_email="*",
+            gmail_thread_id=comment_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_FRAME_COMMENT_PREDICATE,
         )
     )
     async with SessionLocal() as own:
@@ -513,7 +553,8 @@ __all__ = [
     "enqueue_label_sync",
     "enqueue_task_folder_sync",
     "enqueue_frame_project_sync",
-    "enqueue_frame_task_sync",
+    "enqueue_frame_leveranse_sync",
+    "enqueue_frame_comment_sync",
     "claim_one",
     "mark_done",
     "mark_failed",

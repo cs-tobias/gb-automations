@@ -250,7 +250,7 @@ async def create_project(workspace_id: str, name: str) -> dict[str, Any]:
     The response carries a `root_folder_id` (the auto-created root folder
     that becomes the parent of every folder we provision inside this
     project). It's immutable for the lifetime of the Project and is what
-    sync_frame_task uses as the parent when creating discipline subfolders.
+    sync_frame_leveranse uses as the parent when creating discipline subfolders.
     """
     token = await frame_auth.get_access_token()
     body = {"data": {"name": name}}
@@ -468,17 +468,16 @@ async def get_file(file_id: str) -> dict[str, Any]:
 
 
 # ============================================================
-# Phase 2 — probe-only methods (response shapes unverified)
+# Phase 2 — comments + webhooks
 # ============================================================
 #
-# These exist to support the probe phase in docs/misc/frame-setup.md and the
-# /debug/frame/comments + /debug/frame/webhooks endpoints. The exact response
-# shapes (field names, nesting, signature header) are NOT yet pinned against
-# the live V4 API. Once probed:
-#   1. record the observed shape in each method's docstring,
-#   2. write the engine in sync/sync_frame_comments.py against those shapes,
-#   3. add the writer methods (create_webhook, delete_webhook, get_comment).
-# Do not consume these from production code paths until the probe is complete.
+# Comment shape verified 2026-05-26 against Goldbox's Frame workspace
+# (see docs/misc/frame-setup.md "probe phase"). Author + replies require
+# `?include=owner,replies` (comma-separated — repeated keys silently drop
+# all but the last). Replies appear nested under parent's `replies: [...]`
+# and themselves carry no `parent_id`. Webhooks send
+# `X-Frameio-Signature: v0=<hex>` with `v0:{ts}:{body}` HMAC-SHA256 over
+# the raw body, ±5-minute replay window.
 
 
 async def list_comments(
@@ -522,18 +521,42 @@ async def list_comments(
         return response.json().get("data", [])
 
 
-async def get_comment_raw(
+async def get_comment(
     comment_id: str, *, include: tuple[str, ...] = ("owner", "replies")
 ) -> dict[str, Any]:
     """Fetch a single comment by id, with `?include=owner,replies` (comma-
-    separated) by default so the engine gets author + nested replies in
-    one round-trip.
+    separated) by default so callers get author + nested replies in one
+    round-trip.
 
-    See `list_comments` for the rationale on the include params and the
-    repeated-vs-comma-separated gotcha. Returns the raw response so
-    callers can read whichever fields they need — most call sites should
-    use the future `get_comment()` wrapper instead.
+    Returns the unwrapped comment object (handles both `{data: {...}}`
+    and bare-object response shapes). See `list_comments` for the
+    rationale on the include params and the repeated-vs-comma-separated
+    gotcha.
+
+    Raises FrameAPIError with 404 if the comment was deleted in Frame —
+    the engine treats this as "mark done silently", same self-heal
+    pattern as sync_frame uses for stale folder ids.
     """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        params = {"include": ",".join(include)} if include else None
+        response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/comments/{comment_id}",
+                params=params,
+            ),
+            op_name="get_comment",
+        )
+        _raise_for_status(response)
+        return _unwrap(response.json())
+
+
+# Backwards-compat alias for the probe-phase debug endpoint that returns
+# the un-unwrapped JSON. Remove once /debug/frame/comment/{id} is taken
+# out (the probe is done; we keep the debug endpoint as an operator tool).
+async def get_comment_raw(
+    comment_id: str, *, include: tuple[str, ...] = ("owner", "replies")
+) -> dict[str, Any]:
     token = await frame_auth.get_access_token()
     async with await _client(access_token=token) as client:
         params = {"include": ",".join(include)} if include else None
@@ -549,10 +572,10 @@ async def get_comment_raw(
 
 
 async def list_webhooks(workspace_id: str) -> list[dict[str, Any]]:
-    """[PROBE] List webhooks registered against a workspace.
+    """List webhooks registered against a workspace.
 
-    Endpoint shape from V4 docs: GET /accounts/{aid}/workspaces/{wid}/webhooks.
-    Used by the bootstrap script to check whether `{PUBLIC_HUB}/webhooks/frame`
+    V4 endpoint: GET /accounts/{aid}/workspaces/{wid}/webhooks. Used by
+    the bootstrap script to check whether `{PUBLIC_HUB}/webhooks/frame`
     is already registered before creating a duplicate, and by the
     /debug/frame/webhooks endpoint for visibility.
     """
@@ -566,3 +589,182 @@ async def list_webhooks(workspace_id: str) -> list[dict[str, Any]]:
         )
         _raise_for_status(response)
         return response.json().get("data", [])
+
+
+async def create_webhook(
+    workspace_id: str,
+    *,
+    url: str,
+    events: list[str],
+    name: str,
+) -> dict[str, Any]:
+    """Register a new webhook on a workspace. Returns the new webhook
+    object — the response carries a `secret` field that must be saved
+    (it's never shown again) and used to verify HMAC signatures on
+    incoming requests.
+
+    V4 endpoint: POST /accounts/{aid}/workspaces/{wid}/webhooks. Body
+    shape (verified via Adobe webhook docs):
+        {"data": {"name": ..., "url": ..., "events": [...]}}
+
+    Events for Phase 2 comments: `comment.created`, `comment.updated`,
+    `comment.completed`, `comment.uncompleted`, `comment.deleted`.
+    `comment.created` fires for replies too (there's no
+    `comment.replied`); the engine detects "reply" by walking the parent
+    comment's `replies: [...]` array, not the event type.
+    """
+    token = await frame_auth.get_access_token()
+    body = {"data": {"name": name, "url": url, "events": events}}
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.post(
+                f"/accounts/{_account_id()}/workspaces/{workspace_id}/webhooks",
+                json=body,
+            ),
+            op_name="create_webhook",
+        )
+        _raise_for_status(response)
+        webhook = _unwrap(response.json())
+        logger.info(
+            "frame webhook created %r → %s (id=%s, events=%s)",
+            name,
+            url,
+            webhook.get("id"),
+            events,
+        )
+        return webhook
+
+
+async def delete_webhook(webhook_id: str) -> None:
+    """Delete a webhook by id. Used by the bootstrap script + manual
+    operator cleanup to remove stale registrations.
+
+    V4 endpoint: DELETE /accounts/{aid}/webhooks/{wid}. Idempotent: a
+    404 is logged but not raised, so a webhook that was already deleted
+    out-of-band doesn't crash a cleanup pass.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.delete(
+                f"/accounts/{_account_id()}/webhooks/{webhook_id}"
+            ),
+            op_name="delete_webhook",
+        )
+        if response.status_code == 404:
+            logger.info(
+                "frame webhook %s already gone — delete is a no-op", webhook_id
+            )
+            return
+        _raise_for_status(response)
+        logger.info("frame webhook %s deleted", webhook_id)
+
+
+async def get_file_version_info(file_id: str) -> tuple[int, str | None]:
+    """Derive the round number for a Frame File from its version stack.
+
+    Returns `(version_number, version_stack_id)`:
+      - V00 (placeholder, no real delivery yet) → (0, None)
+      - V01 (first real delivery, the placeholder still in its history) → (1, <stack_id>)
+      - V02 (revision after round 1) → (2, <stack_id>)
+
+    How V4 represents versions (verified 2026-05-26 against a placeholder
+    file; behavior with V01+ uploaded on top is INFERRED — log line below
+    will tell us if the shape differs when a real V01 lands):
+      - A bare File has `parent_id` pointing at its folder. No version
+        stack. We report round 0.
+      - When a user uploads a new version on top, Frame creates a
+        `version_stack` entity in the folder, moves the original File
+        underneath, and the new upload becomes another child of the
+        stack. The stack's children are ordered (V00, V01, V02 …).
+
+    Implementation: GET /files/{file_id}, look at parent. If parent is
+    a folder → round 0. If parent is a version_stack → list its children,
+    find the file's index. The placeholder is index 0 → V00, the next
+    upload is index 1 → V01.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.get(f"/accounts/{_account_id()}/files/{file_id}"),
+            op_name="get_file_version_info(file)",
+        )
+        _raise_for_status(response)
+        file_obj = _unwrap(response.json())
+
+        # Heuristic: if the file response carries a top-level
+        # `version_number` (we haven't seen this yet but Frame may add
+        # it), trust it. Otherwise derive from parent inspection.
+        explicit = file_obj.get("version_number")
+        if isinstance(explicit, int):
+            logger.info(
+                "frame file %s has explicit version_number=%d (shape changed — update docs)",
+                file_id, explicit,
+            )
+            return explicit, file_obj.get("parent_id")
+
+        parent_id = file_obj.get("parent_id")
+        if not parent_id:
+            logger.warning(
+                "frame file %s has no parent_id — assuming round 0 (placeholder)",
+                file_id,
+            )
+            return 0, None
+
+        # Look at the parent. If it's a folder, we're a bare file (no
+        # version stack yet) → round 0. If it's a version_stack, walk
+        # its children to find our index.
+        parent_response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/folders/{parent_id}/children"
+            ),
+            op_name="get_file_version_info(children)",
+        )
+        # The folder may have many siblings; that's fine — we're really
+        # asking "is the parent a folder containing this file as a
+        # peer of other files/version stacks?" If so → round 0.
+        if parent_response.status_code == 200:
+            children = parent_response.json().get("data", [])
+            # If any child has type 'version_stack' and contains our
+            # file, we're not in this case — fall through. Otherwise the
+            # file lives directly in a folder → round 0.
+            if any(c.get("id") == file_id for c in children):
+                logger.info(
+                    "frame file %s lives directly in folder %s — round 0",
+                    file_id, parent_id,
+                )
+                return 0, None
+
+        # Parent was probably a version_stack. Try listing its children
+        # via the same /folders endpoint (V4 sometimes treats stacks as
+        # folders for children listing) — if that 404s we know we need
+        # a different endpoint.
+        stack_response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/folders/{parent_id}/children"
+            ),
+            op_name="get_file_version_info(stack-children)",
+        )
+        if stack_response.status_code == 200:
+            stack_children = stack_response.json().get("data", [])
+            # Sort by created_at to get version order (oldest first =
+            # V00, then V01, V02…).
+            stack_children.sort(key=lambda c: c.get("created_at", ""))
+            for idx, child in enumerate(stack_children):
+                if child.get("id") == file_id:
+                    logger.info(
+                        "frame file %s is index %d in stack %s → round %d",
+                        file_id, idx, parent_id, idx,
+                    )
+                    return idx, parent_id
+            logger.warning(
+                "frame file %s not found in stack %s children — assuming 0",
+                file_id, parent_id,
+            )
+            return 0, parent_id
+
+        logger.warning(
+            "frame file %s: couldn't determine version via parent %s (status=%d) — assuming round 0",
+            file_id, parent_id, stack_response.status_code,
+        )
+        return 0, parent_id

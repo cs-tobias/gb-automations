@@ -21,9 +21,12 @@ from gb_automations.config import (
     PROJECTS_NAS_URL_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
+    LEVERANSER_FRAME_URL_PROP,
+    LEVERANSER_PROPS,
+    OPPGAVE_KIND_KORREKSJON,
+    OPPGAVE_KIND_OPPSTART,
+    OPPGAVER_PROPS,
     SYNC_QUEUE_PROPS,
-    TASKS_FRAME_URL_PROP,
-    TASKS_PROPS,
     settings,
 )
 
@@ -238,7 +241,7 @@ def task_project_id(page: dict[str, Any]) -> str | None:
     A task should belong to exactly one project; if Notion has more than one
     related page we log and use the first — Notion's UI doesn't prevent it.
     """
-    ids = read_relation_ids(page, TASKS_PROPS["project"])
+    ids = read_relation_ids(page, LEVERANSER_PROPS["project"])
     if len(ids) > 1:
         logger.warning(
             "task %s has %d Prosjekt relations; using the first (%s)",
@@ -255,7 +258,7 @@ def task_discipline(page: dict[str, Any]) -> str | None:
     The raw label (e.g. "Interiør") is what callers pass to the NAS layer; it
     normalizes to a canonical key via DISCIPLINE_KEYS.
     """
-    prop = (page.get("properties") or {}).get(TASKS_PROPS["discipline"]) or {}
+    prop = (page.get("properties") or {}).get(LEVERANSER_PROPS["discipline"]) or {}
     sel = prop.get("select") or {}
     name = sel.get("name")
     return name or None
@@ -323,19 +326,22 @@ async def _query_projects_db(db_id: str) -> list[dict[str, Any]]:
 
 
 async def tasks_for_project(project_page_id: str) -> list[dict[str, Any]]:
-    """Every non-archived Oppgaver row that relates to this project, paginated.
+    """Every non-archived Leveranser row that relates to this project, paginated.
 
     Used by the project-button flow to derive which discipline branches to
     create — the set of disciplines is "the union of Type across this
-    project's tasks", so we don't need a separate discipline field on the
-    project. Returns [] if TASKS_DB_ID is unset (feature disabled) or the
-    project has no tasks yet.
+    project's Leveranser", so we don't need a separate discipline field on
+    the project. Returns [] if LEVERANSER_DB_ID is unset (feature disabled)
+    or the project has no Leveranser yet.
+
+    The function name `tasks_for_project` is legacy from the old DB name;
+    callers will be renamed in Step 5's full rename pass.
     """
-    if not settings.tasks_db_id:
+    if not settings.leveranser_db_id:
         return []
     filter_body = {
         "filter": {
-            "property": TASKS_PROPS["project"],
+            "property": LEVERANSER_PROPS["project"],
             "relation": {"contains": project_page_id},
         }
     }
@@ -347,7 +353,7 @@ async def tasks_for_project(project_page_id: str) -> list[dict[str, Any]]:
             if start_cursor:
                 body["start_cursor"] = start_cursor
             response = await client.post(
-                f"/databases/{settings.tasks_db_id}/query", json=body
+                f"/databases/{settings.leveranser_db_id}/query", json=body
             )
             _raise_for_status(response)
             payload = response.json()
@@ -560,6 +566,121 @@ async def create_email_row(properties: dict[str, Any], db_id: str) -> dict[str, 
         return response.json()
 
 
+async def create_oppgave_row(
+    *,
+    name: str,
+    leveranse_page_id: str,
+    kind: str,
+    round_number: int | None = None,
+) -> dict[str, Any]:
+    """Create a row in the Oppgaver DB. Returns the created page object.
+
+    `kind` is one of OPPGAVE_KIND_OPPSTART / OPPGAVE_KIND_KORREKSJON. For an
+    Oppstart row, `round_number` is left null; for a Korreksjonsrunde row,
+    pass the Frame file's version number (V01 → 1, V02 → 2, …). The caller
+    is responsible for the dedup check (see `find_oppgave_by_round`) — this
+    function blindly creates.
+
+    Raises RuntimeError if OPPGAVER_DB_ID is unset. The Phase 2 features
+    that call this gate on `settings.oppgaver_db_id` first and skip with a
+    log line, rather than crashing.
+    """
+    if not settings.oppgaver_db_id:
+        raise RuntimeError(
+            "OPPGAVER_DB_ID is not set — Oppgaver writes are disabled."
+        )
+    properties: dict[str, Any] = {
+        OPPGAVER_PROPS["name"]: {"title": [{"text": {"content": name}}]},
+        OPPGAVER_PROPS["leveranse"]: {
+            "relation": [{"id": leveranse_page_id}]
+        },
+        OPPGAVER_PROPS["kind"]: {"select": {"name": kind}},
+    }
+    if round_number is not None:
+        properties[OPPGAVER_PROPS["round"]] = {"number": round_number}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.post(
+                "/pages",
+                json={
+                    "parent": {"database_id": settings.oppgaver_db_id},
+                    "properties": properties,
+                },
+            ),
+            op_name=f"POST /pages oppgave({kind} round={round_number})",
+        )
+        _raise_for_status(response)
+        return response.json()
+
+
+async def find_oppgave_by_round(
+    leveranse_page_id: str, round_number: int | None
+) -> str | None:
+    """Find an existing Oppgave row for a Leveranse + round, or None.
+
+    `round_number=None` looks for the Oppstart row (kind=Oppstart, no round).
+    Any other value looks for the Korreksjonsrunde N row. Returns the page
+    id of the first non-archived match, or None if there isn't one yet
+    (caller then creates via `create_oppgave_row`).
+
+    Returns None silently if OPPGAVER_DB_ID is unset — callers that
+    depend on the lookup decision (e.g. the comment engine that needs to
+    know whether to create round N) MUST also gate on the env, since
+    "couldn't look up" and "doesn't exist" are not the same.
+    """
+    if not settings.oppgaver_db_id:
+        return None
+    # Filter by relation (Leveranse) + kind (Type) + round (Runde or empty).
+    kind_value = (
+        OPPGAVE_KIND_OPPSTART if round_number is None else OPPGAVE_KIND_KORREKSJON
+    )
+    conditions: list[dict[str, Any]] = [
+        {
+            "property": OPPGAVER_PROPS["leveranse"],
+            "relation": {"contains": leveranse_page_id},
+        },
+        {
+            "property": OPPGAVER_PROPS["kind"],
+            "select": {"equals": kind_value},
+        },
+    ]
+    if round_number is None:
+        # Distinguish Oppstart from a Korreksjonsrunde row where someone
+        # accidentally cleared the Runde field — require the number to be
+        # empty (kind=Oppstart already encodes "no round" semantically but
+        # we belt-and-suspender against schema drift).
+        conditions.append(
+            {
+                "property": OPPGAVER_PROPS["round"],
+                "number": {"is_empty": True},
+            }
+        )
+    else:
+        conditions.append(
+            {
+                "property": OPPGAVER_PROPS["round"],
+                "number": {"equals": round_number},
+            }
+        )
+    body = {
+        "filter": {"and": conditions},
+        "page_size": 1,
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.post(
+                f"/databases/{settings.oppgaver_db_id}/query", json=body
+            ),
+            op_name=f"POST /databases/oppgaver/query lookup({kind_value} round={round_number})",
+        )
+        _raise_for_status(response)
+        results = response.json().get("results", [])
+    for page in results:
+        if not page.get("archived") and not page.get("in_trash"):
+            return page.get("id")
+    return None
+
+
 async def patch_email_row_files(page_id: str, files: list[dict[str, str]]) -> None:
     """Set the Files property on an existing email row.
 
@@ -638,13 +759,16 @@ async def set_project_frame_url(project_page_id: str, url: str | None) -> None:
 
 
 async def set_task_frame_url(task_page_id: str, url: str | None) -> None:
-    """Write the Frame.io URL property on a Tasks/Oppgaver-DB page. Idempotent.
+    """Write the Frame.io URL property on a Leveranser-DB page. Idempotent.
 
-    Same shape and rationale as set_project_frame_url, just for tasks. Pass
-    `url=None` to clear (e.g. if the task's Frame folder is deleted manually
-    and we want the property to reflect "not provisioned").
+    Same shape and rationale as set_project_frame_url, just for a Leveranse
+    row. Pass `url=None` to clear (e.g. if the Leveranse's Frame folder is
+    deleted manually and we want the property to reflect "not provisioned").
+
+    Function name `set_task_frame_url` is legacy from the old DB name;
+    callers will be renamed in Step 5's full rename pass.
     """
-    props = {TASKS_FRAME_URL_PROP: {"url": url}}
+    props = {LEVERANSER_FRAME_URL_PROP: {"url": url}}
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
@@ -1115,13 +1239,22 @@ async def create_company(*, name: str, domain: str) -> dict[str, Any]:
 # ============================================================
 
 
-async def append_blocks_to_page(page_id: str, blocks: list[dict[str, Any]]) -> None:
+async def append_blocks_to_page(
+    page_id: str, blocks: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Append a list of Notion blocks to a page. Notion caps each call at 100 children.
 
     PATCH /blocks/.../children is the slowest Notion endpoint we hit in practice
     — sometimes 15-25s for a small block. We retry-with-backoff on transient
     timeouts; permanent failures (4xx) propagate immediately.
+
+    Returns the concatenated list of created block objects across all batches
+    (each carries an `id` that callers can persist when they need to later
+    PATCH children under it — Phase 2 reply indenting uses this to find a
+    parent comment's bullet block by id without re-listing the whole page).
+    Existing call sites that ignore the return value continue to work.
     """
+    created: list[dict[str, Any]] = []
     async with _client() as client:
         # Chunk into batches of 100 to respect Notion's limit.
         for i in range(0, len(blocks), 100):
@@ -1133,6 +1266,8 @@ async def append_blocks_to_page(page_id: str, blocks: list[dict[str, Any]]) -> N
                 op_name=f"PATCH /blocks/{page_id}/children",
             )
             _raise_for_status(response)
+            created.extend(response.json().get("results", []))
+    return created
 
 
 def paragraph_block(text: str) -> dict[str, Any]:
@@ -1167,6 +1302,35 @@ def callout_block(
             ],
         },
     }
+
+
+def bullet_block(
+    text: str, *, children: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Build a bulleted_list_item block with optional nested children.
+
+    Used by the Phase 2 Frame-comments engine to render a comment as one
+    bullet on a Korreksjonsrunde Oppgave's page body. `children` (when set)
+    becomes the nested bullet list directly below — Frame comment replies
+    use this on first-render to indent under their parent.
+
+    Notion's API allows arbitrary nesting depth via either inline `children`
+    on the block or a subsequent PATCH `/blocks/{parent}/children`. The
+    engine uses the inline form for replies that arrive *with* the parent,
+    and the PATCH form for replies that arrive later (looked up via
+    `FrameComment.notion_block_id`). Caller is responsible for chunking
+    `text` if it exceeds Notion's 2000-char rich_text limit.
+    """
+    block: dict[str, Any] = {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {
+            "rich_text": [{"type": "text", "text": {"content": text}}],
+        },
+    }
+    if children:
+        block["bulleted_list_item"]["children"] = children
+    return block
 
 
 def chunk_text(text: str, size: int = 1900) -> list[str]:

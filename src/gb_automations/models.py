@@ -368,13 +368,6 @@ class FrameLeveranseFolder(Base):
     )
 
 
-# Temporary backward-compat alias to keep imports working between Step 2
-# (this rename) and Step 5 (the rename pass through sync_frame.py + tests).
-# Remove at the end of Step 5 — every call site should reference
-# FrameLeveranseFolder by then.
-FrameTaskFolder = FrameLeveranseFolder
-
-
 class FrameComment(Base):
     """Frame.io comment ↔ Notion bullet block on a Korreksjonsrunde Oppgave.
 

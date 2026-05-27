@@ -46,8 +46,8 @@ from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import (
+    enqueue_frame_leveranse_sync,
     enqueue_frame_project_sync,
-    enqueue_frame_task_sync,
     enqueue_label_sync,
     enqueue_nas_folder_sync,
     enqueue_task_folder_sync,
@@ -131,18 +131,19 @@ def _page_parented_to_projects_db(page: dict[str, Any]) -> bool:
     return parent_db == target
 
 
-def _page_parented_to_tasks_db(page: dict[str, Any]) -> bool:
-    """Parent check: page is a row in the configured Tasks (Oppgaver) database.
+def _page_parented_to_leveranser_db(page: dict[str, Any]) -> bool:
+    """Parent check: page is a row in the configured Leveranser database.
 
-    Unlike the Projects check, an unset TASKS_DB_ID means "task webhooks
-    disabled" rather than "skip the check" — we never want to misroute a
-    project-button click as a task-folder sync. Returns False if unset.
+    Unlike the Projects check, an unset LEVERANSER_DB_ID means "Leveranse
+    webhooks disabled" rather than "skip the check" — we never want to
+    misroute a project-button click as a Leveranse-folder sync. Returns
+    False if unset.
     """
-    if not settings.tasks_db_id:
+    if not settings.leveranser_db_id:
         return False
     parent = page.get("parent") or {}
     parent_db = (parent.get("database_id") or "").replace("-", "").lower()
-    target = settings.tasks_db_id.replace("-", "").lower()
+    target = settings.leveranser_db_id.replace("-", "").lower()
     return parent_db == target
 
 
@@ -524,11 +525,12 @@ async def _notion_webhook_impl(request: Request) -> Response:
     parent_db = (page.get("parent") or {}).get("database_id")
     logger.info("↳ click parent.database_id=%s page=%s", parent_db, page_id)
 
-    # Tasks DB takes priority: same button on a task row → task-folder sync.
-    # The project-DB check below is a `True` no-op if PROJECTS_DB_ID is unset
-    # (used as "skip the gate" for dev), so we check tasks first to avoid a
-    # task-row click being misrouted as a project sync in that mode.
-    if _page_parented_to_tasks_db(page):
+    # Leveranser DB takes priority: same button on a Leveranse row → folder
+    # sync (NAS + Frame). The project-DB check below is a `True` no-op if
+    # PROJECTS_DB_ID is unset (used as "skip the gate" for dev), so we
+    # check Leveranser first to avoid a Leveranse-row click being misrouted
+    # as a project sync in that mode.
+    if _page_parented_to_leveranser_db(page):
         title = notion_client.extract_page_title(page)
         if not title:
             logger.info("↳ task %s has no title yet, skipping", page_id)
@@ -545,7 +547,7 @@ async def _notion_webhook_impl(request: Request) -> Response:
             # One Notion click fans out to NAS + Frame. Both are independent
             # task_types so a Frame failure can't block NAS retries (and vice
             # versa). The Frame enqueue dedups separately on its own index.
-            frame_inserted = await enqueue_frame_task_sync(page_id)
+            frame_inserted = await enqueue_frame_leveranse_sync(page_id)
         queue_worker.wake()
         logger.info(
             "📋 task folder sync requested for %r (page %s) — nas=%s frame=%s",

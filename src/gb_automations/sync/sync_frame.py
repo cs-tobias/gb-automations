@@ -1,4 +1,4 @@
-"""Project / Task → Frame.io mirror.
+"""Project / Leveranse → Frame.io mirror.
 
 Notion is the source of truth; this module reconciles the corresponding
 **Frame Project** (one per Notion project, at the workspace level) and the
@@ -7,14 +7,14 @@ folder structure inside it:
     <workspace>/<ProjectName> (Frame Project)
                  └── (project's root_folder_id, auto-created by Frame)
                      ├── Interiør/
-                     │   └── Task A/placeholder.png
+                     │   └── Leveranse A/placeholder.png
                      └── Eksteriør/
-                         └── Task B/placeholder.png
+                         └── Leveranse B/placeholder.png
 
 Each Notion Project is its own top-level Frame Project, visible in Frame V4's
-"Active Projects" view. Discipline folders are lazily created from each task's
-`Type` select (Interiør/Eksteriør/Animasjon); a project with zero tasks gets
-no discipline folders.
+"Active Projects" view. Discipline folders are lazily created from each
+Leveranse's `Type` select (Interiør/Eksteriør/Animasjon); a project with no
+Leveranser gets no discipline folders.
 
 Idempotent and self-healing, mirroring sync_thread:
   - re-runs are no-ops on Frame's side (rename only when name actually changed),
@@ -25,9 +25,14 @@ Idempotent and self-healing, mirroring sync_thread:
     project is ADOPTED rather than duplicated (same for nested folders).
 
 The queue worker calls `sync_frame_project` for a `frame_project_sync` task
-and `sync_frame_task` for `frame_task_sync`. Both fan out from the existing
-Notion webhook — the same button click that enqueues a Gmail label_sync also
-enqueues a Frame sync when SYNC_FRAME=true.
+and `sync_frame_leveranse` for `frame_leveranse_sync`. Both fan out from the
+existing Notion webhook — the same button click that enqueues a Gmail
+label_sync also enqueues a Frame sync when SYNC_FRAME=true.
+
+In Phase 2, `sync_frame_leveranse` ALSO auto-creates an "Oppstart" Oppgave
+row alongside the Frame folder + placeholder, so every Leveranse has a
+place to track pre-delivery work. Korreksjonsrunde rows are created later
+by sync_frame_comments when Frame comments arrive.
 """
 
 from __future__ import annotations
@@ -42,10 +47,11 @@ from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
     DISCIPLINE_KEYS,
     FRAME_DISCIPLINE_FOLDER_NAMES,
+    OPPGAVE_KIND_OPPSTART,
     settings,
 )
 from gb_automations.db import SessionLocal
-from gb_automations.models import FrameProjectFolder, FrameTaskFolder
+from gb_automations.models import FrameLeveranseFolder, FrameProjectFolder
 from gb_automations.utils.labels import project_path_parts
 
 logger = logging.getLogger(__name__)
@@ -120,10 +126,10 @@ class FrameProjectResult:
 
 
 @dataclass
-class FrameTaskResult:
-    task_page_id: str
+class FrameLeveranseResult:
+    leveranse_page_id: str
     project_page_id: str | None = None
-    # adopted = a sibling task folder with the same name already existed under
+    # adopted = a sibling folder with the same name already existed under
     # the discipline folder and we matched it instead of creating a duplicate
     # (and reused its placeholder.png if one was present).
     action: str = "skipped"  # created | adopted | renamed | unchanged | skipped | failed
@@ -172,8 +178,8 @@ async def _evict_if_stale_project(
     return False
 
 
-async def _evict_if_stale_task(
-    session: AsyncSession, row: FrameTaskFolder
+async def _evict_if_stale_leveranse(
+    session: AsyncSession, row: FrameLeveranseFolder
 ) -> bool:
     try:
         await frame_client.get_folder(row.frame_folder_id)
@@ -181,7 +187,7 @@ async def _evict_if_stale_task(
         if not _is_404(err):
             return False
         logger.info(
-            "frame task folder %s for page %s is gone — evicting cache",
+            "frame leveranse folder %s for page %s is gone — evicting cache",
             row.frame_folder_id,
             row.notion_page_id,
         )
@@ -447,13 +453,63 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
     return result
 
 
-async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
-    """Mirror one Notion Task page to a Frame.io folder + placeholder file
-    under its project's discipline subfolder. Recursively provisions the
-    parent project if its cache row is missing, so the worker can drain
-    `frame_task_sync` tasks out of order without races.
+async def _ensure_oppstart_oppgave(
+    leveranse_page_id: str, leveranse_title: str
+) -> None:
+    """Best-effort: make sure an "Oppstart" Oppgave row exists for this
+    Leveranse. Called from `sync_frame_leveranse` after the Frame folder
+    + placeholder are provisioned.
+
+    Idempotent — re-running is a no-op once the row exists. An
+    Oppgaver-DB outage (or OPPGAVER_DB_ID unset) is logged and swallowed
+    so it can't break the Frame sync: the Leveranse + Frame folder + URL
+    write-back are the contract of `sync_frame_leveranse`; Oppstart is a
+    convenience the team can also create by hand if this fails.
     """
-    result = FrameTaskResult(task_page_id=task_page_id)
+    if not settings.oppgaver_db_id:
+        logger.info(
+            "frame: OPPGAVER_DB_ID unset — skipping Oppstart auto-create "
+            "for leveranse %s",
+            leveranse_page_id,
+        )
+        return
+    try:
+        existing = await notion_client.find_oppgave_by_round(
+            leveranse_page_id, round_number=None
+        )
+        if existing:
+            return
+        await notion_client.create_oppgave_row(
+            name="Oppstart",
+            leveranse_page_id=leveranse_page_id,
+            kind=OPPGAVE_KIND_OPPSTART,
+            round_number=None,
+        )
+        logger.info(
+            "frame: created Oppstart Oppgave for leveranse %s (%r)",
+            leveranse_page_id,
+            leveranse_title,
+        )
+    except Exception:
+        logger.exception(
+            "frame: Oppstart auto-create for leveranse %s failed — "
+            "Frame folder still provisioned, team can create the row "
+            "by hand",
+            leveranse_page_id,
+        )
+
+
+async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
+    """Mirror one Notion Leveranse page to a Frame.io folder + placeholder
+    file under its project's discipline subfolder. Recursively provisions
+    the parent project if its cache row is missing, so the worker can drain
+    `frame_leveranse_sync` tasks out of order without races.
+
+    Also auto-creates an "Oppstart" Oppgave row in the Oppgaver DB so the
+    team has somewhere to track pre-delivery work — best-effort, skipped
+    silently if OPPGAVER_DB_ID isn't configured.
+    """
+    result = FrameLeveranseResult(leveranse_page_id=leveranse_page_id)
 
     if not settings.sync_frame:
         result.note = "SYNC_FRAME=false"
@@ -463,19 +519,19 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
         return result
 
     try:
-        page = await notion_client.get_page(task_page_id)
+        page = await notion_client.get_page(leveranse_page_id)
     except Exception:
         logger.exception(
-            "frame: failed to load Notion task page %s", task_page_id
+            "frame: failed to load Notion leveranse page %s", leveranse_page_id
         )
         result.action = "failed"
         return result
 
-    task_name = notion_client.extract_page_title(page)
+    leveranse_name = notion_client.extract_page_title(page)
     project_page_id = notion_client.task_project_id(page)
     discipline_label = notion_client.task_discipline(page)
 
-    if not task_name:
+    if not leveranse_name:
         result.note = "no title yet"
         return result
     if not project_page_id:
@@ -490,8 +546,8 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
     discipline_key = DISCIPLINE_KEYS.get(discipline_label.strip().lower())
     if not discipline_key:
         logger.warning(
-            "frame: task %s has unrecognized Type %r; skipping",
-            task_page_id,
+            "frame: leveranse %s has unrecognized Type %r; skipping",
+            leveranse_page_id,
             discipline_label,
         )
         result.note = f"unknown discipline: {discipline_label}"
@@ -500,8 +556,8 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
     try:
         # Ensure the parent project exists in Frame first. We can't assume
         # frame_project_sync ran before us — the queue can drain in any order,
-        # and a task button click doesn't enqueue its project. Recursing is
-        # cheap when the cache row is already present (no Frame API call).
+        # and a Leveranse button click doesn't enqueue its project. Recursing
+        # is cheap when the cache row is already present (no Frame API call).
         async with SessionLocal() as session:
             project_row = await session.get(FrameProjectFolder, project_page_id)
         if project_row is None:
@@ -513,9 +569,9 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
         if project_row is None:
             logger.warning(
                 "frame: parent project sync for %s yielded no cache row; "
-                "task %s cannot be provisioned this round",
+                "leveranse %s cannot be provisioned this round",
                 project_page_id,
-                task_page_id,
+                leveranse_page_id,
             )
             result.note = "parent project not provisioned"
             return result
@@ -527,40 +583,40 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
             project_row.frame_folder_id, discipline_key
         )
         # Carry the project_id so we can scope the fallback view_url for any
-        # task folder that comes back without one.
+        # leveranse folder that comes back without one.
         project_id_for_url = project_row.frame_project_id
 
-        # Per-task placeholder filename, e.g.
+        # Per-leveranse placeholder filename, e.g.
         #   "1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png"
-        # Computed from the project's CURRENT cached name plus the task's
+        # Computed from the project's CURRENT cached name plus the leveranse
         # title + the configured studio slot. The "_V00" marks this as the
         # placeholder version; the team's first real delivery uploads on
         # top of it as V01 in Frame's version stack.
         #
-        # Renames in Notion (project or task) won't auto-rename an existing
-        # uploaded placeholder file — Frame's version stack keys on file
-        # slot id, not name, so the stale filename is purely cosmetic and
-        # the upload-on-top workflow still functions. If we ever want to
-        # rename the file too, that's a separate enhancement.
+        # Renames in Notion (project or leveranse) won't auto-rename an
+        # existing uploaded placeholder file — Frame's version stack keys
+        # on file slot id, not name, so the stale filename is purely
+        # cosmetic and the upload-on-top workflow still functions. If we
+        # ever want to rename the file too, that's a separate enhancement.
         placeholder_filename = _placeholder_filename(
-            project_row.current_name, task_name
+            project_row.current_name, leveranse_name
         )
 
         async with SessionLocal() as session:
-            row = await session.get(FrameTaskFolder, task_page_id)
+            row = await session.get(FrameLeveranseFolder, leveranse_page_id)
 
-            if row is not None and await _evict_if_stale_task(session, row):
+            if row is not None and await _evict_if_stale_leveranse(session, row):
                 row = None
 
             if row is None:
                 # Same adopt-or-create dance as sync_frame_project: a manually
-                # pre-created task folder (or a folder left over after a cache
-                # wipe) gets adopted instead of duplicated. If we adopt, also
-                # look for an existing placeholder.png inside it — Frame allows
-                # duplicate file names, so without the lookup an adopted folder
-                # that already had a placeholder would end up with two.
+                # pre-created leveranse folder (or a folder left over after a
+                # cache wipe) gets adopted instead of duplicated. If we adopt,
+                # also look for an existing placeholder.png inside it — Frame
+                # allows duplicate file names, so without the lookup an adopted
+                # folder that already had a placeholder would end up with two.
                 existing_folder = await _find_child_folder_by_name(
-                    discipline_folder_id, task_name
+                    discipline_folder_id, leveranse_name
                 )
                 if existing_folder is not None:
                     folder_id = existing_folder["id"]
@@ -585,7 +641,7 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
                     action = "adopted"
                 else:
                     new_folder = await frame_client.create_folder(
-                        discipline_folder_id, task_name
+                        discipline_folder_id, leveranse_name
                     )
                     folder_id = new_folder["id"]
                     placeholder = await frame_client.create_file_from_url(
@@ -595,17 +651,17 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
                     url = _folder_view_url(new_folder, folder_id, project_id_for_url)
                     action = "created"
                 session.add(
-                    FrameTaskFolder(
-                        notion_page_id=task_page_id,
+                    FrameLeveranseFolder(
+                        notion_page_id=leveranse_page_id,
                         project_page_id=project_page_id,
                         frame_folder_id=folder_id,
                         frame_placeholder_file_id=placeholder_id,
-                        current_name=task_name,
+                        current_name=leveranse_name,
                         current_discipline=discipline_label,
                         frame_url=url,
                     )
                 )
-            elif row.current_name != task_name:
+            elif row.current_name != leveranse_name:
                 # Discipline change is logged but not re-parented in Phase 1 —
                 # cross-folder move requires a V4 endpoint we haven't verified
                 # safe yet; the folder stays under its original discipline and
@@ -613,18 +669,18 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
                 # of stale parented folders is observed.
                 if row.current_discipline != discipline_label:
                     logger.warning(
-                        "frame: task %s discipline changed %r→%r — renaming "
+                        "frame: leveranse %s discipline changed %r→%r — renaming "
                         "in place under old discipline; re-parenting is not "
                         "yet implemented",
-                        task_page_id,
+                        leveranse_page_id,
                         row.current_discipline,
                         discipline_label,
                     )
-                renamed = await frame_client.rename_folder(row.frame_folder_id, task_name)
+                renamed = await frame_client.rename_folder(row.frame_folder_id, leveranse_name)
                 folder_id = row.frame_folder_id
                 placeholder_id = row.frame_placeholder_file_id
                 url = _folder_view_url(renamed, folder_id, project_id_for_url)
-                row.current_name = task_name
+                row.current_name = leveranse_name
                 row.current_discipline = discipline_label
                 row.frame_url = url
                 await session.merge(row)
@@ -637,26 +693,32 @@ async def sync_frame_task(task_page_id: str) -> FrameTaskResult:
 
             await session.commit()
     except Exception:
-        logger.exception("frame: task sync failed for %s", task_page_id)
+        logger.exception("frame: leveranse sync failed for %s", leveranse_page_id)
         result.action = "failed"
         return result
 
     try:
-        await notion_client.set_task_frame_url(task_page_id, url)
+        await notion_client.set_task_frame_url(leveranse_page_id, url)
     except Exception:
         logger.exception(
-            "frame: failed to patch Frame URL on task page %s", task_page_id
+            "frame: failed to patch Frame URL on leveranse page %s",
+            leveranse_page_id,
         )
+
+    # Best-effort Oppstart auto-create — independent of the Frame writeback
+    # so a Notion outage on the URL patch doesn't skip the Oppgave creation
+    # (and vice versa). `_ensure_oppstart_oppgave` is itself best-effort.
+    await _ensure_oppstart_oppgave(leveranse_page_id, leveranse_name)
 
     result.action = action
     result.frame_folder_id = folder_id
     result.frame_placeholder_file_id = placeholder_id
     result.frame_url = url
     logger.info(
-        "frame task sync %s for %r (page %s, discipline %s) → %s",
+        "frame leveranse sync %s for %r (page %s, discipline %s) → %s",
         action,
-        task_name,
-        task_page_id,
+        leveranse_name,
+        leveranse_page_id,
         discipline_label,
         folder_id,
     )
