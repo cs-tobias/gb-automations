@@ -69,7 +69,19 @@
       "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest tests\\\\test_sync_frame_project.py tests\\\\test_sync_frame_task.py --tb=short 2>&1)",
       "PowerShell(.\\\\.venv-test\\\\Scripts\\\\python.exe -m pytest --tb=line 2>&1)",
       "Bash(dir \"src\\\\gb_automations\\\\assets\")",
-      "PowerShell(if \\(-not \\(Test-Path \"X:\\\\gb-nas-test\\\\Goldbox_Logo_White.png\"\\)\\) { Write-Output \"SOURCE_MISSING\"; exit 1 }; Copy-Item -Path \"X:\\\\gb-nas-test\\\\Goldbox_Logo_White.png\" -Destination \"src\\\\gb_automations\\\\assets\\\\Goldbox_Logo_White.png\" -Force; \\(Get-Item \"src\\\\gb_automations\\\\assets\\\\Goldbox_Logo_White.png\" | Select-Object Name, Length | Format-List | Out-String\\).Trim\\(\\))"
+      "PowerShell(if \\(-not \\(Test-Path \"X:\\\\gb-nas-test\\\\Goldbox_Logo_White.png\"\\)\\) { Write-Output \"SOURCE_MISSING\"; exit 1 }; Copy-Item -Path \"X:\\\\gb-nas-test\\\\Goldbox_Logo_White.png\" -Destination \"src\\\\gb_automations\\\\assets\\\\Goldbox_Logo_White.png\" -Force; \\(Get-Item \"src\\\\gb_automations\\\\assets\\\\Goldbox_Logo_White.png\" | Select-Object Name, Length | Format-List | Out-String\\).Trim\\(\\))",
+      "Bash(find \"c:\\\\Users\\\\tobia\\\\Documents\\\\Code\\\\gb-automations\" -name \"*.py\" -path \"*/routes/*debug*\" 2>nul | head -5)",
+      "Bash(grep -r \"GET.*debug.*queue\" \"c:\\\\Users\\\\tobia\\\\Documents\\\\Code\\\\gb-automations\\\\src\" --include=\"*.py\" 2>nul)",
+      "WebSearch",
+      "WebFetch(domain:forum.frame.io)",
+      "WebFetch(domain:developer.adobe.com)",
+      "WebFetch(domain:next.developer.frame.io)",
+      "WebFetch(domain:developer.frame.io)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('migrations/versions/k6h7i8j9e0f1_phase2_frame_comments.py'\\).read\\(\\)\\); print\\('migration: ok'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/models.py'\\).read\\(\\)\\); print\\('models: ok'\\)\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\tobia\\Documents\\Code\\gb-automations"
     ]
   }
 }

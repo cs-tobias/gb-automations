@@ -328,19 +328,33 @@ class FrameProjectFolder(Base):
     )
 
 
-class FrameTaskFolder(Base):
-    """Notion task page ↔ Frame.io task folder + its placeholder file.
+class FrameLeveranseFolder(Base):
+    """Notion Leveranse page ↔ Frame.io task folder + its placeholder file.
 
-    The placeholder file is what makes "first delivery uploads as V2 on top"
-    work in Frame's UI; we persist its id (`frame_placeholder_file_id`) so:
-    (a) Phase 2 comment polling can join comments → file_id → task page, and
-    (b) a task rename preserves the placeholder rather than recreating it.
+    Phase 2 reframed what this table represents: a row in the (formerly
+    "Oppgaver", now "Leveranser") Notion DB is a deliverable *entity* — one
+    image / render — not a task. Each row provisions its own Frame folder
+    under the project's discipline subfolder, plus a V00 placeholder file
+    that becomes the base of Frame's version stack (V01 = first real
+    delivery, V02 = revision after round 1, etc.).
 
-    `project_page_id` denormalized for "all Frame task folders for project X"
-    lookups (e.g. when a project's folder id is re-resolved after self-heal).
+    The placeholder file id (`frame_placeholder_file_id`) is what makes
+    "first delivery uploads as V01 on top" work in Frame's UI; we persist
+    it so:
+    (a) Phase 2 comment polling joins comment.file_id → this row →
+        Notion Leveranse page, and
+    (b) a Leveranse rename preserves the placeholder rather than
+        recreating it (and losing the version stack).
+
+    `project_page_id` denormalized for "all Frame folders for project X"
+    lookups (e.g. when a project's folder id is re-resolved after
+    self-heal). Column names are kept as-is across the
+    frame_task_folders → frame_leveranse_folders table rename — the
+    semantic shift is "what does a row mean", not "what does each column
+    hold".
     """
 
-    __tablename__ = "frame_task_folders"
+    __tablename__ = "frame_leveranse_folders"
 
     notion_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     project_page_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -351,6 +365,67 @@ class FrameTaskFolder(Base):
     frame_url: Mapped[str] = mapped_column(String(512), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# Temporary backward-compat alias to keep imports working between Step 2
+# (this rename) and Step 5 (the rename pass through sync_frame.py + tests).
+# Remove at the end of Step 5 — every call site should reference
+# FrameLeveranseFolder by then.
+FrameTaskFolder = FrameLeveranseFolder
+
+
+class FrameComment(Base):
+    """Frame.io comment ↔ Notion bullet block on a Korreksjonsrunde Oppgave.
+
+    One row per Frame comment we've successfully synced. The primary key is
+    the Frame comment UUID; INSERTs use ON CONFLICT DO NOTHING for engine-
+    level idempotency (a re-delivered webhook for the same comment id is
+    a no-op).
+
+    `notion_block_id` is the id of the bullet we wrote to the
+    Korreksjonsrunde Oppgave page. Replies look this up to PATCH a nested
+    child bullet under their parent block (Decision 2 in the Phase 2
+    plan), avoiding the cost of rebuilding the whole bullet section.
+
+    `parent_comment_id` is set when this comment is a reply (the parent's
+    `replies: [...]` array surfaces it). Frame's reply object itself does
+    NOT carry a parent pointer — we derive it from where it sits in the
+    response tree when fetching the parent.
+
+    `round_number` is the Frame file version number (V01 = round 1,
+    V00 = round 0). Cached here so we don't re-derive it on every reply.
+
+    `body_snippet` is the first 512 chars of the comment text — kept for
+    operator debugging at /debug/queue and for log lines; the canonical
+    body lives in Frame and (rendered) in Notion.
+    """
+
+    __tablename__ = "frame_comments"
+
+    frame_comment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    frame_file_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    leveranse_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    oppgave_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    round_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    notion_block_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    body_snippet: Mapped[str] = mapped_column(String(512), nullable=False, server_default="")
+    inserted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        # "Replies for this file + round" — used when a reply needs to
+        # find its parent's notion_block_id to indent under.
+        Index("ix_frame_comments_file_round", "frame_file_id", "round_number"),
+        # "All comments on this Oppgave" — used by operator-side rebuilds
+        # and by the engine when a Korreksjonsrunde row needs to enumerate
+        # what's already there.
+        Index("ix_frame_comments_oppgave", "oppgave_page_id"),
     )
 
 
@@ -386,10 +461,14 @@ SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
 # folder structure on the office NAS (split out of label_sync so each system
 # has its own retry/failure surface and its own per-system button).
 # 'task_folder_sync' provisions NAS folders for one Notion task page (Oppgaver
-# DB). 'frame_project_sync' and 'frame_task_sync' do the same for Frame.io —
-# kept separate from the NAS task types because Frame I/O is slower
-# (placeholder upload) and gated by its own SYNC_FRAME toggle, so a Frame
-# outage shouldn't tie up NAS/label retries.
+# DB). 'frame_project_sync' and 'frame_leveranse_sync' do the same for
+# Frame.io — kept separate from the NAS task types because Frame I/O is
+# slower (placeholder upload) and gated by its own SYNC_FRAME toggle, so
+# a Frame outage shouldn't tie up NAS/label retries.
+# 'frame_comment_sync' is the Phase 2 inbound side: a Frame webhook fires
+# on comment.created / comment.updated, the receiver enqueues one of
+# these per comment id, and the worker fetches the full comment and
+# writes a bullet into the corresponding Korreksjonsrunde Oppgave row.
 # New types go here + the CHECK below + a branch in jobs/queue_worker._process.
 SYNC_TASK_TYPES = (
     "thread",
@@ -397,7 +476,8 @@ SYNC_TASK_TYPES = (
     "nas_folder_sync",
     "task_folder_sync",
     "frame_project_sync",
-    "frame_task_sync",
+    "frame_leveranse_sync",
+    "frame_comment_sync",
 )
 
 
@@ -468,7 +548,8 @@ class SyncTask(Base):
         ),
         CheckConstraint(
             "task_type IN ('thread','label_sync','nas_folder_sync',"
-            "'task_folder_sync','frame_project_sync','frame_task_sync')",
+            "'task_folder_sync','frame_project_sync','frame_leveranse_sync',"
+            "'frame_comment_sync')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -521,15 +602,32 @@ class SyncTask(Base):
                 "status IN ('pending','in_progress') AND task_type = 'frame_project_sync'"
             ),
         ),
-        # At most one ACTIVE frame_task_sync per task. Mirrors the
-        # task_folder_sync pattern: gmail_thread_id carries the task page id as
-        # a placeholder so the dedup is on a single column.
+        # At most one ACTIVE frame_leveranse_sync per Leveranse (renamed
+        # from frame_task_sync in Phase 2; the column rename + index
+        # predicate update happen in the same Alembic migration as the
+        # frame_task_folders → frame_leveranse_folders rename).
+        # Mirrors the task_folder_sync pattern: gmail_thread_id carries
+        # the Leveranse page id as a placeholder so the dedup is on a
+        # single column.
         Index(
-            "uq_sync_tasks_active_frame_task",
+            "uq_sync_tasks_active_frame_leveranse",
             "gmail_thread_id",
             unique=True,
             postgresql_where=text(
-                "status IN ('pending','in_progress') AND task_type = 'frame_task_sync'"
+                "status IN ('pending','in_progress') AND task_type = 'frame_leveranse_sync'"
+            ),
+        ),
+        # At most one ACTIVE frame_comment_sync per Frame comment. The
+        # comment UUID is stashed in gmail_thread_id (mirroring the
+        # task_folder_sync / frame_leveranse_sync pattern); a webhook
+        # redelivery for the same comment id while a sync is still
+        # in-flight collapses to a single task.
+        Index(
+            "uq_sync_tasks_active_frame_comment",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'frame_comment_sync'"
             ),
         ),
         # Drives the worker's claim query: filter by status, FIFO by oldest

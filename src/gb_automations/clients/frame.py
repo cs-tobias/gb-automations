@@ -465,3 +465,104 @@ async def get_file(file_id: str) -> dict[str, Any]:
         )
         _raise_for_status(response)
         return _unwrap(response.json())
+
+
+# ============================================================
+# Phase 2 — probe-only methods (response shapes unverified)
+# ============================================================
+#
+# These exist to support the probe phase in docs/misc/frame-setup.md and the
+# /debug/frame/comments + /debug/frame/webhooks endpoints. The exact response
+# shapes (field names, nesting, signature header) are NOT yet pinned against
+# the live V4 API. Once probed:
+#   1. record the observed shape in each method's docstring,
+#   2. write the engine in sync/sync_frame_comments.py against those shapes,
+#   3. add the writer methods (create_webhook, delete_webhook, get_comment).
+# Do not consume these from production code paths until the probe is complete.
+
+
+async def list_comments(
+    file_id: str, *, include: tuple[str, ...] = ("owner", "replies")
+) -> list[dict[str, Any]]:
+    """List comments on a Frame File, with optional `?include=` expansions.
+
+    V4 omits `owner` (the author) and `replies` (the nested reply chain)
+    from the default response — they're privacy/perf gated and have to be
+    opted into explicitly. The defaults here (`owner` + `replies`) match
+    what the Phase 2 engine needs to render a Notion bullet with author
+    attribution and nested reply bullets in one round-trip.
+
+    Source: https://forum.frame.io/t/no-comment-replies-api-in-v4/2922
+    plus the migration guide at next.developer.frame.io.
+
+    Returns the raw `data` array. Each comment carries nested
+    `owner: {id, name, email, active, adobe_user_id, avatar_url}` when the
+    commenter is a registered Frame user — for external/guest commenters
+    `owner` is `null` by Frame's privacy policy and will not be backfilled.
+    Replies appear nested under their parent as `replies: [...]`; the
+    reply object does NOT carry its own `parent_id`, so the engine derives
+    "this is a reply" from where it sits in the response tree.
+
+    Important: include params MUST be comma-separated in a single
+    `?include=` key (verified 2026-05-26 against V4). Using repeated keys
+    (`?include=owner&include=replies`) silently drops everything but the
+    last value — replies came back but `owner` was null.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        params = {"include": ",".join(include)} if include else None
+        response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/files/{file_id}/comments",
+                params=params,
+            ),
+            op_name="list_comments",
+        )
+        _raise_for_status(response)
+        return response.json().get("data", [])
+
+
+async def get_comment_raw(
+    comment_id: str, *, include: tuple[str, ...] = ("owner", "replies")
+) -> dict[str, Any]:
+    """Fetch a single comment by id, with `?include=owner,replies` (comma-
+    separated) by default so the engine gets author + nested replies in
+    one round-trip.
+
+    See `list_comments` for the rationale on the include params and the
+    repeated-vs-comma-separated gotcha. Returns the raw response so
+    callers can read whichever fields they need — most call sites should
+    use the future `get_comment()` wrapper instead.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        params = {"include": ",".join(include)} if include else None
+        response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/comments/{comment_id}",
+                params=params,
+            ),
+            op_name="get_comment_raw",
+        )
+        _raise_for_status(response)
+        return response.json()
+
+
+async def list_webhooks(workspace_id: str) -> list[dict[str, Any]]:
+    """[PROBE] List webhooks registered against a workspace.
+
+    Endpoint shape from V4 docs: GET /accounts/{aid}/workspaces/{wid}/webhooks.
+    Used by the bootstrap script to check whether `{PUBLIC_HUB}/webhooks/frame`
+    is already registered before creating a duplicate, and by the
+    /debug/frame/webhooks endpoint for visibility.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/workspaces/{workspace_id}/webhooks"
+            ),
+            op_name="list_webhooks",
+        )
+        _raise_for_status(response)
+        return response.json().get("data", [])

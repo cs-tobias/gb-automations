@@ -269,6 +269,125 @@ async def debug_frame_workspace() -> dict[str, Any]:
     }
 
 
+@router.get("/frame/comments/{file_id}")
+async def debug_frame_comments(file_id: str) -> dict[str, Any]:
+    """[PROBE] Dump the raw comment list for a Frame File.
+
+    Phase 2 probe endpoint — point this at a known placeholder file id (from
+    `FrameLeveranseFolder.frame_placeholder_file_id` in the DB, or by
+    eyeballing the URL in Frame's UI). The intent is to learn the exact V4
+    response shape (field names, nesting) BEFORE writing the comment sync
+    engine. Returns the unwrapped payload as-is so the operator can read
+    field names off it. Safe to leave in place after Phase 2 ships — useful
+    for ad-hoc debugging when a comment doesn't sync.
+    """
+    try:
+        comments = await frame_client.list_comments(file_id)
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    return {
+        "ok": True,
+        "file_id": file_id,
+        "comment_count": len(comments),
+        "comments": comments,
+    }
+
+
+@router.get("/frame/comment-raw/{comment_id}")
+async def debug_frame_comment_raw_variants(comment_id: str) -> dict[str, Any]:
+    """[PROBE] Fetch one comment trying include= variants (probe-only).
+
+    The default `?include=owner&include=replies` form returns replies but
+    no owner. Try comma-separated and bracket-array forms to find the one
+    that surfaces `owner`.
+    """
+    import httpx
+
+    from gb_automations.clients import frame_auth
+
+    token = await frame_auth.get_access_token()
+    aid = frame_client._account_id()  # noqa: SLF001
+    base = frame_client.FRAME_API_BASE
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "x-api-key": frame_client._client_id(),  # noqa: SLF001
+        "Accept": "application/json",
+    }
+    variants = [
+        "",
+        "?include=owner",
+        "?include=owner,replies",
+        "?include[]=owner&include[]=replies",
+        "?fields=owner,owner_id,text",
+        "?expand=owner",
+        "?include=owner&include=replies",
+    ]
+    out: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(base_url=base, headers=headers, timeout=30.0) as client:
+        for q in variants:
+            resp = await client.get(f"/accounts/{aid}/comments/{comment_id}{q}")
+            try:
+                body = resp.json()
+                data = body.get("data", body)
+                # Show only the keys + owner fields if present, for compactness
+                summary = {
+                    "keys": sorted(data.keys()) if isinstance(data, dict) else "non-dict",
+                    "owner_id": data.get("owner_id") if isinstance(data, dict) else None,
+                    "owner": data.get("owner") if isinstance(data, dict) else None,
+                }
+            except Exception:  # noqa: BLE001
+                summary = {"raw": resp.text[:300]}
+            out.append({"query": q or "(none)", "status": resp.status_code, "summary": summary})
+    return {"ok": True, "comment_id": comment_id, "variants": out}
+
+
+@router.get("/frame/comment/{comment_id}")
+async def debug_frame_comment(comment_id: str) -> dict[str, Any]:
+    """[PROBE] Fetch a single Frame comment by id, raw payload.
+
+    The `file/{id}/comments` list view is missing author info; this single-
+    comment endpoint may return more fields. Returns the unwrapped JSON
+    so the operator can read field names off it.
+    """
+    try:
+        payload = await frame_client.get_comment_raw(comment_id)
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    return {"ok": True, "comment_id": comment_id, "payload": payload}
+
+
+@router.get("/frame/webhooks")
+async def debug_frame_webhooks() -> dict[str, Any]:
+    """[PROBE] List webhooks currently registered against FRAME_WORKSPACE_ID.
+
+    Operator visibility for "is my Phase 2 webhook registered?". Run after
+    the bootstrap to confirm the comment.created webhook for
+    `{PUBLIC_HUB}/webhooks/frame` shows up here. If duplicates appear (e.g.
+    from re-running the bootstrap before the dedup logic landed), the
+    operator can clean them up against the Frame API directly.
+    """
+    from gb_automations.config import settings
+
+    if not settings.frame_workspace_id:
+        raise HTTPException(400, "FRAME_WORKSPACE_ID is not set — run the bootstrap.")
+    try:
+        webhooks = await frame_client.list_webhooks(settings.frame_workspace_id)
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    return {
+        "ok": True,
+        "workspace_id": settings.frame_workspace_id,
+        "webhook_count": len(webhooks),
+        "webhooks": webhooks,
+    }
+
+
 @router.get("/queue")
 async def queue_status() -> dict[str, Any]:
     """Live state of the durable sync queue: counts by status, oldest pending
