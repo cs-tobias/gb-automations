@@ -82,7 +82,11 @@
       "Bash(curl.exe -s -o /dev/null -w \"%{http_code}\\\\n\" -X POST \"https://hub.tobiaseek.com/webhooks/frame\" -H \"Content-Type: application/json\" -d '{\"type\":\"comment.created\",\"resource\":{\"id\":\"deadbeef\",\"type\":\"comment\"}}')",
       "Bash(curl.exe -s \"https://hub.tobiaseek.com/debug/frame/webhooks\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/sync/sync_oppgave_done.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/sync/sync_leveranse_status.py'\\).read\\(\\)\\); print\\('ok'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/sync/sync_leveranse_status.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "Bash(xargs cat)",
+      "WebFetch(domain:engineering.toggl.com)",
+      "WebFetch(domain:support.toggl.com)",
+      "WebFetch(domain:toggl.com)"
     ],
     "additionalDirectories": [
       "c:\\Users\\tobia\\Documents\\Code\\gb-automations"

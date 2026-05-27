@@ -51,6 +51,12 @@ _ACTIVE_FRAME_LEVERANSE_PREDICATE = text(
 _ACTIVE_FRAME_COMMENT_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_comment_sync'"
 )
+_ACTIVE_TOGGL_PROJECT_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'toggl_project_sync'"
+)
+_ACTIVE_TOGGL_HOURS_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'toggl_hours_sync'"
+)
 
 
 async def enqueue_threads(
@@ -221,6 +227,66 @@ async def enqueue_frame_project_sync(project_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["project_page_id"],
             index_where=_ACTIVE_FRAME_PROJECT_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_toggl_project_sync(project_page_id: str) -> int:
+    """Enqueue a Toggl Track project-mirror sync for a Notion Project page.
+
+    Phase 1 of the Toggl integration. Mirrors enqueue_frame_project_sync:
+    project_page_id is the dedup key (uq_sync_tasks_active_toggl_project),
+    user_email/gmail_thread_id are placeholders ("*" / project_page_id)
+    so the NOT NULL columns are satisfied. Returns 1 if newly enqueued,
+    0 if a duplicate was already active.
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="toggl_project_sync",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id"],
+            index_where=_ACTIVE_TOGGL_PROJECT_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_toggl_hours_sync() -> int:
+    """Enqueue a daily Toggl hours aggregation. Singleton — at most one
+    active row globally (cron + manual /debug double-fire collapses to one).
+
+    Returns 1 if newly enqueued, 0 if one was already pending/in_progress.
+    """
+    # Late import: TOGGL_HOURS_SINGLETON_KEY is defined alongside
+    # SyncTask in models.py; pulling it here avoids the import-cycle risk
+    # of putting it next to the other queue.py constants at the top.
+    from gb_automations.models import TOGGL_HOURS_SINGLETON_KEY
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="toggl_hours_sync",
+            user_email="*",
+            gmail_thread_id=TOGGL_HOURS_SINGLETON_KEY,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_TOGGL_HOURS_PREDICATE,
         )
     )
     async with SessionLocal() as own:

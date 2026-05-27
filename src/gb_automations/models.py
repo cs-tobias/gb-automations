@@ -422,6 +422,90 @@ class FrameComment(Base):
     )
 
 
+class TogglProject(Base):
+    """Notion project page ↔ Toggl Track project, one row per project.
+
+    Toggl allows duplicate-named projects in a workspace, so name lookups
+    aren't safe — the integration MUST own the mapping. This table is that
+    mapping: a Notion project page id resolves to the Toggl numeric project
+    id (plus the workspace it lives in and the URL the team clicks from
+    Notion to land on it).
+
+    Self-healing parallels FrameProjectFolder: if `toggl_project_id`
+    starts returning 404/403 (admin deleted the project in Toggl's UI),
+    the engine evicts this row and re-creates on the next pass.
+
+    `toggl_workspace_id` is denormalized so a sync engine doesn't need to
+    re-read settings to know which workspace the project belongs to (and
+    so a future workspace migration is a single UPDATE rather than a
+    schema change).
+    """
+
+    __tablename__ = "toggl_projects"
+
+    notion_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # Toggl's project ids are int64; stored as string to match every other
+    # external id in this schema and to avoid integer-overflow surprises
+    # if Toggl ever widens the type.
+    toggl_project_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    toggl_workspace_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    current_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    toggl_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class TogglUserCache(Base):
+    """Toggl workspace user roster, cached from Toggl's API.
+
+    The hours engine needs an email for each Toggl user_id so it can map
+    that user to a native Notion account (by email match against
+    `GET /v1/users`). Time-entry payloads from Reports v3 only carry
+    `user_id`; this table is what makes id → email a single PK read.
+
+    Refreshed at the top of every nightly hours sync via
+    `sync.refresh_toggl_users_cache.refresh_toggl_users_cache` (new
+    workspace members get picked up on the next run without a restart).
+    Rows whose toggl_user_id no longer appears in the workspace get
+    deleted, so a departed employee stops showing up in lookups.
+
+    No UNIQUE on email: Toggl deduplicates by user_id, not email, and
+    emails are mutable. The engine's per-run Notion-side index is the
+    one place where we assume "one email = one Notion user."
+    """
+
+    __tablename__ = "toggl_user_cache"
+
+    toggl_user_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    email: Mapped[str] = mapped_column(String(254), nullable=False)
+    # Cached display name for logs — the canonical value lives in Toggl.
+    name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class TimerDbCache(Base):
+    """Year → Notion DB ID for the year-partitioned Timer databases.
+
+    Direct parallel to EmailsDbCache. The Timer year router
+    (`clients/notion_timer_db.py`) auto-creates `Timer YYYY` databases on
+    first sync of each year and caches the resolved id here so we don't
+    search Notion on every nightly run. Cached id is self-healed if Notion
+    no longer has the DB (deleted/recreated by hand): the next resolve
+    evicts and recreates.
+    """
+
+    __tablename__ = "timer_db_cache"
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notion_db_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class EmailsDbCache(Base):
     """Year → Notion DB ID for the year-partitioned Emails databases.
 
@@ -472,6 +556,19 @@ SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
 # the engine PATCHes the matching Frame comment's completed state.
 # 'leveranse_status_recheck' rolls up the active round's Korreksjon
 # completion counts into Under arbeid / Oppgaver ferdig.
+# 'toggl_project_sync' mirrors a Notion Project to Toggl Track (Phase 1
+# of the Toggl integration). The Notion Initialize button fans out to this
+# task type alongside label_sync / nas_folder_sync / frame_project_sync
+# when SYNC_TOGGL=true. project_page_id carries the Notion page id; the
+# engine looks up the existing TogglProject cache row (or creates one)
+# and renames the Toggl project if the title changed.
+# 'toggl_hours_sync' is the Phase 2 nightly aggregator. APScheduler
+# enqueues one of these per day; the engine pulls the last 14 days from
+# Toggl Reports v3, aggregates per (user, project, local_day), and
+# upserts rows into the year-partitioned `Timer YYYY` Notion DB. There's
+# at most one active row at a time — the dedup index uses a fixed
+# sentinel value in gmail_thread_id so a late-night double-trigger
+# collapses to one run.
 # New types go here + the CHECK below + a branch in jobs/queue_worker._process.
 SYNC_TASK_TYPES = (
     "thread",
@@ -484,7 +581,16 @@ SYNC_TASK_TYPES = (
     "frame_version_sync",
     "oppgave_done_sync",
     "leveranse_status_recheck",
+    "toggl_project_sync",
+    "toggl_hours_sync",
 )
+
+# Sentinel value stuffed into gmail_thread_id on toggl_hours_sync rows so
+# the partial unique index `uq_sync_tasks_active_toggl_hours` collapses
+# every active row to one — there is at most one global hours sync in
+# flight. Exposed as a constant so the enqueue helper and the migration
+# downgrade both reference the same string.
+TOGGL_HOURS_SINGLETON_KEY = "toggl-hours-singleton"
 
 
 class SyncTask(Base):
@@ -556,7 +662,8 @@ class SyncTask(Base):
             "task_type IN ('thread','label_sync','nas_folder_sync',"
             "'task_folder_sync','frame_project_sync','frame_leveranse_sync',"
             "'frame_comment_sync','frame_version_sync','oppgave_done_sync',"
-            "'leveranse_status_recheck')",
+            "'leveranse_status_recheck','toggl_project_sync',"
+            "'toggl_hours_sync')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -674,6 +781,34 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'leveranse_status_recheck'"
+            ),
+        ),
+        # Toggl Phase 1 — At most one ACTIVE toggl_project_sync per project
+        # (mirrors uq_sync_tasks_active_frame_project: a Notion button
+        # re-fire on the same Project page must collapse to one task even
+        # though label_sync / nas_folder_sync / frame_project_sync /
+        # toggl_project_sync can all be in flight for the same project at
+        # the same time).
+        Index(
+            "uq_sync_tasks_active_toggl_project",
+            "project_page_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'toggl_project_sync'"
+            ),
+        ),
+        # Toggl Phase 2 — At most one ACTIVE toggl_hours_sync ever (global
+        # singleton: there's only one nightly aggregator, not per-project).
+        # The enqueue helper stuffs TOGGL_HOURS_SINGLETON_KEY into
+        # gmail_thread_id so every active row collides on that single
+        # value, collapsing a double-trigger (cron + manual /debug call,
+        # or two cron pulses if APScheduler ever fires twice) to one run.
+        Index(
+            "uq_sync_tasks_active_toggl_hours",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'toggl_hours_sync'"
             ),
         ),
         # Drives the worker's claim query: filter by status, FIFO by oldest

@@ -57,6 +57,7 @@ from gb_automations.sync.queue import (
     enqueue_oppgave_done_sync,
     enqueue_task_folder_sync,
     enqueue_threads,
+    enqueue_toggl_project_sync,
 )
 from gb_automations.sync.watches import cursor_source_for, fetch_project_label_ids_for_user
 
@@ -690,9 +691,12 @@ async def _notion_webhook_impl(request: Request) -> Response:
     frame_inserted = 0
     if settings.sync_frame:
         frame_inserted = await enqueue_frame_project_sync(page_id)
+    toggl_inserted = 0
+    if settings.sync_toggl:
+        toggl_inserted = await enqueue_toggl_project_sync(page_id)
     queue_worker.wake()
     logger.info(
-        "🏷  initialize requested for %r (page %s) — labels=%s nas=%s frame=%s",
+        "🏷  initialize requested for %r (page %s) — labels=%s nas=%s frame=%s toggl=%s",
         title,
         page_id,
         "enqueued" if inserted else "already queued",
@@ -701,6 +705,9 @@ async def _notion_webhook_impl(request: Request) -> Response:
         else "off",
         ("enqueued" if frame_inserted else "already queued")
         if settings.sync_frame
+        else "off",
+        ("enqueued" if toggl_inserted else "already queued")
+        if settings.sync_toggl
         else "off",
     )
     return _json(
@@ -712,6 +719,9 @@ async def _notion_webhook_impl(request: Request) -> Response:
             else "off",
             "frame": ("queued" if frame_inserted else "already_queued")
             if settings.sync_frame
+            else "off",
+            "toggl": ("queued" if toggl_inserted else "already_queued")
+            if settings.sync_toggl
             else "off",
         }
     )

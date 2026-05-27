@@ -416,3 +416,63 @@ async def queue_retry_failed(thread_id: str | None = Query(default=None)) -> dic
     if requeued:
         queue_worker.wake()
     return {"requeued": requeued, "thread_id": thread_id}
+
+
+@router.post("/toggl/sync-hours")
+async def debug_toggl_sync_hours() -> dict[str, Any]:
+    """Manually trigger the Toggl hours aggregator.
+
+    Enqueues a `toggl_hours_sync` task and wakes the worker. Same code
+    path the nightly APScheduler job uses — handy for testing without
+    waiting until 02:00 Oslo. Singleton dedup means a second click while
+    one is in flight is a no-op (the response says so).
+    """
+    from gb_automations.jobs import queue_worker
+    from gb_automations.sync.queue import enqueue_toggl_hours_sync
+
+    inserted = await enqueue_toggl_hours_sync()
+    if inserted:
+        queue_worker.wake()
+    return {
+        "action": "queued" if inserted else "already_queued",
+        "note": "watch the api logs for 'toggl hours sync done' summary",
+    }
+
+
+@router.post("/toggl/refresh-users")
+async def debug_toggl_refresh_users() -> dict[str, Any]:
+    """Refresh both halves of the Toggl→Notion user map without running a sync.
+
+    Pulls the Toggl workspace member list into `toggl_user_cache`, then
+    queries Notion's workspace users (`GET /v1/users`) and reports how
+    many distinct emails are indexed. Both numbers must be >= 1 before
+    the nightly hours sync can write any rows.
+
+    Useful right after onboarding a new employee (added to Toggl AND
+    invited to Notion with the same email) to confirm the mapping
+    works end-to-end before the next nightly run.
+    """
+    from gb_automations.clients import notion as notion_client
+    from gb_automations.sync.refresh_toggl_users_cache import (
+        refresh_toggl_users_cache,
+    )
+
+    toggl_result = await refresh_toggl_users_cache()
+
+    notion_users = await notion_client.list_workspace_users()
+    notion_emails: set[str] = set()
+    for u in notion_users:
+        if u.get("type") != "person":
+            continue
+        email = ((u.get("person") or {}).get("email") or "").strip().lower()
+        if email:
+            notion_emails.add(email)
+
+    return {
+        "toggl_users_cached": toggl_result.total_in_toggl,
+        "toggl_added": toggl_result.added,
+        "toggl_updated": toggl_result.updated,
+        "toggl_removed": toggl_result.removed,
+        "toggl_skipped_no_email": toggl_result.skipped_no_email,
+        "notion_users_indexed_by_email": len(notion_emails),
+    }

@@ -19,6 +19,7 @@ from gb_automations.config import (
     PROJECTS_FRAME_URL_PROP,
     PROJECTS_GMAIL_URL_PROP,
     PROJECTS_NAS_URL_PROP,
+    PROJECTS_TOGGL_URL_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
     LEVERANSER_FRAME_URL_PROP,
@@ -220,6 +221,44 @@ async def search_pages(page_size: int = 100) -> list[dict[str, Any]]:
 async def search_databases(page_size: int = 100) -> list[dict[str, Any]]:
     """Return every database the integration can see. Use to discover DB IDs."""
     return await _search_all("database", page_size)
+
+
+async def list_workspace_users(page_size: int = 100) -> list[dict[str, Any]]:
+    """Return every workspace user via paginated `GET /v1/users`.
+
+    Used by the Toggl hours engine to map a Toggl user (via their email) to
+    the matching Notion user UUID, which then goes into the `Ansatt` people
+    property on each Timer row.
+
+    Response shape per user (type=person):
+        {"object": "user", "id": "<uuid>", "type": "person",
+         "person": {"email": "name@goldbox.no"}, "name": "Petter", ...}
+    Bot users (type=bot) get returned too — caller filters on `type=="person"`
+    because bots don't have `person.email` and can't own Timer rows.
+
+    `/v1/users` paginates with query params (`start_cursor`, `page_size`),
+    not POST body like `/search` and `/databases/{id}/query`.
+    """
+    results: list[dict[str, Any]] = []
+    start_cursor: str | None = None
+    async with _client() as client:
+        while True:
+            params: dict[str, Any] = {"page_size": page_size}
+            if start_cursor:
+                params["start_cursor"] = start_cursor
+            response = await _with_retries(
+                lambda p=params: client.get("/users", params=p),
+                op_name="GET /users",
+            )
+            _raise_for_status(response)
+            payload = response.json()
+            results.extend(payload.get("results", []))
+            if not payload.get("has_more"):
+                break
+            start_cursor = payload.get("next_cursor")
+            if not start_cursor:
+                break
+    return results
 
 
 def extract_page_title(page: dict[str, Any]) -> str | None:
@@ -768,6 +807,26 @@ async def set_project_frame_url(project_page_id: str, url: str | None) -> None:
                 f"/pages/{project_page_id}", json={"properties": props}
             ),
             op_name=f"PATCH /pages/{project_page_id} frame_url (project)",
+        )
+        _raise_for_status(response)
+
+
+async def set_project_toggl_url(project_page_id: str, url: str | None) -> None:
+    """Write the Toggl URL property on a Projects-DB page. Idempotent.
+
+    Called by sync_toggl_project after the matching Toggl project is created
+    or confirmed live. Same shape and rationale as set_project_frame_url —
+    pass `url=None` to clear (e.g. if the Toggl project was deleted in the
+    Toggl UI and we want the column to reflect "not provisioned" until the
+    next sync repairs it).
+    """
+    props = {PROJECTS_TOGGL_URL_PROP: {"url": url}}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{project_page_id} toggl_url (project)",
         )
         _raise_for_status(response)
 

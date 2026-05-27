@@ -42,6 +42,8 @@ from gb_automations.sync.sync_nas import sync_nas_folder
 from gb_automations.sync.sync_oppgave_done import sync_oppgave_done
 from gb_automations.sync.sync_tasks import sync_task_folder
 from gb_automations.sync.sync_thread import sync_thread
+from gb_automations.sync.sync_toggl_hours import sync_toggl_hours
+from gb_automations.sync.sync_toggl_project import sync_toggl_project
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +305,85 @@ async def _process_frame_project_sync(claimed: _Claimed, progress: str) -> None:
     await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
 
+async def _process_toggl_hours_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a toggl_hours_sync task: nightly aggregation from Toggl Reports
+    v3 → year-partitioned `Timer YYYY` Notion DB.
+
+    Unlike the project-scoped task types, this one isn't tied to a single
+    Notion page — it's a workspace-wide aggregator. So no project dot
+    update, no per-row queue mirror; the engine's summary log line is
+    the observability surface.
+    """
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — running Toggl hours daily aggregator%s",
+        progress,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    try:
+        result = await sync_toggl_hours()
+        if result.action == "failed":
+            outcome_error = result.note or "toggl hours sync failed"
+    except Exception as err:
+        log_api_error(logger, "toggl hours sync crashed", err)
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label="toggl-hours",
+    )
+
+
+async def _process_toggl_project_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a toggl_project_sync task: mirror the Notion Project to a Toggl
+    Track project under the configured workspace. Lights the Projects-DB
+    dot via the same queue_mirror path label_sync uses — a Toggl failure
+    flips the same icon.
+
+    Phase 1 of the Toggl integration. Project mirror only; the daily hours
+    aggregation lands as a separate task type in a later slice.
+    """
+    project_page_id = claimed.project_page_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing Toggl project for %s%s",
+        progress,
+        project_page_id,
+        retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Toggl project"
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError("toggl_project_sync task has no project_page_id")
+        result = await sync_toggl_project(project_page_id)
+        if result.action == "failed":
+            outcome_error = result.note or "toggl project sync failed"
+    except Exception as err:
+        log_api_error(
+            logger, f"toggl project sync crashed for {project_page_id}", err
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(project_page_id),
+    )
+    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+
+
 async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> None:
     """Run a frame_leveranse_sync task: mirror the Notion Leveranse to a
     folder + placeholder file under its project's discipline subfolder in
@@ -548,6 +629,12 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "frame_project_sync":
         await _process_frame_project_sync(claimed, progress)
+        return
+    if claimed.task_type == "toggl_project_sync":
+        await _process_toggl_project_sync(claimed, progress)
+        return
+    if claimed.task_type == "toggl_hours_sync":
+        await _process_toggl_hours_sync(claimed, progress)
         return
     if claimed.task_type == "frame_leveranse_sync":
         await _process_frame_leveranse_sync(claimed, progress)

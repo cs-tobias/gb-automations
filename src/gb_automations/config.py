@@ -231,6 +231,44 @@ class Settings(BaseSettings):
     # slot, not name, so re-naming after the fact is purely cosmetic).
     frame_filename_studio: str = "Goldbox.no"
 
+    # Toggl Track (timesheet integration).
+    # Single workspace-admin API token. The Reports v3 API returns every
+    # workspace member's entries when called by an admin, so one token is
+    # enough — no per-user setup. Get the token from
+    # https://track.toggl.com/profile after signing in as the admin.
+    # toggl_workspace_id is resolved during the bootstrap script (printed
+    # for .env paste). Phase 1 is polling-only; webhooks may be added later.
+    toggl_api_token: str = ""
+    toggl_workspace_id: str = ""
+    # Phase 1 fan-out toggle (mirrors sync_gmail_labels / sync_nas_folders /
+    # sync_frame). OFF by default so the code can land without flipping
+    # behavior on. Flip to true once toggl_api_token + toggl_workspace_id
+    # are populated AND the bootstrap script has run successfully.
+    # When true, the Notion Initialize button also enqueues a
+    # toggl_project_sync alongside the label / nas / frame fan-out.
+    sync_toggl: bool = False
+
+    # Phase 2 — daily hours aggregation. Independent of sync_toggl so the
+    # project mirror can run without the hours sync (e.g. while you're
+    # still populating the Ansatte DB). When true:
+    #   - the APScheduler job `toggl_hours_daily` runs at 02:00 Europe/Oslo
+    #     and enqueues a `toggl_hours_sync` task
+    #   - the worker pulls the last 14 days from Toggl Reports v3, aggregates
+    #     per (user, project, day) in Europe/Oslo time, and upserts rows
+    #     into the year-partitioned `Timer YYYY` Notion DB
+    sync_toggl_hours: bool = False
+    # Parent page under which yearly `Timer YYYY` databases live (same
+    # pattern as emails_parent_page_id). The hours engine auto-creates
+    # `Timer 2026`, `Timer 2027`, etc. on first use.
+    toggl_timer_parent_page_id: str = ""
+    # How many days back to re-pull on every nightly run. Toggl Reports v3
+    # has no reliable updated_since for cross-user queries, so the engine
+    # re-reads the window and overwrites the corresponding Notion rows —
+    # retroactive timesheet edits within this window propagate. 14 days
+    # comfortably covers the "fix last week" / "fix the day before pay" use
+    # cases without thrashing the rate limit.
+    toggl_hours_window_days: int = 14
+
 
 settings = Settings()
 
@@ -365,6 +403,11 @@ PROJECTS_GMAIL_URL_PROP = "Gmail"
 PROJECTS_NAS_URL_PROP = "NAS"
 PROJECTS_FRAME_URL_PROP = "Frame.io"
 LEVERANSER_FRAME_URL_PROP = "Frame.io"
+# Toggl Track project URL — written back to the Projects DB by
+# sync_toggl_project so a single click in Notion opens the matching
+# project's timer dropdown / Reports view in Toggl. Same column-as-
+# indicator pattern as the others.
+PROJECTS_TOGGL_URL_PROP = "Toggl"
 
 
 # Top-level Gmail label namespace for project labels. The full path we create
@@ -498,6 +541,32 @@ STATUS_UTGAAR = "Utgår"
 MANUAL_LEVERANSE_STATUSES = frozenset({STATUS_TRENGER_AVKLARING, STATUS_UTGAAR})
 
 
+# Timer YYYY DB — auto-created per year, year-partitioned the same way
+# Emails YYYY is. One row per (Ansatt, Prosjekt, Dato) tuple per year.
+# That tuple is also the upsert key the engine uses, encoded into the two
+# rich_text id columns at the end (Toggl IDs are the SOURCE-OF-TRUTH
+# identifier — relations/people can be reassigned in Notion, ids can't).
+TIMER_PROPS = {
+    # The title slot. Composed as "{Navn} — {Dato}" so the row is
+    # human-readable in any view. Notion requires a title; we'd rather
+    # have something meaningful than a blank.
+    "name": "Navn",
+    "date": "Dato",                  # date — the local Europe/Oslo calendar day
+    # `people` property pointing at a native Notion user. The engine looks
+    # up the Notion user UUID by matching the Toggl user's email against
+    # Notion's workspace members. Lets each employee filter "Show my
+    # hours" with Notion's built-in `current user` filter on this column.
+    "employee": "Ansatt",
+    "project": "Prosjekt",           # relation → Projects
+    "hours": "Timer",                # number — decimal hours (e.g. 7.5)
+    # Hidden technical columns — used by the engine to upsert / delete
+    # without scanning the people property (which a user could edit). The
+    # two ids together are the dedup key.
+    "toggl_user_id": "Toggl User ID",
+    "toggl_project_id": "Toggl Project ID",
+}
+
+
 # Notion's multi-select API supports exactly these 10 colors. "default" is the
 # greyish unstyled chip we want to avoid — leaving it out makes every tag chip
 # carry a real color.
@@ -596,6 +665,50 @@ def build_emails_db_schema(
         EMAILS_PROPS["thread_id"]: {"rich_text": {}},
         EMAILS_PROPS["message_id"]: {"rich_text": {}},
     }
+
+
+def build_timer_db_schema(
+    *,
+    projects_db_id: str,
+) -> dict[str, dict]:
+    """Build the Notion property schema for a `Timer YYYY` database.
+
+    The year router (`clients/notion_timer_db.py`) calls this when auto-
+    creating a new year's DB. Property NAMES come from TIMER_PROPS (single
+    source of truth — manual renames in Notion still propagate by editing
+    that dict). Property TYPES are hard-coded here because they're part of
+    the contract with the hours engine.
+
+    Required:
+      - `projects_db_id`: `Prosjekt` is a relation; we need the target DB ID.
+
+    Note: `Ansatt` is a `people` property (Notion native users), so no extra
+    db id is needed — Notion infers the workspace member set.
+    """
+    if not projects_db_id:
+        raise ValueError(
+            "projects_db_id is required to build the Timer DB schema "
+            "(Prosjekt is a relation property)"
+        )
+    # Insertion order = column order in Notion. Title first (Notion
+    # requirement), then the human-readable columns left-to-right (Dato,
+    # Ansatt, Prosjekt, Timer), then the two hidden id columns at the end
+    # where they stay out of the way.
+    return {
+        TIMER_PROPS["name"]: {"title": {}},
+        TIMER_PROPS["date"]: {"date": {}},
+        TIMER_PROPS["employee"]: {"people": {}},
+        TIMER_PROPS["project"]: {
+            "relation": {
+                "database_id": projects_db_id,
+                "single_property": {},
+            },
+        },
+        TIMER_PROPS["hours"]: {"number": {"format": "number"}},
+        TIMER_PROPS["toggl_user_id"]: {"rich_text": {}},
+        TIMER_PROPS["toggl_project_id"]: {"rich_text": {}},
+    }
+
 
 # Multi-select tag taxonomy applied to each synced email by the local LLM.
 # Two axes mixed in one flat list (one Notion `Tags` multi-select property):
