@@ -548,6 +548,45 @@ async def list_comments(
         return response.json().get("data", [])
 
 
+async def set_comment_completed(
+    comment_id: str, completed: bool
+) -> dict[str, Any]:
+    """Mark a Frame comment as resolved (completed=True) or reopen it
+    (completed=False). Returns the updated comment object.
+
+    Endpoint shape verified 2026-05-27 against Goldbox's workspace:
+    PATCH /accounts/{aid}/comments/{id} with body
+    `{"data": {"completed": true|false}}` returns 200. On the response,
+    `completed_at` and `completer_id` are populated when True, cleared
+    when False.
+
+    Used by Phase 2.5's Notion → Frame propagation (sync_oppgave_done):
+    when the team toggles the Ferdig checkbox on a Korreksjon Oppgave
+    in Notion, this PATCHes Frame so the comment's UI reflects the same
+    state. Loop-prevention: the caller (`sync_oppgave_done`) reads
+    Frame's current completed_at first and skips if already matching.
+    """
+    token = await frame_auth.get_access_token()
+    body = {"data": {"completed": completed}}
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/accounts/{_account_id()}/comments/{comment_id}",
+                json=body,
+            ),
+            op_name=f"set_comment_completed({completed})",
+        )
+        _raise_for_status(response)
+        comment = _unwrap(response.json())
+        logger.info(
+            "frame comment %s set completed=%s (completer=%s)",
+            comment_id,
+            completed,
+            comment.get("completer_id"),
+        )
+        return comment
+
+
 async def get_comment(
     comment_id: str, *, include: tuple[str, ...] = ("owner", "replies")
 ) -> dict[str, Any]:

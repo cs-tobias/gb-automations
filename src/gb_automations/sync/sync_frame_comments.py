@@ -54,7 +54,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gb_automations.clients import frame as frame_client
 from gb_automations.clients import notion as notion_client
-from gb_automations.config import OPPGAVE_KIND_KORREKSJON, settings
+from gb_automations.config import (
+    OPPGAVE_KIND_KORREKSJON,
+    OPPGAVE_KIND_KORREKSJONSRUNDE,
+    STATUS_KLAR_TIL_OPPSTART,
+    settings,
+)
 from gb_automations.db import SessionLocal
 from gb_automations.models import FrameComment, FrameLeveranseFolder
 
@@ -258,7 +263,7 @@ async def _ensure_korreksjonsrunde_oppgave(
     created = await notion_client.create_oppgave_row(
         name=name,
         leveranse_page_id=leveranse_page_id,
-        kind=OPPGAVE_KIND_KORREKSJON,
+        kind=OPPGAVE_KIND_KORREKSJONSRUNDE,
         round_number=round_number,
     )
     page_id = created.get("id")
@@ -319,12 +324,27 @@ async def _persist_frame_comment(
 
 
 async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
-    """Process one Frame comment id end-to-end: fetch from Frame, resolve
-    Leveranse + round, find-or-create Korreksjonsrunde Oppgave, append
-    the bullet (top-level or nested under its parent block).
+    """Process one Frame comment id end-to-end.
 
-    Idempotent: a re-delivered webhook for the same comment id is a
-    no-op once the FrameComment cache row exists.
+    Two-path engine after Phase 2.5:
+
+      Path A — comment NOT yet in the FrameComment cache (`comment.created`):
+        Fetch the comment from Frame, resolve Leveranse + round, create a
+        per-comment Korreksjon sub-Oppgave under the Korreksjonsrunde N row
+        (creating the round row itself lazily on first comment). On reply
+        events the new Oppgave is a sub-row of its parent comment's Oppgave
+        (3-level deep). Persist FrameComment with the new oppgave_page_id.
+        Flip Leveranse status to `Klar til oppstart`.
+
+      Path B — comment IS already in the cache
+      (`comment.completed` / `comment.uncompleted` for an existing row):
+        Propagate the new `completed_at` state to the linked Oppgave's
+        Ferdig checkbox via the read-first idempotent
+        `notion_client.set_oppgave_done`. Then enqueue a
+        `leveranse_status_recheck` so the rollup runs.
+
+    Idempotent in both paths. Loop-prevention happens at the Notion
+    helper level (read-first / skip-if-same).
     """
     result = FrameCommentResult(comment_id=comment_id)
 
@@ -332,27 +352,8 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
         result.note = "SYNC_FRAME=false"
         return result
 
-    # 1. Engine-level dedup BEFORE any external IO: if we already
-    # processed this comment id, return early. The active-dedup index
-    # on sync_tasks handles concurrent same-id enqueues, but this
-    # handles the "webhook delivered the same id again hours later"
-    # case where the prior queue row is `done` and a fresh row was
-    # allowed in.
-    async with SessionLocal() as session:
-        already = await session.get(FrameComment, comment_id)
-        if already is not None:
-            result.action = "unchanged"
-            result.leveranse_page_id = already.leveranse_page_id
-            result.oppgave_page_id = already.oppgave_page_id
-            result.round_number = already.round_number
-            result.parent_comment_id = already.parent_comment_id
-            result.notion_block_id = already.notion_block_id
-            result.is_reply = already.parent_comment_id is not None
-            result.note = "dedup: frame_comments row already exists"
-            return result
-
-    # 2. Fetch the comment from Frame. 404 → comment was deleted between
-    # webhook fire and our processing — silently mark done.
+    # Fetch comment first — we need the current completed_at to decide
+    # which path to take.
     try:
         comment = await frame_client.get_comment(comment_id)
     except frame_client.FrameAPIError as err:
@@ -374,6 +375,18 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
         result.note = str(err)
         return result
 
+    # Path B — completion-state propagation for a cached comment. The
+    # comment.created path below also writes a FrameComment cache row,
+    # so any 'previously seen' comment id ends up here. Without this
+    # early branch, the engine would short-circuit on completion events
+    # and never propagate the new state.
+    async with SessionLocal() as session:
+        cached = await session.get(FrameComment, comment_id)
+
+    if cached is not None:
+        return await _propagate_completion(comment_id, comment, cached, result)
+
+    # Path A — brand-new comment. Continue with the create flow.
     file_id = comment.get("file_id")
     if not file_id:
         logger.warning(
@@ -384,7 +397,6 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
         result.note = "comment payload missing file_id"
         return result
 
-    # 3. Resolve the Leveranse via the cached placeholder-file-id join.
     async with SessionLocal() as session:
         leveranse_row = await _resolve_leveranse(session, file_id)
     if leveranse_row is None:
@@ -403,7 +415,6 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
     result.leveranse_page_id = leveranse_page_id
     result.project_page_id = project_page_id
 
-    # 4. Round number from the file's version stack.
     try:
         round_number, _stack_id = await frame_client.get_file_version_info(file_id)
     except Exception:
@@ -415,12 +426,7 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
         round_number = 0
     result.round_number = round_number
 
-    # V00 = the placeholder image; it's not a real deliverable, it's just
-    # the file slot we put down so the team's first real upload becomes
-    # V01. Any comment on V00 is noise (curious test clicks, accidental
-    # comments before the first delivery) and should be dropped — we do
-    # NOT want Korreksjonsrunde 0 rows polluting the Oppgaver DB. Round 1
-    # is the first real correction round, on V01.
+    # V00 placeholder noise — see Phase 2 decision.
     if round_number == 0:
         logger.info(
             "frame_comments: comment %s on V00 placeholder (file %s) — "
@@ -432,120 +438,120 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
         result.note = "comment on V00 placeholder (pre-delivery noise)"
         return result
 
-    # 5. Reply detection: walk the parent file's comments and look for
-    # ourselves nested inside someone else's `replies: [...]`.
+    # Reply detection (Phase 2 logic, unchanged): walk the file's
+    # top-level comments looking for our id in any of their `replies`.
     parent_comment_id = await _find_parent_comment_id(file_id, comment_id)
     result.is_reply = parent_comment_id is not None
     result.parent_comment_id = parent_comment_id
 
-    bullet_text = _bullet_text(comment)
+    name = _bullet_text(comment)  # used as the row title; same author + text format
     body_snippet = (comment.get("text") or "")[:512]
 
-    # 6/7. Branch on top-level vs reply.
-    try:
-        if parent_comment_id is None:
-            # Top-level: find-or-create the Korreksjonsrunde row, then
-            # append a fresh bullet on its page body.
-            oppgave_page_id = await _ensure_korreksjonsrunde_oppgave(
-                leveranse_page_id=leveranse_page_id,
-                round_number=round_number,
+    # Find or create the Korreksjonsrunde N row. Round-create is rare —
+    # only the first comment of a new round needs it.
+    runde_oppgave_id = await _ensure_korreksjonsrunde_oppgave(
+        leveranse_page_id=leveranse_page_id,
+        round_number=round_number,
+    )
+    if runde_oppgave_id is None:
+        result.action = "skipped"
+        result.note = "OPPGAVER_DB_ID unset or create failed"
+        return result
+
+    # Determine the parent for the new sub-row:
+    #   - top-level comment → child of the Korreksjonsrunde row.
+    #   - reply             → child of the parent Korreksjon row (3-deep).
+    if parent_comment_id is None:
+        parent_oppgave_id = runde_oppgave_id
+    else:
+        async with SessionLocal() as session:
+            parent_cache = await session.get(FrameComment, parent_comment_id)
+        if parent_cache is None or not parent_cache.oppgave_page_id:
+            # Parent webhook hasn't been processed yet OR parent is a
+            # legacy Phase 2 bullet (oppgave_page_id pointed at the round
+            # row, not a per-comment row). Fall back to parenting under
+            # the round — the reply still lands; nesting is just one level
+            # shallower than ideal.
+            logger.warning(
+                "frame_comments: reply %s — parent %s has no per-comment "
+                "Oppgave; parenting under Korreksjonsrunde %d instead",
+                comment_id,
+                parent_comment_id,
+                round_number,
             )
-            if oppgave_page_id is None:
-                result.action = "skipped"
-                result.note = "OPPGAVER_DB_ID unset or create failed"
-                return result
-            created_blocks = await notion_client.append_blocks_to_page(
-                oppgave_page_id, [notion_client.bullet_block(bullet_text)]
-            )
-            notion_block_id = created_blocks[0]["id"] if created_blocks else None
-            result.oppgave_page_id = oppgave_page_id
-            result.notion_block_id = notion_block_id
-            result.action = "created" if not created_blocks else "appended"
-            if not notion_block_id:
-                # Defensive — Notion always returns the created blocks on a
-                # successful PATCH, but log if shape ever drifts.
-                logger.warning(
-                    "frame_comments: append for comment %s returned no "
-                    "block ids — reply indenting will fall back to "
-                    "page-level bullet",
-                    comment_id,
-                )
+            parent_oppgave_id = runde_oppgave_id
         else:
-            # Reply: look up the parent's notion_block_id and PATCH a
-            # nested-bullet child under it.
-            async with SessionLocal() as session:
-                parent_row = await session.get(FrameComment, parent_comment_id)
-            if parent_row is None or not parent_row.notion_block_id:
-                # The parent webhook hasn't been processed yet (or was
-                # processed before we started persisting block ids). Fall
-                # back to appending at the page level under the round's
-                # Oppgave — the reply still lands in Notion, just not
-                # indented. Operator can clean up by hand if needed.
-                logger.warning(
-                    "frame_comments: reply %s — parent %s has no cached "
-                    "notion_block_id; falling back to page-level append",
-                    comment_id,
-                    parent_comment_id,
-                )
-                oppgave_page_id = await _ensure_korreksjonsrunde_oppgave(
-                    leveranse_page_id=leveranse_page_id,
-                    round_number=round_number,
-                )
-                if oppgave_page_id is None:
-                    result.action = "skipped"
-                    result.note = "OPPGAVER_DB_ID unset or create failed"
-                    return result
-                created_blocks = await notion_client.append_blocks_to_page(
-                    oppgave_page_id,
-                    [notion_client.bullet_block(f"↳ {bullet_text}")],
-                )
-                notion_block_id = (
-                    created_blocks[0]["id"] if created_blocks else None
-                )
-                result.oppgave_page_id = oppgave_page_id
-                result.notion_block_id = notion_block_id
-                result.action = "reply"
-                result.note = "parent block_id missing; flat append"
-            else:
-                # Reply path: PATCH /blocks/{parent_block_id}/children
-                # via the same helper — Notion accepts a block id where
-                # the helper passes a page id.
-                created_blocks = await notion_client.append_blocks_to_page(
-                    parent_row.notion_block_id,
-                    [notion_client.bullet_block(bullet_text)],
-                )
-                notion_block_id = (
-                    created_blocks[0]["id"] if created_blocks else None
-                )
-                result.oppgave_page_id = parent_row.oppgave_page_id
-                result.notion_block_id = notion_block_id
-                result.action = "reply"
+            parent_oppgave_id = parent_cache.oppgave_page_id
+
+    # Create the per-comment Oppgave row.
+    try:
+        created = await notion_client.create_oppgave_row(
+            name=name,
+            leveranse_page_id=leveranse_page_id,
+            kind=OPPGAVE_KIND_KORREKSJON,
+            round_number=round_number,
+            parent_oppgave_id=parent_oppgave_id,
+        )
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "frame_comments: Notion write failed for comment %s — "
-            "queue will retry",
+            "frame_comments: failed to create Korreksjon Oppgave for "
+            "comment %s — queue will retry",
             comment_id,
         )
         result.action = "failed"
-        result.note = f"Notion write: {err}"
+        result.note = f"Notion create: {err}"
         return result
 
-    # 8. Persist the FrameComment row LAST (Decision 3 from the plan).
-    if result.oppgave_page_id is None:
-        # Defensive: shouldn't happen — every success branch sets it.
-        return result
+    oppgave_page_id = created.get("id")
+    result.oppgave_page_id = oppgave_page_id
+    result.action = "reply" if parent_comment_id else "created"
+
+    # If the comment is already resolved in Frame at create time
+    # (e.g. an old comment we're just now syncing), mirror that into
+    # the new Notion checkbox immediately.
+    if comment.get("completed_at") is not None:
+        try:
+            await notion_client.set_oppgave_done(oppgave_page_id, True)
+        except Exception:
+            logger.exception(
+                "frame_comments: initial set_oppgave_done failed for %s "
+                "(non-fatal)",
+                oppgave_page_id,
+            )
+
+    # Persist FrameComment last (Decision 3 from the original plan).
+    # notion_block_id stays null in the sub-row model — replies are
+    # separate rows, no per-bullet block to track.
     async with SessionLocal() as session:
         await _persist_frame_comment(
             session,
             frame_comment_id=comment_id,
             frame_file_id=file_id,
             leveranse_page_id=leveranse_page_id,
-            oppgave_page_id=result.oppgave_page_id,
+            oppgave_page_id=oppgave_page_id,
             round_number=round_number,
             parent_comment_id=parent_comment_id,
-            notion_block_id=result.notion_block_id,
+            notion_block_id=None,
             body_snippet=body_snippet,
         )
+
+    # First comment of a new round → flip Leveranse status to
+    # "Klar til oppstart". Only fires for TOP-LEVEL comments (replies
+    # arrive after the first top-level, so the status flip already
+    # happened). set_leveranse_status is read-first/idempotent: if the
+    # team has already moved past Klar til oppstart (e.g. they ticked
+    # a checkbox before the next webhook delivery), this is a no-op.
+    if parent_comment_id is None:
+        try:
+            await notion_client.set_leveranse_status(
+                leveranse_page_id, STATUS_KLAR_TIL_OPPSTART
+            )
+        except Exception:
+            logger.exception(
+                "frame_comments: set_leveranse_status(Klar til oppstart) "
+                "failed for %s (non-fatal)",
+                leveranse_page_id,
+            )
 
     logger.info(
         "frame_comments: %s comment %s by %r → leveranse %s round %d → oppgave %s",
@@ -554,6 +560,84 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
         _author_display(comment),
         leveranse_page_id,
         round_number,
-        result.oppgave_page_id,
+        oppgave_page_id,
+    )
+    return result
+
+
+async def _propagate_completion(
+    comment_id: str,
+    comment: dict,
+    cached: FrameComment,
+    result: FrameCommentResult,
+) -> FrameCommentResult:
+    """Path B: propagate Frame's completed_at state to the cached
+    comment's Oppgave Ferdig checkbox + enqueue a status recheck.
+
+    Loop-prevention rests on notion_client.set_oppgave_done's
+    read-first/skip-if-same behavior — when the propagation cycle
+    bounces back (Notion writes → automation fires → engine reads
+    Frame again), this branch sees Notion already matches and the
+    helper returns "unchanged" without PATCHing.
+    """
+    # Lazy import to avoid a circular dep — queue.py imports the engine
+    # for testing; we'd loop on module import otherwise.
+    from gb_automations.sync.queue import enqueue_leveranse_status_recheck
+
+    result.leveranse_page_id = cached.leveranse_page_id
+    result.oppgave_page_id = cached.oppgave_page_id
+    result.round_number = cached.round_number
+    result.parent_comment_id = cached.parent_comment_id
+    result.is_reply = cached.parent_comment_id is not None
+
+    if not cached.oppgave_page_id:
+        # Legacy Phase 2 cache rows pointed oppgave_page_id at the
+        # round Oppgave, not a per-comment row. There's no individual
+        # checkbox to flip for those — they're bullet-list artifacts.
+        # No-op: the row's still here, status rollup just can't include
+        # it. The team will see the Frame UI mark it resolved; the
+        # Notion bullets stay as-is.
+        result.action = "unchanged"
+        result.note = "legacy bullet row — no per-comment checkbox to mirror"
+        return result
+
+    desired_done = comment.get("completed_at") is not None
+    try:
+        action = await notion_client.set_oppgave_done(
+            cached.oppgave_page_id, desired_done
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.exception(
+            "frame_comments: set_oppgave_done failed for %s — queue will retry",
+            cached.oppgave_page_id,
+        )
+        result.action = "failed"
+        result.note = f"Notion set_oppgave_done: {err}"
+        return result
+
+    result.action = "unchanged" if action == "unchanged" else "completed"
+    result.note = (
+        f"completion propagated: Frame={desired_done} Notion action={action}"
+    )
+
+    # Enqueue rollup recheck — even if set_oppgave_done was a no-op the
+    # Leveranse's status may still need to move (e.g. a stale recheck
+    # task missed an earlier toggle). The dedup index collapses rapid
+    # bursts to one task.
+    try:
+        await enqueue_leveranse_status_recheck(cached.leveranse_page_id)
+    except Exception:
+        logger.exception(
+            "frame_comments: enqueue_leveranse_status_recheck failed for %s "
+            "(non-fatal)",
+            cached.leveranse_page_id,
+        )
+
+    logger.info(
+        "frame_comments: propagated completed=%s for comment %s → oppgave %s (notion=%s)",
+        desired_done,
+        comment_id,
+        cached.oppgave_page_id,
+        action,
     )
     return result

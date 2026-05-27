@@ -51,8 +51,10 @@ from gb_automations.sync.queue import (
     enqueue_frame_comment_sync,
     enqueue_frame_leveranse_sync,
     enqueue_frame_project_sync,
+    enqueue_frame_version_sync,
     enqueue_label_sync,
     enqueue_nas_folder_sync,
+    enqueue_oppgave_done_sync,
     enqueue_task_folder_sync,
     enqueue_threads,
 )
@@ -489,6 +491,83 @@ async def notion_sync_frame(request: Request) -> Response:
     """
     with request_scope("sync-frame"):
         return await _sync_frame_impl(request)
+
+
+@router.post("/notion/oppgave-done")
+async def notion_oppgave_done(request: Request) -> Response:
+    """Notion automation receiver: the team toggled `Ferdig` on an Oppgaver row.
+
+    Auth: `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` — same secret the
+    other Notion buttons use. Notion's automation UI supports custom request
+    headers, so we reuse the bearer pattern rather than an HMAC scheme.
+
+    Payload shape (verified probe 2026-05-27):
+        {"source": {...}, "data": {"object": "page", "id": "<uuid>",
+            "parent": {"database_id": "<oppgaver db id>"}, ...,
+            "properties": {}}}  ← properties is EMPTY; the engine GETs the
+                                  row at process time to read the checkbox.
+
+    Two Notion automations should be set up — one for "Ferdig is checked",
+    one for "Ferdig is unchecked" — both POSTing here with the same secret.
+    Direction-agnostic: the engine reads the row's current state regardless
+    of which automation fired.
+    """
+    with request_scope("oppgave-done"):
+        return await _notion_oppgave_done_impl(request)
+
+
+async def _notion_oppgave_done_impl(request: Request) -> Response:
+    if not _verify_bearer(request.headers.get("Authorization")):
+        logger.warning(
+            "Notion oppgave-done auth failed (NOTION_WEBHOOK_SECRET set: %s)",
+            bool(settings.notion_webhook_secret),
+        )
+        raise HTTPException(401, "Bad or missing bearer token")
+
+    raw_body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body") from None
+
+    # Notion automation payload puts the page object under `data` (not
+    # `data.id` like buttons — same outer shape, different content).
+    data = payload.get("data") or {}
+    page_id = data.get("id")
+    parent = (data.get("parent") or {}).get("database_id") or ""
+    target_db = (settings.oppgaver_db_id or "").replace("-", "").lower()
+    payload_db = parent.replace("-", "").lower()
+
+    if not page_id:
+        logger.warning("oppgave-done: no page id in payload")
+        return _json({"action": "skipped", "reason": "no page id"})
+
+    # Defense: confirm the row really is in the Oppgaver DB (the
+    # automation should only target that DB, but a misconfigured
+    # automation pointing at Korreksjoner or another DB would silently
+    # send junk events here otherwise).
+    if target_db and payload_db != target_db:
+        logger.info(
+            "oppgave-done: page %s parent DB %s does not match OPPGAVER_DB_ID — skipping",
+            page_id,
+            parent,
+        )
+        return _json({"action": "skipped", "reason": "wrong parent DB"})
+
+    inserted = await enqueue_oppgave_done_sync(page_id)
+    queue_worker.wake()
+    logger.info(
+        "📥 enqueued oppgave_done_sync for %s (inserted=%d)",
+        page_id,
+        inserted,
+    )
+    return _json(
+        {
+            "action": "enqueued",
+            "oppgave_page_id": page_id,
+            "enqueued": inserted,
+        }
+    )
 
 
 async def _notion_webhook_impl(request: Request) -> Response:
@@ -1068,11 +1147,50 @@ async def frame_webhook(request: Request) -> Response:
             resource_id,
         )
 
-        # Only `comment.*` events are interesting for Phase 2. Any other
-        # event (project.created, file.uploaded, …) acks 200 and returns
-        # — registering for them is fine if it ever lands a webhook on a
-        # different event by mistake; we'd rather not retry-storm.
+        # Phase 2.5 — file.versioned fires when the team drags a new
+        # version on top of an existing file. Resource id is the
+        # version_stack id (NOT a file id, unlike file.created /
+        # file.upload.completed / file.ready). Enqueue and let the
+        # engine resolve the stack → Leveranse → flip status to Ferdig.
+        if event_type == "file.versioned":
+            if not resource_id:
+                logger.warning(
+                    "frame: file.versioned has no resource.id — ignoring"
+                )
+                return Response(
+                    content=json.dumps({"received": True, "ignored": "no resource.id"}),
+                    media_type="application/json",
+                )
+            inserted = await enqueue_frame_version_sync(resource_id)
+            queue_worker.wake()
+            logger.info(
+                "📨 enqueued frame_version_sync for stack %s (inserted=%d)",
+                resource_id,
+                inserted,
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "received": True,
+                        "event": event_type,
+                        "stack_id": resource_id,
+                        "enqueued": inserted,
+                    }
+                ),
+                media_type="application/json",
+            )
+
+        # Other file.* events (file.created, file.upload.completed,
+        # file.ready) fire on EVERY upload including the placeholder
+        # that sync_frame_leveranse creates at Initialize. They'd be
+        # noisy and require the engine to filter "is this a real
+        # version upload" defensively. file.versioned is the precise
+        # signal — we ignore the others.
         if not event_type.startswith("comment."):
+            logger.info(
+                "frame webhook: ignoring %s (only file.versioned + comment.* are acted on)",
+                event_type,
+            )
             return Response(
                 content=json.dumps({"received": True, "ignored": event_type}),
                 media_type="application/json",

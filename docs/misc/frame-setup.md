@@ -74,3 +74,102 @@ The cache row stores BOTH the Frame Project id (`frame_project_id`) and its root
 ## Re-running the bootstrap
 
 Re-run only if the refresh token is invalidated (Adobe password change, credential rotation) or you need to change account/workspace. The script clears stale state in `/tmp` before starting; pasted values overwrite the previous ones in `.env`.
+
+---
+
+## Phase 2.5 — Frame ↔ Notion comment + status loop
+
+What this adds on top of Phase 1:
+
+- **Frame comments → Notion sub-rows.** Each comment on a delivered version (V01+) lands as a `Korreksjon` Oppgave under its `Korreksjonsrunde N` parent. Replies become 3-level grandchildren. Each row has a `Ferdig` checkbox.
+- **Bidirectional `Ferdig` ↔ `completed_at` sync.** Ticking the Notion checkbox PATCHes the Frame comment's completed state; resolving the comment in Frame ticks the Notion checkbox. Loop-prevented via read-first/skip-if-same.
+- **Auto-managed `Status` select on the Leveranser DB.** Transitions:
+  - V01+ uploaded in Frame → **Ferdig**.
+  - First client comment on the new version → **Klar til oppstart**.
+  - Any Korreksjon checkbox ticked → **Under arbeid**.
+  - All Korreksjon checkboxes done → **Oppgaver ferdig**.
+  - Next version uploaded → loops back to Ferdig.
+- **Manual override.** Setting Status to `Trenger avklaring` or `Utgår` suppresses all auto-writes for that Leveranse until the team manually moves it out.
+
+### Operator setup (Phase 2.5)
+
+1. **Add a `Status` select property to the Leveranser DB** with these options (in order, Norwegian labels):
+   - `Klar til oppstart`
+   - `Trenger avklaring`
+   - `Under arbeid`
+   - `Oppgaver ferdig`
+   - `Ferdig`
+   - `Utgår`
+
+2. **Add a `Ferdig` checkbox property to the Oppgaver DB.**
+
+3. **Enable sub-items on the Oppgaver DB.** Newer Notion auto-creates the `Parent item` relation; in `OPPGAVER_PROPS["parent"]` (`config.py`) the default value is `"Parent item"` — rename if your workspace uses a different label.
+
+4. **Set up two Notion automations on the Oppgaver DB** (the lightning-bolt menu → New automation):
+   - **Automation 1**: When `Ferdig` is checked → Send webhook → `https://hub.<your-domain>/webhooks/notion/oppgave-done`. Add a custom header `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` (the same secret your other Notion buttons use).
+   - **Automation 2**: When `Ferdig` is unchecked → same URL, same header.
+
+   Two automations are required because Notion's checkbox triggers are direction-specific. The receiver doesn't care which one fired — it reads the row's current state at process time.
+
+5. **Re-register the Frame webhook** to subscribe to the `file.versioned` event (in addition to the comment events from Phase 2):
+   ```
+   docker compose exec api python -m gb_automations.scripts.frame_register_webhook
+   ```
+   The script detects the existing webhook's event list, sees `file.versioned` is missing, deletes + recreates with the wider set. It prints a fresh `FRAME_WEBHOOK_SECRET=...` — paste into `.env`.
+
+6. **Restart the api**:
+   ```
+   docker compose up -d --force-recreate api
+   ```
+
+7. **Verify**:
+   ```
+   curl https://hub.<your-domain>/debug/frame/webhooks
+   ```
+   Should show the webhook subscribed to: `comment.created`, `comment.updated`, `comment.completed`, `comment.uncompleted`, `comment.deleted`, `file.versioned`.
+
+### End-to-end test
+
+1. **First delivery → Ferdig.** Drag a real image as V01 onto a Leveranse's V00 placeholder in Frame's UI. Within a few seconds: the Leveranse's `Status` flips to **Ferdig**. Logs: `[frame:...] file.versioned ... enqueued frame_version_sync`.
+
+2. **Client comment → Klar til oppstart.** Post a comment on V01 in Frame. A `Korreksjonsrunde 1` Oppgave appears in Notion, with a child `Korreksjon` row holding the comment text and a `Ferdig □` checkbox. The Leveranse's `Status` flips to **Klar til oppstart**.
+
+3. **Resolve comment in Frame → Under arbeid.** Click ✓ on the comment in Frame's UI. The Notion `Korreksjon` row's `Ferdig` checkbox auto-checks. Status → **Under arbeid**.
+
+4. **Tick checkbox in Notion → Frame updates.** On another open Korreksjon row, check `Ferdig` in Notion. Within seconds, the linked Frame comment's `completed_at` populates (visible by reopening the comment in Frame's UI — it shows ✓ resolved).
+
+5. **All done → Oppgaver ferdig.** Resolve the last open comment in either tool. Status → **Oppgaver ferdig**. The Korreksjonsrunde row's own `Ferdig` checkbox auto-ticks.
+
+6. **Re-upload V02 → Ferdig.** Drag a new image as V02. Status → **Ferdig**. The old Korreksjonsrunde 1 stays in Notion as history.
+
+7. **Manual override.** Manually flip Status to `Trenger avklaring`. Post another comment in Frame. Korreksjonsrunde 2 + the Korreksjon child get created, but Status stays at `Trenger avklaring` — auto-writes are suppressed.
+
+### Loop-prevention model
+
+The bidirectional sync between Frame's `completed_at` and Notion's `Ferdig` could loop forever:
+
+- Notion checkbox → engine PATCHes Frame → Frame webhook fires → engine writes Notion → Notion automation fires → …
+
+It doesn't, because both `notion_client.set_oppgave_done` and `notion_client.set_leveranse_status` are **read-first / skip-if-same**:
+
+- When we write to Notion to mirror Frame's state, the Notion automation fires back.
+- The receiver enqueues `oppgave_done_sync`.
+- The engine reads the Frame side and sees the comment is ALREADY in the same state we'd write — no PATCH back.
+
+One round-trip per click, no ping-pong.
+
+### What status transitions can fire
+
+| Trigger | Engine | Target status |
+|---|---|---|
+| `file.versioned` webhook | `sync_frame_version` | `Ferdig` |
+| First top-level `comment.created` of round N | `sync_frame_comments` | `Klar til oppstart` |
+| Any Korreksjon `Ferdig` toggled (either side) | `sync_leveranse_status` (rollup) | `Under arbeid` or `Oppgaver ferdig` |
+
+The rollup engine runs after every Korreksjon state change. It reads the active Korreksjonsrunde's children count and decides the target. Pure read-then-decide logic.
+
+### Things to know
+
+- **V00 comments are dropped.** The placeholder image isn't a real deliverable; comments on it are pre-delivery noise and get logged + skipped.
+- **Legacy Phase 2 bullets stay as historical artifacts.** Existing Korreksjonsrunde rows from Phase 2 testing have bullet-list page bodies (not sub-row children). They aren't migrated. New comments use the sub-row model.
+- **Comments on Frame files we don't track are skipped.** The engine only acts on files whose id is cached as a `FrameLeveranseFolder.frame_placeholder_file_id` (or whose version stack contains such a file).

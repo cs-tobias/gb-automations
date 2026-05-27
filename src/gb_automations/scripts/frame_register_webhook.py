@@ -40,6 +40,14 @@ _WEBHOOK_EVENTS = [
     "comment.completed",
     "comment.uncompleted",
     "comment.deleted",
+    # Phase 2.5: file.versioned fires when the team drags a new version
+    # on top of an existing file (resource = version_stack_id). Verified
+    # in the probe to be the cleanest signal — other file.* events
+    # (file.created / file.upload.completed / file.ready) fire on every
+    # upload INCLUDING our own placeholder uploads at Initialize time,
+    # so they'd require defensive filtering. file.versioned only fires
+    # for genuine version stacks, which is exactly what we care about.
+    "file.versioned",
 ]
 
 
@@ -94,19 +102,41 @@ async def main() -> None:
     if matching:
         hook = matching[0]
         print(f"Existing webhook found (id={hook.get('id')}).")
-        if settings.frame_webhook_secret:
+
+        # Compare the existing event list to what we want. Frame's API
+        # returns events as a list (order not guaranteed) — compare as
+        # sets so a reorder doesn't trigger a needless rebuild.
+        current_events = set(hook.get("events") or [])
+        desired_events = set(_WEBHOOK_EVENTS)
+        events_match = current_events == desired_events
+
+        if events_match and settings.frame_webhook_secret:
             print(
-                "FRAME_WEBHOOK_SECRET is already set — leaving the existing "
-                "webhook in place.\n"
+                "FRAME_WEBHOOK_SECRET is already set AND the existing event "
+                "list matches the desired one — leaving the webhook in place.\n"
                 "If you need a fresh secret, unset FRAME_WEBHOOK_SECRET in "
                 ".env and re-run."
             )
             return
-        print(
-            "FRAME_WEBHOOK_SECRET is unset, so we can't reuse this hook "
-            "(Frame only returns the secret at create time).\n"
-            "Deleting and recreating to capture a fresh secret…"
-        )
+
+        if not events_match:
+            missing = desired_events - current_events
+            extra = current_events - desired_events
+            print(
+                f"  Event list has drifted:\n"
+                f"    missing from existing webhook: {sorted(missing) or '(none)'}\n"
+                f"    extra on existing webhook:    {sorted(extra) or '(none)'}"
+            )
+            print(
+                "  Deleting + recreating to subscribe to the desired set."
+            )
+        else:
+            # events match but no secret in env
+            print(
+                "FRAME_WEBHOOK_SECRET is unset, so we can't reuse this hook "
+                "(Frame only returns the secret at create time).\n"
+                "Deleting and recreating to capture a fresh secret…"
+            )
         try:
             await frame.delete_webhook(hook["id"])
         except frame.FrameAPIError as err:

@@ -79,7 +79,10 @@
       "WebFetch(domain:developer.frame.io)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('migrations/versions/k6h7i8j9e0f1_phase2_frame_comments.py'\\).read\\(\\)\\); print\\('migration: ok'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/models.py'\\).read\\(\\)\\); print\\('models: ok'\\)\")",
-      "Bash(curl.exe -s -o /dev/null -w \"%{http_code}\\\\n\" -X POST \"https://hub.tobiaseek.com/webhooks/frame\" -H \"Content-Type: application/json\" -d '{\"type\":\"comment.created\",\"resource\":{\"id\":\"deadbeef\",\"type\":\"comment\"}}')"
+      "Bash(curl.exe -s -o /dev/null -w \"%{http_code}\\\\n\" -X POST \"https://hub.tobiaseek.com/webhooks/frame\" -H \"Content-Type: application/json\" -d '{\"type\":\"comment.created\",\"resource\":{\"id\":\"deadbeef\",\"type\":\"comment\"}}')",
+      "Bash(curl.exe -s \"https://hub.tobiaseek.com/debug/frame/webhooks\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/sync/sync_oppgave_done.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/sync/sync_leveranse_status.py'\\).read\\(\\)\\); print\\('ok'\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\tobia\\Documents\\Code\\gb-automations"

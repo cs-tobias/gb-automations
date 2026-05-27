@@ -296,6 +296,110 @@ async def enqueue_frame_comment_sync(comment_id: str) -> int:
         return result.rowcount or 0
 
 
+# ============================================================
+# Phase 2.5 — status loop enqueues
+# ============================================================
+
+_ACTIVE_FRAME_VERSION_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_version_sync'"
+)
+_ACTIVE_OPPGAVE_DONE_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'oppgave_done_sync'"
+)
+_ACTIVE_LEVERANSE_STATUS_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'leveranse_status_recheck'"
+)
+
+
+async def enqueue_frame_version_sync(stack_id: str) -> int:
+    """Enqueue processing of a Frame version_stack id after `file.versioned`.
+
+    gmail_thread_id carries the Frame version_stack UUID (the webhook
+    event's resource.id when type is file.versioned). Dedup collapses
+    rapid-fire deliveries (Frame may fire file.created /
+    file.upload.completed / file.ready / file.versioned all close
+    together — only file.versioned is acted on; the rest are dropped
+    in the receiver).
+    """
+    if not stack_id:
+        return 0
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="frame_version_sync",
+            user_email="*",
+            gmail_thread_id=stack_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_FRAME_VERSION_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_oppgave_done_sync(oppgave_page_id: str) -> int:
+    """Enqueue propagation of a Notion Korreksjon row's Ferdig checkbox
+    to its linked Frame comment.
+
+    gmail_thread_id carries the Notion Oppgave page id. Dedup collapses
+    bursts of toggles on the same row (e.g. the team double-clicking) to
+    one task — the engine reads the row's current state at process time,
+    so collapsing same-id is safe.
+    """
+    if not oppgave_page_id:
+        return 0
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="oppgave_done_sync",
+            user_email="*",
+            gmail_thread_id=oppgave_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_OPPGAVE_DONE_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_leveranse_status_recheck(leveranse_page_id: str) -> int:
+    """Enqueue a rollup recheck for a Leveranse.
+
+    Fired after both propagation engines (sync_frame_comments and
+    sync_oppgave_done) write a Korreksjon done-state change. The cascade
+    of N children flipping all enqueue the same parent's recheck task;
+    the active-dedup index collapses them to one rollup pass.
+
+    gmail_thread_id carries the Leveranse page id.
+    """
+    if not leveranse_page_id:
+        return 0
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="leveranse_status_recheck",
+            user_email="*",
+            gmail_thread_id=leveranse_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_LEVERANSE_STATUS_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
 async def claim_one(session: AsyncSession) -> SyncTask | None:
     """Claim the oldest eligible pending task, marking it in_progress.
 
@@ -555,6 +659,9 @@ __all__ = [
     "enqueue_frame_project_sync",
     "enqueue_frame_leveranse_sync",
     "enqueue_frame_comment_sync",
+    "enqueue_frame_version_sync",
+    "enqueue_oppgave_done_sync",
+    "enqueue_leveranse_status_recheck",
     "claim_one",
     "mark_done",
     "mark_failed",

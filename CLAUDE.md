@@ -13,18 +13,24 @@ What works end-to-end:
 - Email labeled with a project label in Gmail → Pub/Sub push → the webhook **enqueues a durable `sync_tasks` row** (it does NOT sync inline) → a background **queue worker** processes it: cleaned body, extracted history (split into per-message rows), participants upserted to `Contacts`/`Companies`, attachments uploaded to Drive and linked, multi-select tags by a local Ollama LLM (taxonomy in [config.py](src/gb_automations/config.py) `EMAIL_TAGS`), written to a year-partitioned `Emails` DB.
 - **The queue is the guarantee:** a labeled thread will reach Notion — crash-safe, retry-with-backoff, terminal failures parked as `failed` (visible at `/debug/queue`, never silently lost). Per-project status shows as an icon on the Projects DB; stale Notion ids self-heal. See [docs/misc/gotchas.md](docs/misc/gotchas.md) entry 16.
 
-## Frame.io — Phase 1 shipped (May 2026); Phase 2 next
+## Frame.io — Phases 1, 2, and 2.5 all shipped (May 2026)
 
-**Phase 1 done**: Notion → Frame mirror. The "Initialize" button enqueues `frame_project_sync` / `frame_task_sync` (when `SYNC_FRAME=true`). Each Notion project becomes its own **top-level Frame Project** under `FRAME_WORKSPACE_ID` (visible in Frame V4's Active Projects view); per-task folder + placeholder file land under the Project's discipline subfolders. Frame URLs are written back to the Projects/Oppgaver rows. Renames mirror in place (project_id + root_folder_id stable). Self-heals when a Project is deleted in Frame; adopts a pre-existing same-name Project instead of duplicating. Setup: [docs/misc/frame-setup.md](docs/misc/frame-setup.md). Engine: [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py).
+**Phase 1**: Notion → Frame mirror. The "Initialize" button enqueues `frame_project_sync` / `frame_leveranse_sync` (when `SYNC_FRAME=true`). Each Notion project becomes its own **top-level Frame Project** under `FRAME_WORKSPACE_ID`; per-Leveranse folder + V00 placeholder land under the Project's discipline subfolders. Frame URLs are written back to the Leveranser rows. Renames mirror in place; self-heals on Frame deletions; adopts pre-existing same-name entities. Engine: [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py).
 
-**Phase 2 (next)** — comments + Corrections DB:
+**Phase 2**: Frame comments → Notion. Each top-level Frame comment becomes a `Korreksjon` Oppgave sub-row under `Korreksjonsrunde N` (where N is derived from the file's version-stack index). Replies become 3-level grandchildren. Engine: [sync/sync_frame_comments.py](src/gb_automations/sync/sync_frame_comments.py). Cache: `FrameComment` table, keyed on the Frame comment UUID, persists `oppgave_page_id` for two-way lookups.
 
-- Frame.io webhooks → sync comments into a new Notion `Corrections` database, linked to project + task (joined back via `FrameTaskFolder.frame_placeholder_file_id`, which Phase 1 persists for exactly this).
-- Auto-create "korreksjon runde N" sub-tasks under the parent task on a new correction round.
-- Eventually: AI drafts replies using mail/brief context, project manager approves before sending.
-- Project marked finished in Notion → set inactive in Frame.io (one PATCH on the Frame Project entity — now trivial since each Notion project IS a Frame Project).
+**Phase 2.5**: Status loop + 2-way `Ferdig` ↔ `completed` sync.
 
-After Frame Phase 2: Toggl (daily aggregated hours → Notion), Fiken (accounting), meeting transcripts, then MCP server + RAG.
+- New Frame webhook event `file.versioned` (resource = `version_stack_id`) → engine [sync/sync_frame_version.py](src/gb_automations/sync/sync_frame_version.py) flips Leveranse `Status` to **Ferdig**.
+- New Notion automation on Oppgaver DB (`Ferdig` checked/unchecked) → `POST /webhooks/notion/oppgave-done` (bearer auth, reuses `NOTION_WEBHOOK_SECRET`) → engine [sync/sync_oppgave_done.py](src/gb_automations/sync/sync_oppgave_done.py) PATCHes the linked Frame comment's `completed` field.
+- Frame's existing `comment.completed` / `comment.uncompleted` webhooks → existing comment engine propagates to Notion's `Ferdig` checkbox.
+- Either direction triggers a rollup recheck via [sync/sync_leveranse_status.py](src/gb_automations/sync/sync_leveranse_status.py) which sets `Under arbeid` (some done) or `Oppgaver ferdig` (all done).
+- **Loop-prevention** via read-first / skip-if-same in `notion_client.set_leveranse_status` and `notion_client.set_oppgave_done` — one round-trip per click, no ping-pong.
+- **Manual override**: setting Status to `Trenger avklaring` or `Utgår` suppresses all auto-writes for that Leveranse.
+
+Setup: [docs/misc/frame-setup.md](docs/misc/frame-setup.md) (Phase 2.5 section).
+
+Next up after Frame: Toggl (daily aggregated hours → Notion), Fiken (accounting), meeting transcripts, then MCP server + RAG. Also follow-on Frame work: AI-drafted reply suggestions, `Project marked finished in Notion → set inactive in Frame`.
 
 ## Architecture in one diagram
 
@@ -190,9 +196,12 @@ curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20ti
 | "What does a synced row look like in Notion?" | `EMAILS_PROPS` in [config.py](src/gb_automations/config.py) — property names, types, and order |
 | "What tags can the LLM apply?" | `EMAIL_TAGS` in [config.py](src/gb_automations/config.py); prompt body in [prompts/](prompts/) |
 | "How are re-carried attachments kept off every reply row?" | `ThreadAttachmentTracker` (`attached_this_pass`) in [sync/sync_thread.py](src/gb_automations/sync/sync_thread.py); gotchas.md attachment notes |
-| "How does a Frame.io folder get created?" | `SYNC_FRAME=true` flag in [config.py](src/gb_automations/config.py); same Notion button enqueues `frame_project_sync` / `frame_task_sync` in [routes/webhooks.py](src/gb_automations/routes/webhooks.py) → worker runs [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py) `sync_frame_project` / `sync_frame_task` |
-| "How are Frame URLs written back to Notion?" | `set_project_frame_url` / `set_task_frame_url` in [clients/notion.py](src/gb_automations/clients/notion.py); `PROJECTS_FRAME_URL_PROP` / `TASKS_FRAME_URL_PROP` in [config.py](src/gb_automations/config.py) |
-| "Frame.io setup / bootstrap?" | [docs/misc/frame-setup.md](docs/misc/frame-setup.md); script in [scripts/frame_oauth_bootstrap.py](src/gb_automations/scripts/frame_oauth_bootstrap.py); smoke tests at `GET /debug/frame` + `GET /debug/frame/workspace` |
+| "How does a Frame.io folder get created?" | `SYNC_FRAME=true` flag in [config.py](src/gb_automations/config.py); same Notion button enqueues `frame_project_sync` / `frame_leveranse_sync` in [routes/webhooks.py](src/gb_automations/routes/webhooks.py) → worker runs [sync/sync_frame.py](src/gb_automations/sync/sync_frame.py) `sync_frame_project` / `sync_frame_leveranse` |
+| "How are Frame URLs written back to Notion?" | `set_project_frame_url` / `set_task_frame_url` in [clients/notion.py](src/gb_automations/clients/notion.py); `PROJECTS_FRAME_URL_PROP` / `LEVERANSER_FRAME_URL_PROP` in [config.py](src/gb_automations/config.py) |
+| "How do Frame comments become Notion sub-rows?" | `POST /webhooks/frame` (`comment.created`) enqueues `frame_comment_sync` → worker runs [sync/sync_frame_comments.py](src/gb_automations/sync/sync_frame_comments.py) `sync_frame_comment` → creates a `Korreksjon` Oppgave under its `Korreksjonsrunde N` parent (or under the parent comment's row for replies). Cache: `FrameComment` table |
+| "Where does the Leveranse Status come from?" | Auto-managed by 3 engines: [sync/sync_frame_version.py](src/gb_automations/sync/sync_frame_version.py) (Ferdig), [sync/sync_frame_comments.py](src/gb_automations/sync/sync_frame_comments.py) (Klar til oppstart on first comment), [sync/sync_leveranse_status.py](src/gb_automations/sync/sync_leveranse_status.py) (Under arbeid / Oppgaver ferdig rollup). All gated by `notion_client.set_leveranse_status` which respects `MANUAL_LEVERANSE_STATUSES` |
+| "How does Ferdig sync 2-way between Notion and Frame?" | Notion → Frame: `POST /webhooks/notion/oppgave-done` (bearer auth) enqueues `oppgave_done_sync` → [sync/sync_oppgave_done.py](src/gb_automations/sync/sync_oppgave_done.py) PATCHes Frame via `frame.set_comment_completed`. Frame → Notion: `comment.completed` webhook is handled by the existing comment engine which propagates to `set_oppgave_done`. Loop-prevention via read-first/skip-if-same on both helpers |
+| "Frame.io setup / bootstrap?" | [docs/misc/frame-setup.md](docs/misc/frame-setup.md); scripts in [scripts/frame_oauth_bootstrap.py](src/gb_automations/scripts/frame_oauth_bootstrap.py) (one-time OAuth) and [scripts/frame_register_webhook.py](src/gb_automations/scripts/frame_register_webhook.py) (re-runnable webhook registration); smoke tests at `GET /debug/frame` + `GET /debug/frame/workspace` + `GET /debug/frame/webhooks` |
 | "Why isn't my new integration working?" | [docs/misc/gotchas.md](docs/misc/gotchas.md) first, then the relevant client wrapper in `clients/` |
 | "What's the full deployment story for a fresh workspace?" | [docs/guide.md](docs/guide.md) → [google-setup.md](docs/misc/google-setup.md) + [scripts/gcp-bootstrap.sh](scripts/gcp-bootstrap.sh) + [notion-setup.md](docs/misc/notion-setup.md) + [cloudflare-setup.md](docs/misc/cloudflare-setup.md) |
 | "What does the client actually want long-term?" | [docs/reference/client-brief.md](docs/reference/client-brief.md) |

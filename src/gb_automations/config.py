@@ -429,6 +429,9 @@ LEVERANSER_PROPS = {
     "name": "Navn",          # title
     "project": "Prosjekt",   # relation → Projects DB
     "discipline": "Type",    # single_select: Interiør / Eksteriør / Animasjon
+    # Phase 2.5: at-a-glance state per Leveranse. Driven by Frame events
+    # + Notion checkbox toggles (see STATUS_* constants below).
+    "status": "Status",
 }
 
 
@@ -442,13 +445,57 @@ OPPGAVER_PROPS = {
     "leveranse": "Leveranse",  # relation → Leveranser DB (single page)
     "kind": "Type",            # single_select: see OPPGAVE_KIND_* constants
     "round": "Runde",          # number — round N; null/empty for Oppstart
+    # Phase 2.5: checkbox on Korreksjon rows. Bidirectionally syncs with
+    # the Frame comment's `completed` state. Two-way: a Notion-side
+    # toggle PATCHes Frame; a Frame-side ✓ writes here. The
+    # Korreksjonsrunde parent's Ferdig auto-ticks when all its children
+    # are done.
+    "done": "Ferdig",
+    # Phase 2.5: self-referential relation on Oppgaver — the "sub-items"
+    # parent pointer. Notion auto-creates this when sub-items are
+    # enabled; the default name is "Parent item" (workspace-dependent).
+    # Korreksjon rows point at their Korreksjonsrunde; reply Korreksjon
+    # rows point at their parent comment's Korreksjon. The engine writes
+    # to this relation when creating sub-rows.
+    "parent": "Parent item",
 }
 
-# Allowed `Type` values on Oppgaver. The Frame comments engine creates rows
-# with kind=Korreksjonsrunde and writes the round number; the Leveranse
-# Initialize button creates kind=Oppstart with no round number.
+# Allowed `Type` values on Oppgaver. Three kinds:
+#   - Oppstart: auto-created on Leveranse Initialize. Pre-delivery work. Round=null.
+#   - Korreksjonsrunde: auto-created on the first Frame comment of round N
+#     (round=N). Parent of N Korreksjon rows (one per comment).
+#   - Korreksjon: NEW in Phase 2.5. One Notion row per Frame comment;
+#     sub-row of its Korreksjonsrunde, carries the Ferdig checkbox that
+#     bidirectionally syncs with Frame's comment-resolved state. Replies
+#     are also Korreksjon rows but parented to the comment they reply to
+#     (3-level nesting). Round inherited from the parent Korreksjonsrunde.
 OPPGAVE_KIND_OPPSTART = "Oppstart"
-OPPGAVE_KIND_KORREKSJON = "Korreksjonsrunde"
+OPPGAVE_KIND_KORREKSJONSRUNDE = "Korreksjonsrunde"
+OPPGAVE_KIND_KORREKSJON = "Korreksjon"
+
+
+# Phase 2.5 — Status options on the Leveranser DB's `Status` select.
+# Names match exactly what's configured in Notion's select-option list.
+# State machine:
+#   Ferdig (V01+ uploaded)
+#     → Klar til oppstart (client comments arrived → Korreksjonsrunde N created)
+#     → Under arbeid (team ticked at least one Korreksjon checkbox)
+#     → Oppgaver ferdig (all this round's Korreksjon checkboxes done)
+#     → Ferdig (team uploaded V0(N+1) — file.versioned event)
+# Manual-only (automation respects, never overwrites):
+#   Trenger avklaring, Utgår.
+STATUS_FERDIG = "Ferdig"
+STATUS_KLAR_TIL_OPPSTART = "Klar til oppstart"
+STATUS_UNDER_ARBEID = "Under arbeid"
+STATUS_OPPGAVER_FERDIG = "Oppgaver ferdig"
+STATUS_TRENGER_AVKLARING = "Trenger avklaring"
+STATUS_UTGAAR = "Utgår"
+
+# When the Leveranse status is one of these, every auto-write is
+# suppressed. Comments still arrive, Korreksjonsrunder + tasks still get
+# created, but Status stays where the team manually put it. The team has
+# to move it out manually before the automation can write again.
+MANUAL_LEVERANSE_STATUSES = frozenset({STATUS_TRENGER_AVKLARING, STATUS_UTGAAR})
 
 
 # Notion's multi-select API supports exactly these 10 colors. "default" is the

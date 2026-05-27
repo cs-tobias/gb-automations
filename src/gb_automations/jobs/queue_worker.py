@@ -35,8 +35,11 @@ from gb_automations.sync.queue import (
 )
 from gb_automations.sync.sync_frame import sync_frame_leveranse, sync_frame_project
 from gb_automations.sync.sync_frame_comments import sync_frame_comment
+from gb_automations.sync.sync_frame_version import sync_frame_version
 from gb_automations.sync.sync_labels import sync_project_labels
+from gb_automations.sync.sync_leveranse_status import recheck_leveranse_status
 from gb_automations.sync.sync_nas import sync_nas_folder
+from gb_automations.sync.sync_oppgave_done import sync_oppgave_done
 from gb_automations.sync.sync_tasks import sync_task_folder
 from gb_automations.sync.sync_thread import sync_thread
 
@@ -398,6 +401,135 @@ async def _process_frame_comment_sync(claimed: _Claimed, progress: str) -> None:
         await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
 
+async def _process_frame_version_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a frame_version_sync task: a new version was uploaded on a
+    tracked Leveranse's version stack → flip Leveranse status to Ferdig.
+
+    The queue row carries the Frame version_stack UUID in gmail_thread_id
+    (placeholder slot). The engine resolves the Leveranse and writes the
+    status; project_page_id is set so the Projects-DB dot picks it up too.
+    "Skipped" outcomes (stack 4xx, untracked stack, only V00) are healthy
+    no-ops, NOT failed.
+    """
+    stack_id = claimed.gmail_thread_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing Frame version stack %s%s",
+        progress,
+        stack_id,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    project_page_id: str | None = None
+    try:
+        if not stack_id:
+            raise ValueError(
+                "frame_version_sync task has no stack id (gmail_thread_id)"
+            )
+        result = await sync_frame_version(stack_id)
+        project_page_id = result.project_page_id
+        if result.action == "failed":
+            outcome_error = result.note or "frame version sync failed"
+    except Exception as err:
+        log_api_error(logger, f"frame version sync crashed for {stack_id}", err)
+        outcome_error = describe_error(err)
+
+    if project_page_id:
+        await set_task_project(claimed.id, project_page_id)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(stack_id),
+    )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+
+
+async def _process_oppgave_done_sync(claimed: _Claimed, progress: str) -> None:
+    """Run an oppgave_done_sync task: propagate a Notion Korreksjon's
+    Ferdig checkbox state to its linked Frame comment.
+
+    Most loop-iteration outcomes are 'skipped_loop' (Frame already
+    matches Notion — we're seeing our own write bouncing back). Those
+    are healthy no-ops. project_page_id isn't reliably set here (the
+    engine resolves leveranse but not project), so we skip the
+    Projects-DB dot update.
+    """
+    oppgave_id = claimed.gmail_thread_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — propagating Oppgave done state for %s%s",
+        progress,
+        oppgave_id,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not oppgave_id:
+            raise ValueError(
+                "oppgave_done_sync task has no Oppgave page id (gmail_thread_id)"
+            )
+        result = await sync_oppgave_done(oppgave_id)
+        if result.action == "failed":
+            outcome_error = result.note or "oppgave done sync failed"
+    except Exception as err:
+        log_api_error(logger, f"oppgave done sync crashed for {oppgave_id}", err)
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(oppgave_id),
+    )
+
+
+async def _process_leveranse_status_recheck(claimed: _Claimed, progress: str) -> None:
+    """Run a leveranse_status_recheck task: recompute the Leveranse's
+    status from the active Korreksjonsrunde's Korreksjon children.
+
+    The engine is pure read-then-decide-then-write logic; failure modes
+    are Notion API errors only.
+    """
+    leveranse_id = claimed.gmail_thread_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — rechecking Leveranse status for %s%s",
+        progress,
+        leveranse_id,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not leveranse_id:
+            raise ValueError(
+                "leveranse_status_recheck task has no Leveranse page id (gmail_thread_id)"
+            )
+        result = await recheck_leveranse_status(leveranse_id)
+        if result.action == "failed":
+            outcome_error = result.note or "leveranse status recheck failed"
+    except Exception as err:
+        log_api_error(
+            logger, f"leveranse status recheck crashed for {leveranse_id}", err
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(leveranse_id),
+    )
+
+
 async def _process(claimed: _Claimed, progress: str) -> None:
     """Dispatch a claimed task by type and record the outcome.
 
@@ -422,6 +554,15 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "frame_comment_sync":
         await _process_frame_comment_sync(claimed, progress)
+        return
+    if claimed.task_type == "frame_version_sync":
+        await _process_frame_version_sync(claimed, progress)
+        return
+    if claimed.task_type == "oppgave_done_sync":
+        await _process_oppgave_done_sync(claimed, progress)
+        return
+    if claimed.task_type == "leveranse_status_recheck":
+        await _process_leveranse_status_recheck(claimed, progress)
         return
 
     task_id, email, thread_id, attempts, rebuild = (

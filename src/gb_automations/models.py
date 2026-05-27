@@ -459,9 +459,19 @@ SYNC_TASK_STATUSES = ("pending", "in_progress", "done", "failed")
 # slower (placeholder upload) and gated by its own SYNC_FRAME toggle, so
 # a Frame outage shouldn't tie up NAS/label retries.
 # 'frame_comment_sync' is the Phase 2 inbound side: a Frame webhook fires
-# on comment.created / comment.updated, the receiver enqueues one of
-# these per comment id, and the worker fetches the full comment and
-# writes a bullet into the corresponding Korreksjonsrunde Oppgave row.
+# on comment.created / comment.updated / comment.completed / comment.uncompleted,
+# the receiver enqueues one of these per comment id, and the worker fetches
+# the full comment and (a) creates a Korreksjon sub-Oppgave under its
+# Korreksjonsrunde and (b) for completed/uncompleted events propagates the
+# done state into the Notion checkbox.
+# 'frame_version_sync' is the Phase 2.5 trigger for file.versioned events:
+# a new version uploaded on top of the placeholder flips the Leveranse
+# status to "Ferdig". gmail_thread_id carries the Frame version_stack id.
+# 'oppgave_done_sync' is the Phase 2.5 Notion-side propagator: a Notion
+# automation fires when the team toggles a Korreksjon's Ferdig checkbox;
+# the engine PATCHes the matching Frame comment's completed state.
+# 'leveranse_status_recheck' rolls up the active round's Korreksjon
+# completion counts into Under arbeid / Oppgaver ferdig.
 # New types go here + the CHECK below + a branch in jobs/queue_worker._process.
 SYNC_TASK_TYPES = (
     "thread",
@@ -471,6 +481,9 @@ SYNC_TASK_TYPES = (
     "frame_project_sync",
     "frame_leveranse_sync",
     "frame_comment_sync",
+    "frame_version_sync",
+    "oppgave_done_sync",
+    "leveranse_status_recheck",
 )
 
 
@@ -542,7 +555,8 @@ class SyncTask(Base):
         CheckConstraint(
             "task_type IN ('thread','label_sync','nas_folder_sync',"
             "'task_folder_sync','frame_project_sync','frame_leveranse_sync',"
-            "'frame_comment_sync')",
+            "'frame_comment_sync','frame_version_sync','oppgave_done_sync',"
+            "'leveranse_status_recheck')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -621,6 +635,45 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'frame_comment_sync'"
+            ),
+        ),
+        # Phase 2.5 — At most one ACTIVE frame_version_sync per version
+        # stack. gmail_thread_id carries the Frame version_stack id (from
+        # the file.versioned webhook's resource.id). A rapid sequence of
+        # file.created/.upload.completed/.ready/.versioned events that
+        # could end up enqueueing more than one task for the same stack
+        # collapses to a single row here.
+        Index(
+            "uq_sync_tasks_active_frame_version",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'frame_version_sync'"
+            ),
+        ),
+        # Phase 2.5 — At most one ACTIVE oppgave_done_sync per Oppgave
+        # page. gmail_thread_id carries the Notion Oppgave page id. The
+        # Notion automation may fire rapidly when the team toggles
+        # checkboxes; dedup keeps the engine running once per row.
+        Index(
+            "uq_sync_tasks_active_oppgave_done",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'oppgave_done_sync'"
+            ),
+        ),
+        # Phase 2.5 — At most one ACTIVE leveranse_status_recheck per
+        # Leveranse. gmail_thread_id carries the Leveranse page id. The
+        # cascade of N children being toggled in succession all enqueue
+        # the same parent's recheck task; the dedup makes it a single
+        # rollup pass.
+        Index(
+            "uq_sync_tasks_active_leveranse_status",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'leveranse_status_recheck'"
             ),
         ),
         # Drives the worker's claim query: filter by status, FIFO by oldest
