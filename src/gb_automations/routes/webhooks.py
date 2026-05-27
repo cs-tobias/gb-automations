@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any
@@ -46,6 +48,7 @@ from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import (
+    enqueue_frame_comment_sync,
     enqueue_frame_leveranse_sync,
     enqueue_frame_project_sync,
     enqueue_label_sync,
@@ -942,3 +945,180 @@ async def _gmail_webhook_impl(request: Request) -> Response:
         ),
         media_type="application/json",
     )
+
+
+# ============================================================
+# /webhooks/frame — Frame.io comment events (Phase 2)
+# ============================================================
+#
+# Frame V4 webhook events for comments deliver only `{type, resource:{id,
+# type}, account, project, workspace, user}` — no comment body, no author.
+# The handler verifies the HMAC, enqueues a `frame_comment_sync` task with
+# the resource id, returns 200. The worker drains the queue, fetches the
+# full comment from Frame (`GET /comments/{id}?include=owner,replies`),
+# and writes it into the Korreksjonsrunde Oppgave's page body.
+#
+# Verified webhook security spec (Adobe Frame.io developer docs):
+#   - Signature header: X-Frameio-Signature, formatted as "v0=<hex>".
+#   - Timestamp header: X-Frameio-Request-Timestamp (Unix seconds).
+#   - Signing scheme: HMAC-SHA256 over the literal byte string
+#     `v0:{timestamp}:{raw_body}` using the webhook's signing secret
+#     (returned at registration time as the `secret` field on the webhook
+#     object — saved to FRAME_WEBHOOK_SECRET .env).
+#   - Replay window: reject requests where |now - timestamp| > 5 minutes.
+
+
+# Reject requests whose timestamp is too far off — defeats replay attacks.
+# 5 minutes matches Frame's own recommendation and Slack's convention.
+_FRAME_HMAC_REPLAY_WINDOW_SECONDS = 5 * 60
+
+
+def _verify_frame_hmac(
+    body_bytes: bytes,
+    signature_header: str | None,
+    timestamp_header: str | None,
+) -> bool:
+    """Verify a Frame.io webhook signature.
+
+    Signature header looks like `v0=<hex>`. The HMAC is computed over
+    the literal string `v0:{timestamp}:{raw_body}` (Slack-style scheme)
+    with FRAME_WEBHOOK_SECRET as the key. We also enforce a replay
+    window via the timestamp.
+
+    Returns False on any of: missing config, missing headers, malformed
+    signature header, replay-window violation, HMAC mismatch.
+    """
+    if not settings.frame_webhook_secret:
+        logger.warning(
+            "frame: FRAME_WEBHOOK_SECRET unset — rejecting all webhooks"
+        )
+        return False
+    if not signature_header or not timestamp_header:
+        return False
+    if not signature_header.startswith("v0="):
+        return False
+
+    # Replay-window check. We tolerate a malformed timestamp by rejecting,
+    # NOT by treating it as zero — that would let an attacker bypass the
+    # window by sending a non-numeric header.
+    try:
+        ts = int(timestamp_header)
+    except ValueError:
+        return False
+    now = int(time.time())
+    if abs(now - ts) > _FRAME_HMAC_REPLAY_WINDOW_SECONDS:
+        logger.warning(
+            "frame: webhook timestamp %s outside replay window (now=%d, diff=%d)",
+            timestamp_header,
+            now,
+            now - ts,
+        )
+        return False
+
+    signing_base = f"v0:{timestamp_header}:".encode("utf-8") + body_bytes
+    expected = hmac.new(
+        settings.frame_webhook_secret.encode("utf-8"),
+        signing_base,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature_header[3:], expected)
+
+
+@router.post("/frame")
+async def frame_webhook(request: Request) -> Response:
+    """Receive a Frame.io webhook event; enqueue + return 200 fast.
+
+    Wrapped in `request_scope("frame")` so every log line during this
+    request (and the queued comment-sync task it spawns) carries the
+    `[frame:abcd]` prefix.
+
+    Returns 401 on auth failure (so Frame doesn't retry indefinitely
+    with the same bad signature); returns 200 on auth success even when
+    the event is one we don't act on, so Frame retires its retry queue
+    promptly.
+    """
+    with request_scope("frame"):
+        body_bytes = await request.body()
+        sig = request.headers.get("X-Frameio-Signature")
+        ts = request.headers.get("X-Frameio-Request-Timestamp")
+        if not _verify_frame_hmac(body_bytes, sig, ts):
+            logger.warning(
+                "frame: webhook auth failed — sig=%r ts=%r body_len=%d",
+                sig,
+                ts,
+                len(body_bytes),
+            )
+            raise HTTPException(401, "invalid signature")
+
+        try:
+            payload = json.loads(body_bytes) if body_bytes else {}
+        except json.JSONDecodeError:
+            logger.warning("frame: webhook body is not JSON")
+            raise HTTPException(400, "body is not JSON") from None
+
+        event_type = payload.get("type") or ""
+        resource = payload.get("resource") or {}
+        resource_id = resource.get("id")
+        resource_type = resource.get("type")
+
+        logger.info(
+            "📨 frame webhook %s: resource=%s/%s",
+            event_type,
+            resource_type,
+            resource_id,
+        )
+
+        # Only `comment.*` events are interesting for Phase 2. Any other
+        # event (project.created, file.uploaded, …) acks 200 and returns
+        # — registering for them is fine if it ever lands a webhook on a
+        # different event by mistake; we'd rather not retry-storm.
+        if not event_type.startswith("comment."):
+            return Response(
+                content=json.dumps({"received": True, "ignored": event_type}),
+                media_type="application/json",
+            )
+
+        if not resource_id:
+            logger.warning(
+                "frame: comment event %s has no resource.id — ignoring",
+                event_type,
+            )
+            return Response(
+                content=json.dumps({"received": True, "ignored": "no resource.id"}),
+                media_type="application/json",
+            )
+
+        # `comment.deleted` would still match comment.* but there's no
+        # value in enqueueing it — we can't fetch a deleted comment to
+        # render it as a bullet, and the engine would just self-heal
+        # 404 it. Skip explicitly so /debug/queue stays tidy.
+        if event_type == "comment.deleted":
+            logger.info(
+                "frame: comment %s deleted in Frame — no enqueue", resource_id
+            )
+            return Response(
+                content=json.dumps(
+                    {"received": True, "ignored": "comment.deleted"}
+                ),
+                media_type="application/json",
+            )
+
+        inserted = await enqueue_frame_comment_sync(resource_id)
+        queue_worker.wake()
+        logger.info(
+            "📨 enqueued frame_comment_sync for %s (event=%s, inserted=%d)",
+            resource_id,
+            event_type,
+            inserted,
+        )
+        return Response(
+            content=json.dumps(
+                {
+                    "received": True,
+                    "event": event_type,
+                    "comment_id": resource_id,
+                    "enqueued": inserted,
+                }
+            ),
+            media_type="application/json",
+        )

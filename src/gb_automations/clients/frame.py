@@ -467,6 +467,33 @@ async def get_file(file_id: str) -> dict[str, Any]:
         return _unwrap(response.json())
 
 
+async def list_version_stack_children(stack_id: str) -> list[dict[str, Any]]:
+    """List the files inside a version stack, in Frame's stable ordering.
+
+    Frame V4 endpoint: GET /accounts/{aid}/version_stacks/{sid}/children.
+    Verified 2026-05-27 against a real V00→V01 stack: returns all File
+    entities under the stack, each carrying `id`, `name`, `type`,
+    `created_at`. `version_number` is present but null in observed
+    responses — round derivation must sort by `created_at` ascending
+    (V00 = oldest, V01 = next, etc.).
+
+    DO NOT call `list_folder_children(stack_id)` for this — Frame V4
+    distinguishes folders from version stacks at the URL level and
+    returns 422 "Entity ... is not a folder" for a stack id under
+    /folders/{id}/children.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/version_stacks/{stack_id}/children"
+            ),
+            op_name="list_version_stack_children",
+        )
+        _raise_for_status(response)
+        return response.json().get("data", [])
+
+
 # ============================================================
 # Phase 2 — comments + webhooks
 # ============================================================
@@ -663,108 +690,65 @@ async def delete_webhook(webhook_id: str) -> None:
 async def get_file_version_info(file_id: str) -> tuple[int, str | None]:
     """Derive the round number for a Frame File from its version stack.
 
-    Returns `(version_number, version_stack_id)`:
-      - V00 (placeholder, no real delivery yet) → (0, None)
-      - V01 (first real delivery, the placeholder still in its history) → (1, <stack_id>)
-      - V02 (revision after round 1) → (2, <stack_id>)
+    Returns `(round_number, version_stack_id)`:
+      - V00 placeholder, never had a real version uploaded on top of it
+        → (0, None). The file's parent is the task folder, not a stack.
+      - V00 inside a version stack (a V01 was uploaded on top of it,
+        Frame wrapped both in a stack) → (0, <stack_id>).
+      - V01 (first real delivery) → (1, <stack_id>).
+      - V02 (revision after round 1) → (2, <stack_id>). Etc.
 
-    How V4 represents versions (verified 2026-05-26 against a placeholder
-    file; behavior with V01+ uploaded on top is INFERRED — log line below
-    will tell us if the shape differs when a real V01 lands):
-      - A bare File has `parent_id` pointing at its folder. No version
-        stack. We report round 0.
-      - When a user uploads a new version on top, Frame creates a
-        `version_stack` entity in the folder, moves the original File
-        underneath, and the new upload becomes another child of the
-        stack. The stack's children are ordered (V00, V01, V02 …).
-
-    Implementation: GET /files/{file_id}, look at parent. If parent is
-    a folder → round 0. If parent is a version_stack → list its children,
-    find the file's index. The placeholder is index 0 → V00, the next
-    upload is index 1 → V01.
+    Verified 2026-05-27 against a real V00 → V01 stack on Goldbox's
+    workspace:
+      - A file's `parent_id` is the version_stack id when versions exist;
+        the same `parent_id` field holds the task folder id when the file
+        is bare. The two are distinguished by GET-ing them: a folder
+        responds 200 at /folders/{id}, a stack 422 (and vice versa).
+      - The version stack's /children endpoint is
+        /accounts/{aid}/version_stacks/{sid}/children — NOT the /folders
+        equivalent (which 422s on a stack id).
+      - Each child carries `created_at`. `version_number` is present but
+        null in observed responses, so we derive round = index when
+        children are sorted by `created_at` ascending (V00 = oldest).
     """
-    token = await frame_auth.get_access_token()
-    async with await _client(access_token=token) as client:
-        response = await _with_retries(
-            lambda: client.get(f"/accounts/{_account_id()}/files/{file_id}"),
-            op_name="get_file_version_info(file)",
+    file_obj = await get_file(file_id)
+    parent_id = file_obj.get("parent_id")
+    if not parent_id:
+        logger.warning(
+            "frame file %s has no parent_id — assuming round 0",
+            file_id,
         )
-        _raise_for_status(response)
-        file_obj = _unwrap(response.json())
+        return 0, None
 
-        # Heuristic: if the file response carries a top-level
-        # `version_number` (we haven't seen this yet but Frame may add
-        # it), trust it. Otherwise derive from parent inspection.
-        explicit = file_obj.get("version_number")
-        if isinstance(explicit, int):
+    # Try the version-stack endpoint. If it 422s the parent is a folder
+    # (bare V00, no real delivery on top) → round 0, no stack.
+    try:
+        stack_children = await list_version_stack_children(parent_id)
+    except FrameAPIError as err:
+        if err.status_code in (404, 422):
             logger.info(
-                "frame file %s has explicit version_number=%d (shape changed — update docs)",
-                file_id, explicit,
-            )
-            return explicit, file_obj.get("parent_id")
-
-        parent_id = file_obj.get("parent_id")
-        if not parent_id:
-            logger.warning(
-                "frame file %s has no parent_id — assuming round 0 (placeholder)",
-                file_id,
-            )
-            return 0, None
-
-        # Look at the parent. If it's a folder, we're a bare file (no
-        # version stack yet) → round 0. If it's a version_stack, walk
-        # its children to find our index.
-        parent_response = await _with_retries(
-            lambda: client.get(
-                f"/accounts/{_account_id()}/folders/{parent_id}/children"
-            ),
-            op_name="get_file_version_info(children)",
-        )
-        # The folder may have many siblings; that's fine — we're really
-        # asking "is the parent a folder containing this file as a
-        # peer of other files/version stacks?" If so → round 0.
-        if parent_response.status_code == 200:
-            children = parent_response.json().get("data", [])
-            # If any child has type 'version_stack' and contains our
-            # file, we're not in this case — fall through. Otherwise the
-            # file lives directly in a folder → round 0.
-            if any(c.get("id") == file_id for c in children):
-                logger.info(
-                    "frame file %s lives directly in folder %s — round 0",
-                    file_id, parent_id,
-                )
-                return 0, None
-
-        # Parent was probably a version_stack. Try listing its children
-        # via the same /folders endpoint (V4 sometimes treats stacks as
-        # folders for children listing) — if that 404s we know we need
-        # a different endpoint.
-        stack_response = await _with_retries(
-            lambda: client.get(
-                f"/accounts/{_account_id()}/folders/{parent_id}/children"
-            ),
-            op_name="get_file_version_info(stack-children)",
-        )
-        if stack_response.status_code == 200:
-            stack_children = stack_response.json().get("data", [])
-            # Sort by created_at to get version order (oldest first =
-            # V00, then V01, V02…).
-            stack_children.sort(key=lambda c: c.get("created_at", ""))
-            for idx, child in enumerate(stack_children):
-                if child.get("id") == file_id:
-                    logger.info(
-                        "frame file %s is index %d in stack %s → round %d",
-                        file_id, idx, parent_id, idx,
-                    )
-                    return idx, parent_id
-            logger.warning(
-                "frame file %s not found in stack %s children — assuming 0",
+                "frame file %s parent %s is not a version_stack — bare V00, round 0",
                 file_id, parent_id,
             )
-            return 0, parent_id
+            return 0, None
+        raise
 
-        logger.warning(
-            "frame file %s: couldn't determine version via parent %s (status=%d) — assuming round 0",
-            file_id, parent_id, stack_response.status_code,
-        )
-        return 0, parent_id
+    # Sort oldest-first. Frame's UI orders V00, V01, V02 by upload time,
+    # and `created_at` is what backs that ordering.
+    stack_children.sort(key=lambda c: c.get("created_at", ""))
+    for idx, child in enumerate(stack_children):
+        if child.get("id") == file_id:
+            logger.info(
+                "frame file %s is index %d in stack %s → round %d",
+                file_id, idx, parent_id, idx,
+            )
+            return idx, parent_id
+
+    # Shouldn't happen: the file's parent is the stack but the file
+    # isn't in the stack's children list. Fall back to round 0 with a
+    # loud warning so we notice if the shape ever drifts.
+    logger.warning(
+        "frame file %s not found in stack %s children — assuming round 0",
+        file_id, parent_id,
+    )
+    return 0, parent_id

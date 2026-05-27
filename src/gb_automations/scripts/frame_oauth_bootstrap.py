@@ -192,6 +192,15 @@ async def main() -> None:
         "→ lists existing projects in the workspace"
     )
     print()
+    print(
+        "For Phase 2 (Frame comments → Notion Korreksjonsrunde rows), also run:\n"
+        "  docker compose exec api python -m gb_automations.scripts.frame_register_webhook\n"
+        "It registers /webhooks/frame against this workspace and prints the\n"
+        "FRAME_WEBHOOK_SECRET line to paste into .env. It's a separate script\n"
+        "so you can re-register the webhook (e.g. after a tunnel hostname\n"
+        "change) without going through the Adobe OAuth dance again."
+    )
+    print()
 
 
 async def _wait_for_result() -> dict | None:

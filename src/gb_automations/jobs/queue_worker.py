@@ -34,6 +34,7 @@ from gb_automations.sync.queue import (
     status_counts,
 )
 from gb_automations.sync.sync_frame import sync_frame_leveranse, sync_frame_project
+from gb_automations.sync.sync_frame_comments import sync_frame_comment
 from gb_automations.sync.sync_labels import sync_project_labels
 from gb_automations.sync.sync_nas import sync_nas_folder
 from gb_automations.sync.sync_tasks import sync_task_folder
@@ -348,6 +349,55 @@ async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> Non
         await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
 
 
+async def _process_frame_comment_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a frame_comment_sync task: write one Frame.io comment into its
+    Korreksjonsrunde Oppgave's page body as a Notion bullet.
+
+    Same shape as _process_frame_leveranse_sync — the queue row carries
+    the Frame comment UUID in gmail_thread_id (placeholder slot), and
+    project_page_id is resolved from the engine result so the Projects-DB
+    dot picks up comment activity too. Many engine outcomes (V00 noise,
+    untracked-file comment, deleted-comment 404) are 'skipped' — those
+    are healthy no-ops and mark the task done, NOT failed.
+    """
+    comment_id = claimed.gmail_thread_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing Frame comment %s%s",
+        progress,
+        comment_id,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    project_page_id: str | None = None
+    try:
+        if not comment_id:
+            raise ValueError(
+                "frame_comment_sync task has no comment id (gmail_thread_id)"
+            )
+        result = await sync_frame_comment(comment_id)
+        project_page_id = result.project_page_id
+        if result.action == "failed":
+            outcome_error = result.note or "frame comment sync failed"
+    except Exception as err:
+        log_api_error(logger, f"frame comment sync crashed for {comment_id}", err)
+        outcome_error = describe_error(err)
+
+    if project_page_id:
+        await set_task_project(claimed.id, project_page_id)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(comment_id),
+    )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+
+
 async def _process(claimed: _Claimed, progress: str) -> None:
     """Dispatch a claimed task by type and record the outcome.
 
@@ -369,6 +419,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "frame_leveranse_sync":
         await _process_frame_leveranse_sync(claimed, progress)
+        return
+    if claimed.task_type == "frame_comment_sync":
+        await _process_frame_comment_sync(claimed, progress)
         return
 
     task_id, email, thread_id, attempts, rebuild = (

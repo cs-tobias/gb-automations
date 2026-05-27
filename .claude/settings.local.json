@@ -78,7 +78,8 @@
       "WebFetch(domain:next.developer.frame.io)",
       "WebFetch(domain:developer.frame.io)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('migrations/versions/k6h7i8j9e0f1_phase2_frame_comments.py'\\).read\\(\\)\\); print\\('migration: ok'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/models.py'\\).read\\(\\)\\); print\\('models: ok'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/gb_automations/models.py'\\).read\\(\\)\\); print\\('models: ok'\\)\")",
+      "Bash(curl.exe -s -o /dev/null -w \"%{http_code}\\\\n\" -X POST \"https://hub.tobiaseek.com/webhooks/frame\" -H \"Content-Type: application/json\" -d '{\"type\":\"comment.created\",\"resource\":{\"id\":\"deadbeef\",\"type\":\"comment\"}}')"
     ],
     "additionalDirectories": [
       "c:\\Users\\tobia\\Documents\\Code\\gb-automations"
