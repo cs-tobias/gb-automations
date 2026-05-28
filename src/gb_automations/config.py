@@ -61,26 +61,44 @@ class Settings(BaseSettings):
     # parent isn't this database. If empty, the parent check is skipped (the button
     # is only placed on the Projects DB template anyway).
     projects_db_id: str = ""
-    # Notion "Leveranser" DB — one row per deliverable entity (image / render).
-    # Renamed in Phase 2 from "Oppgaver"/`tasks_db_id`: the current rows in
-    # this DB are images that go through Frame's version stack, not work
-    # items. The DB id itself doesn't change on a Notion rename — operators
-    # set this env var to the same id the legacy TASKS_DB_ID held.
+    # Notion "Oppgaver" DB — one row per deliverable entity (image / render)
+    # OR a general internal task. The two are distinguished by the `Type`
+    # select: a real discipline (Interiør/Eksteriør/Animasjon/Annet) means
+    # "deliverable" and gets Frame provisioning; any other Type (e.g.
+    # "Klargjøre modell") or a blank Type means "internal task" and is
+    # skipped. Korreksjonsrunde sub-rows also live here (sub-items of their
+    # deliverable).
+    #
+    # History of this env var: it was "Oppgaver"/`tasks_db_id`, briefly
+    # renamed to "Leveranser"/`LEVERANSER_DB_ID`, now back to "Oppgaver"
+    # with the collapsed structure. The DB id never changes on a Notion
+    # rename — operators point this at the same DB throughout. Reads
+    # OPPGAVER_DB_ID, falling back to LEVERANSER_DB_ID / TASKS_DB_ID for
+    # .env files that haven't been migrated yet.
+    #
     # When set, the Notion button webhook accepts clicks from pages in this
-    # DB and treats them as Leveranse provisioning (one row → NAS folders +
-    # Frame folder + V00 placeholder file under the project's discipline).
-    # Reads LEVERANSER_DB_ID, falling back to TASKS_DB_ID for backwards
-    # compatibility with .env files that haven't been migrated yet.
-    leveranser_db_id: str = Field(
+    # DB and (for deliverable rows) provisions NAS folders + a Frame folder
+    # + V00 placeholder under the project's discipline.
+    oppgaver_db_id: str = Field(
         default="",
-        validation_alias=AliasChoices("LEVERANSER_DB_ID", "TASKS_DB_ID"),
+        validation_alias=AliasChoices(
+            "OPPGAVER_DB_ID", "LEVERANSER_DB_ID", "TASKS_DB_ID"
+        ),
     )
-    # New in Phase 2: Notion "Oppgaver" DB — the actual tasks (Oppstart,
-    # Korreksjonsrunde N). Auto-populated by the Frame comments engine: a
-    # webhook on `comment.created` creates a Korreksjonsrunde row keyed off
-    # the file's version stack. Empty during rollout = features that need
-    # to write here log and skip.
-    oppgaver_db_id: str = ""
+    # Notion "Korreksjoner" DB — individual feedback items, one row per Frame
+    # comment (replies nested via Parent item). Each row relates to its
+    # Korreksjonsrunde row (which lives over in the Oppgaver DB). Auto-
+    # populated by the Frame comments engine on `comment.created`. Empty
+    # during rollout = features that need to write here log and skip.
+    #
+    # NOTE: requires its own KORREKSJONER_DB_ID env var — it deliberately
+    # does NOT fall back to the old OPPGAVER_DB_ID name, because that name
+    # now resolves to the deliverables DB above. At cutover, operators set
+    # KORREKSJONER_DB_ID to the id the old OPPGAVER_DB_ID held.
+    korreksjoner_db_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("KORREKSJONER_DB_ID"),
+    )
     # Optional: live mirror of the durable sync queue so the client can watch
     # what's queued / processing / failed in Notion. If empty, the mirror is a
     # no-op (the Postgres queue still works, observable via /debug/queue).
@@ -402,7 +420,7 @@ PROJECT_SYNC_OPTION = {
 PROJECTS_GMAIL_URL_PROP = "Gmail"
 PROJECTS_NAS_URL_PROP = "NAS"
 PROJECTS_FRAME_URL_PROP = "Frame.io"
-LEVERANSER_FRAME_URL_PROP = "Frame.io"
+OPPGAVER_FRAME_URL_PROP = "Frame.io"
 # Toggl Track project URL — written back to the Projects DB by
 # sync_toggl_project so a single click in Notion opens the matching
 # project's timer dropdown / Reports view in Toggl. Same column-as-
@@ -467,62 +485,71 @@ FRAME_DISCIPLINE_FOLDER_NAMES = {
 }
 
 
-# Names of the properties on the Leveranser database (renamed from
-# "Oppgaver" in Phase 2 — every row here is a deliverable entity, not a
-# task). The `Type` single-select holds the discipline label per Leveranse
-# (Interiør / Eksteriør / Animasjon); DISCIPLINE_KEYS normalizes those to
-# the canonical keys (interior/exterior/animation) that the NAS folder
-# code uses everywhere.
-LEVERANSER_PROPS = {
-    "name": "Navn",          # title
-    "project": "Prosjekt",   # relation → Projects DB
-    "discipline": "Type",    # single_select: Interiør / Eksteriør / Animasjon
-    # Phase 2.5: at-a-glance state per Leveranse. Driven by Frame events
-    # + Notion checkbox toggles (see STATUS_* constants below).
-    "status": "Status",
-}
-
-
-# Names of the properties on the (new in Phase 2) Oppgaver DB — the actual
-# tasks: an "Oppstart" row per Leveranse for pre-delivery work, and
-# "Korreksjonsrunde N" rows auto-created when Frame comments arrive on a
-# version Vn. Each Oppgave links back to its Leveranse via a single
-# relation; the Kind select tells the engine + the team what the row is.
+# Names of the properties on the Oppgaver database. Every row here is one of:
+#   - a deliverable entity (image/render) — Type is a real discipline;
+#   - a general internal/prep task — Type is "Klargjøre modell" (or any other
+#     non-discipline value, or blank);
+#   - a Korreksjonsrunde N sub-row under a deliverable — kind=Korreksjonsrunde.
+# `Type` carries BOTH axes: the four disciplines (Interiør/Eksteriør/Animasjon/
+# Annet) mean "deliverable, in this discipline"; anything else (e.g. "Klargjøre
+# modell") means "internal task — no Frame/NAS provisioning". DISCIPLINE_KEYS
+# normalizes the disciplines to canonical keys (interior/exterior/animation/
+# other); a Type that isn't in DISCIPLINE_KEYS is the internal-task marker, so
+# the Frame/NAS gate is simply "is Type a recognized discipline?". The
+# Korreksjonsrunde sub-rows reuse the `kind` (Type) + `round` + `done` +
+# `parent` slots.
 OPPGAVER_PROPS = {
-    "name": "Navn",            # title — e.g. "Oppstart" or "Korreksjonsrunde 1"
-    "leveranse": "Leveranse",  # relation → Leveranser DB (single page)
-    "kind": "Type",            # single_select: see OPPGAVE_KIND_* constants
-    "round": "Runde",          # number — round N; null/empty for Oppstart
-    # Phase 2.5: checkbox on Korreksjon rows. Bidirectionally syncs with
-    # the Frame comment's `completed` state. Two-way: a Notion-side
-    # toggle PATCHes Frame; a Frame-side ✓ writes here. The
-    # Korreksjonsrunde parent's Ferdig auto-ticks when all its children
-    # are done.
-    "done": "Ferdig",
-    # Phase 2.5: self-referential relation on Oppgaver — the "sub-items"
-    # parent pointer. Notion auto-creates this when sub-items are
-    # enabled; the default name is "Parent item" (workspace-dependent).
-    # Korreksjon rows point at their Korreksjonsrunde; reply Korreksjon
-    # rows point at their parent comment's Korreksjon. The engine writes
-    # to this relation when creating sub-rows.
+    "name": "Navn",            # title
+    "project": "Prosjekt",     # relation → Projects DB
+    "discipline": "Type",      # single_select: Interiør / Eksteriør / Animasjon / Annet / Klargjøre modell
+    # Deliverable lifecycle state. Driven by Frame events + Korreksjon
+    # rollup (see STATUS_* constants). Left blank on internal-task rows.
+    "status": "Status",
+    # Korreksjonsrunde sub-rows reuse these three. On deliverable / internal
+    # rows they're unused. `kind` shares the `Type` column with discipline —
+    # a Korreksjonsrunde sub-row carries Type="Korreksjonsrunde", which is
+    # outside the discipline set, so the two never collide on one row.
+    "kind": "Type",
+    "round": "Runde",          # number — round N on Korreksjonsrunde sub-rows
+    "done": "Ferdig",          # checkbox — auto-ticks when the round is fully done
+    # Self-referential "sub-items" relation (Notion auto-creates it when
+    # sub-items are enabled; default label "Parent item"). Korreksjonsrunde
+    # sub-rows point at their deliverable.
     "parent": "Parent item",
 }
 
-# Allowed `Type` values on Oppgaver. Three kinds:
-#   - Oppstart: auto-created on Leveranse Initialize. Pre-delivery work. Round=null.
-#   - Korreksjonsrunde: auto-created on the first Frame comment of round N
-#     (round=N). Parent of N Korreksjon rows (one per comment).
-#   - Korreksjon: NEW in Phase 2.5. One Notion row per Frame comment;
-#     sub-row of its Korreksjonsrunde, carries the Ferdig checkbox that
-#     bidirectionally syncs with Frame's comment-resolved state. Replies
-#     are also Korreksjon rows but parented to the comment they reply to
-#     (3-level nesting). Round inherited from the parent Korreksjonsrunde.
-OPPGAVE_KIND_OPPSTART = "Oppstart"
-OPPGAVE_KIND_KORREKSJONSRUNDE = "Korreksjonsrunde"
-OPPGAVE_KIND_KORREKSJON = "Korreksjon"
+
+# Names of the properties on the Korreksjoner database — individual feedback
+# items, one row per Frame comment (replies nested via `parent`). Each row
+# relates to its Korreksjonsrunde row, which lives over in the Oppgaver DB.
+KORREKSJONER_PROPS = {
+    "name": "Navn",                        # title — author + comment text
+    # relation → Oppgaver DB: the Korreksjonsrunde N row this comment belongs to.
+    "korreksjonsrunde": "Korreksjonsrunde",
+    "kind": "Type",                        # single_select: KORREKSJON_KIND_KORREKSJON
+    "round": "Runde",                      # number — inherited from the round
+    # Checkbox. Bidirectionally syncs with the Frame comment's `completed`
+    # state: a Notion toggle PATCHes Frame; a Frame ✓ writes here.
+    "done": "Ferdig",
+    # Self-referential "sub-items" relation: a reply Korreksjon points at the
+    # parent comment's Korreksjon row (3-level nesting in Notion).
+    "parent": "Parent item",
+}
+
+# `Type`/`kind` values that mark a row as a correction-round container
+# (Oppgaver DB) or an individual feedback item (Korreksjoner DB). Oppstart
+# was dropped — general internal Oppgaver rows replace the auto-created
+# pre-delivery anchor.
+#   - Korreksjonsrunde: a sub-row under a deliverable in the Oppgaver DB,
+#     auto-created on the first Frame comment of round N (round=N).
+#   - Korreksjon: a row in the Korreksjoner DB, one per Frame comment.
+#     Replies are also Korreksjon rows, parented (Parent item) to the
+#     comment they reply to. Round inherited from the Korreksjonsrunde.
+KORREKSJON_KIND_KORREKSJONSRUNDE = "Korreksjonsrunde"
+KORREKSJON_KIND_KORREKSJON = "Korreksjon"
 
 
-# Phase 2.5 — Status options on the Leveranser DB's `Status` select.
+# Phase 2.5 — Status options on the Oppgaver DB's `Status` select (deliverables).
 # Names match exactly what's configured in Notion's select-option list.
 # State machine:
 #   Ferdig (V01+ uploaded)
@@ -539,11 +566,11 @@ STATUS_OPPGAVER_FERDIG = "Oppgaver ferdig"
 STATUS_TRENGER_AVKLARING = "Trenger avklaring"
 STATUS_UTGAAR = "Utgår"
 
-# When the Leveranse status is one of these, every auto-write is
-# suppressed. Comments still arrive, Korreksjonsrunder + tasks still get
-# created, but Status stays where the team manually put it. The team has
+# When a deliverable's status is one of these, every auto-write is
+# suppressed. Comments still arrive, Korreksjonsrunder + Korreksjoner still
+# get created, but Status stays where the team manually put it. The team has
 # to move it out manually before the automation can write again.
-MANUAL_LEVERANSE_STATUSES = frozenset({STATUS_TRENGER_AVKLARING, STATUS_UTGAAR})
+MANUAL_DELIVERABLE_STATUSES = frozenset({STATUS_TRENGER_AVKLARING, STATUS_UTGAAR})
 
 
 # Timer YYYY DB — auto-created per year, year-partitioned the same way

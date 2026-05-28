@@ -8,9 +8,9 @@ state changes:
     recheck rollup.
 
 Algorithm:
-  1. Read current status. If in MANUAL_LEVERANSE_STATUSES (Trenger
+  1. Read current status. If in MANUAL_DELIVERABLE_STATUSES (Trenger
      avklaring / Utgår), return "skipped_manual" — the team's override
-     wins. (set_leveranse_status also gates on this, but the early
+     wins. (set_deliverable_status also gates on this, but the early
      exit saves us the Oppgaver query.)
   2. Find the ACTIVE Korreksjonsrunde row: the one with the highest
      `Runde` number among Korreksjonsrunde-kind rows related to this
@@ -23,7 +23,7 @@ Algorithm:
        - 0 < done < total:        Under arbeid.
        - done == total > 0:       Oppgaver ferdig. Also auto-tick the
                                   round row's own Ferdig checkbox.
-  4. Call set_leveranse_status. Read-first / skip-if-same handles the
+  4. Call set_deliverable_status. Read-first / skip-if-same handles the
      "no actual change" case.
 
 Idempotent — the rollup is a pure function of the current Oppgaver
@@ -39,8 +39,8 @@ from typing import Any
 
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
-    MANUAL_LEVERANSE_STATUSES,
-    OPPGAVE_KIND_KORREKSJONSRUNDE,
+    KORREKSJON_KIND_KORREKSJONSRUNDE,
+    MANUAL_DELIVERABLE_STATUSES,
     OPPGAVER_PROPS,
     STATUS_OPPGAVER_FERDIG,
     STATUS_UNDER_ARBEID,
@@ -79,12 +79,14 @@ async def _find_active_korreksjonsrunde(
         "filter": {
             "and": [
                 {
-                    "property": OPPGAVER_PROPS["leveranse"],
+                    # Korreksjonsrunde rows are sub-items of the deliverable —
+                    # the Parent item relation points at it.
+                    "property": OPPGAVER_PROPS["parent"],
                     "relation": {"contains": leveranse_page_id},
                 },
                 {
                     "property": OPPGAVER_PROPS["kind"],
-                    "select": {"equals": OPPGAVE_KIND_KORREKSJONSRUNDE},
+                    "select": {"equals": KORREKSJON_KIND_KORREKSJONSRUNDE},
                 },
             ]
         },
@@ -127,17 +129,17 @@ async def recheck_leveranse_status(
 
     # 1. Manual override gate (early exit before the Oppgaver query).
     try:
-        current_status = await notion_client.get_leveranse_status(leveranse_page_id)
+        current_status = await notion_client.get_deliverable_status(leveranse_page_id)
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "leveranse_status: get_leveranse_status failed for %s",
+            "leveranse_status: get_deliverable_status failed for %s",
             leveranse_page_id,
         )
         result.action = "failed"
         result.note = f"Notion get_status: {err}"
         return result
 
-    if current_status in MANUAL_LEVERANSE_STATUSES:
+    if current_status in MANUAL_DELIVERABLE_STATUSES:
         logger.info(
             "leveranse_status: skipped (current=%r is manual) for %s",
             current_status,
@@ -218,12 +220,12 @@ async def recheck_leveranse_status(
 
     # 4. Write status.
     try:
-        action = await notion_client.set_leveranse_status(
+        action = await notion_client.set_deliverable_status(
             leveranse_page_id, target
         )
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "leveranse_status: set_leveranse_status failed for %s",
+            "leveranse_status: set_deliverable_status failed for %s",
             leveranse_page_id,
         )
         result.action = "failed"
@@ -232,15 +234,15 @@ async def recheck_leveranse_status(
 
     result.action = action  # written | unchanged | skipped_manual
 
-    # When all Korreksjon tasks of the round are done, auto-tick the
-    # round row's own Ferdig checkbox too. Visual signal that the round
-    # is wrapped up. set_oppgave_done is read-first/idempotent so an
-    # already-ticked round is a no-op. We DO NOT auto-untick on a
-    # downgrade — the team can manually flip it back if they reopened a
+    # When all Korreksjoner of the round are done, auto-tick the round
+    # row's own Ferdig checkbox too (it lives in the Oppgaver DB). Visual
+    # signal that the round is wrapped up. set_row_done is read-first/
+    # idempotent so an already-ticked round is a no-op. We DO NOT auto-untick
+    # on a downgrade — the team can manually flip it back if they reopened a
     # round on purpose.
     if done == total and total > 0:
         try:
-            await notion_client.set_oppgave_done(runde_oppgave_id, True)
+            await notion_client.set_row_done(runde_oppgave_id, True)
         except Exception:
             logger.exception(
                 "leveranse_status: auto-tick round %s Ferdig failed (non-fatal)",

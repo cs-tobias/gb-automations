@@ -15,7 +15,7 @@ Algorithm:
   4. If the latest child is V00 (round 0), the stack only contains the
      placeholder — no real delivery yet, drop silently. (file.versioned
      shouldn't fire for V00 in practice; defense-in-depth.)
-  5. Call `set_leveranse_status(Ferdig)`. The helper respects manual
+  5. Call `set_deliverable_status(Ferdig)`. The helper respects manual
      overrides (Trenger avklaring / Utgår) and skips if already Ferdig.
 
 Self-heal mirrors `sync_frame_comments`:
@@ -152,12 +152,12 @@ async def sync_frame_version(stack_id: str) -> FrameVersionResult:
 
     # 5. Flip status to Ferdig.
     try:
-        action = await notion_client.set_leveranse_status(
+        action = await notion_client.set_deliverable_status(
             leveranse_page_id, STATUS_FERDIG
         )
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "frame_version: set_leveranse_status failed for %s — queue will retry",
+            "frame_version: set_deliverable_status failed for %s — queue will retry",
             leveranse_page_id,
         )
         result.action = "failed"

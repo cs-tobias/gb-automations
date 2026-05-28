@@ -1,17 +1,18 @@
 """Notion Ferdig checkbox → Frame.io `completed` state (Phase 2.5).
 
 The Notion automation fires `POST /webhooks/notion/oppgave-done` when the
-team toggles the `Ferdig` checkbox on an Oppgaver row. The receiver
-enqueues `oppgave_done_sync` with the page id; this engine drains it.
+team toggles the `Ferdig` checkbox on a Korreksjon row (Korreksjoner DB).
+The receiver enqueues `oppgave_done_sync` with the page id; this engine
+drains it.
 
 Algorithm:
-  1. GET the Oppgave page; read current `Ferdig` checkbox + `Type`.
-  2. Skip non-Korreksjon rows (Oppstart / Korreksjonsrunde don't map to
-     a Frame comment). Korreksjonsrunde rows DO get Ferdig auto-ticked
-     by the rollup engine when all children are done, but that write
-     comes from sync_leveranse_status — not via this path.
-  3. Find the linked FrameComment by oppgave_page_id. None → row was
-     manually created, or a legacy Phase 2 bullet — log + skip.
+  1. GET the Korreksjon page; read current `Ferdig` checkbox + `Type`.
+  2. Skip non-Korreksjon rows (defensive — the automation targets the
+     Korreksjoner DB, but a stray row of another kind is ignored).
+     A Korreksjonsrunde row's own Ferdig is auto-ticked by the rollup
+     engine, not via this path.
+  3. Find the linked FrameComment by oppgave_page_id (= the Korreksjon
+     page id). None → row was manually created, or a legacy row — skip.
   4. GET the Frame comment's current `completed_at`. If it already
      matches Notion's checkbox state, skip (LOOP GUARD: we're seeing
      our own write bouncing back via Frame's webhook → our engine →
@@ -19,7 +20,7 @@ Algorithm:
   5. `frame.set_comment_completed(comment_id, checkbox)`.
   6. Enqueue `leveranse_status_recheck` so the rollup runs.
 
-Idempotent: re-running the same Oppgave page id with the same checkbox
+Idempotent: re-running the same Korreksjon page id with the same checkbox
 state is a no-op via the loop guard.
 """
 
@@ -32,7 +33,11 @@ from sqlalchemy import select
 
 from gb_automations.clients import frame as frame_client
 from gb_automations.clients import notion as notion_client
-from gb_automations.config import OPPGAVE_KIND_KORREKSJON, OPPGAVER_PROPS, settings
+from gb_automations.config import (
+    KORREKSJON_KIND_KORREKSJON,
+    KORREKSJONER_PROPS,
+    settings,
+)
 from gb_automations.db import SessionLocal
 from gb_automations.models import FrameComment
 
@@ -80,16 +85,16 @@ async def sync_oppgave_done(oppgave_page_id: str) -> OppgaveDoneResult:
         return result
 
     props = page.get("properties") or {}
-    kind_prop = props.get(OPPGAVER_PROPS["kind"]) or {}
+    kind_prop = props.get(KORREKSJONER_PROPS["kind"]) or {}
     kind = (kind_prop.get("select") or {}).get("name")
-    done_prop = props.get(OPPGAVER_PROPS["done"]) or {}
+    done_prop = props.get(KORREKSJONER_PROPS["done"]) or {}
     desired_done = bool(done_prop.get("checkbox"))
     result.desired_done = desired_done
 
     # 2. Only Korreksjon rows (per-comment) participate in this sync.
-    # Oppstart rows have no linked Frame comment. Korreksjonsrunde rows
-    # are managed by the rollup engine, not here.
-    if kind != OPPGAVE_KIND_KORREKSJON:
+    # Defensive: a Korreksjonsrunde row's Ferdig is managed by the rollup
+    # engine, not here, and shouldn't reach this DB's automation anyway.
+    if kind != KORREKSJON_KIND_KORREKSJON:
         logger.info(
             "oppgave_done: page %s has kind=%r (not Korreksjon) — skipping",
             oppgave_page_id,

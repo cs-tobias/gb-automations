@@ -89,7 +89,7 @@ def _patch_notion(monkeypatch, *, title="Acme", created="2026-01-01T00:00:00Z"):
         sn.notion_client, "get_page", _aval({"created_time": created})
     )
     monkeypatch.setattr(sn.notion_client, "extract_page_title", lambda page: title)
-    monkeypatch.setattr(sn.notion_client, "tasks_for_project", _aval([]))
+    monkeypatch.setattr(sn.notion_client, "oppgaver_for_project", _aval([]))
 
 
 # --------------------------------------------------------------------------

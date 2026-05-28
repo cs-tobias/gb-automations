@@ -329,14 +329,16 @@ class FrameProjectFolder(Base):
 
 
 class FrameLeveranseFolder(Base):
-    """Notion Leveranse page ↔ Frame.io placeholder file (under its discipline folder).
+    """Notion deliverable row ↔ Frame.io placeholder file (under its discipline folder).
 
-    Phase 2 reframed what this table represents: a row in the (formerly
-    "Oppgaver", now "Leveranser") Notion DB is a deliverable *entity* — one
-    image / render — not a task. Each row provisions a V00 placeholder file
-    under the project's discipline subfolder; that file becomes the base of
-    Frame's version stack (V01 = first real delivery, V02 = revision after
-    round 1, etc.).
+    `notion_page_id` is a DELIVERABLE row in the Oppgaver DB (Type is a
+    recognized discipline — Interiør/Eksteriør/Animasjon/Annet). The Oppgaver
+    DB also holds internal-task rows (e.g. Type="Klargjøre modell") and
+    Korreksjonsrunde sub-rows, but only deliverables ever get a cache row
+    here — the webhook gate filters the rest out before the Frame sync runs.
+    Each deliverable provisions a V00 placeholder file under the project's
+    discipline subfolder; that file becomes the base of Frame's version
+    stack (V01 = first real delivery, V02 = revision after round 1, etc.).
 
     Layout shift (post-flatten): there is no longer a per-leveranse wrapping
     folder. The placeholder file sits directly under the discipline folder,
@@ -383,17 +385,25 @@ class FrameLeveranseFolder(Base):
 
 
 class FrameComment(Base):
-    """Frame.io comment ↔ Notion bullet block on a Korreksjonsrunde Oppgave.
+    """Frame.io comment ↔ Notion Korreksjon row.
 
     One row per Frame comment we've successfully synced. The primary key is
     the Frame comment UUID; INSERTs use ON CONFLICT DO NOTHING for engine-
     level idempotency (a re-delivered webhook for the same comment id is
     a no-op).
 
-    `notion_block_id` is the id of the bullet we wrote to the
-    Korreksjonsrunde Oppgave page. Replies look this up to PATCH a nested
-    child bullet under their parent block (Decision 2 in the Phase 2
-    plan), avoiding the cost of rebuilding the whole bullet section.
+    Column meanings after the DB restructure (Oppgaver + Korreksjoner):
+      - `leveranse_page_id` = the DELIVERABLE row's page id (in the Oppgaver
+        DB). Resolved via the cached placeholder file id, unchanged by the
+        restructure.
+      - `oppgave_page_id` = the per-comment KORREKSJON row's page id (in the
+        Korreksjoner DB). A reply's parent lookup reads the parent comment's
+        `oppgave_page_id` to set the new reply's Parent item relation.
+
+    `notion_block_id` is legacy (the Phase 2 bullet-block model). Unused in
+    the per-row model — replies are separate Korreksjon rows, nested via the
+    Parent item relation, so there's no per-bullet block to track. Kept
+    nullable for old rows.
 
     `parent_comment_id` is set when this comment is a reply (the parent's
     `replies: [...]` array surfaces it). Frame's reply object itself does

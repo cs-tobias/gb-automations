@@ -22,13 +22,12 @@ from gb_automations.config import (
     PROJECTS_TOGGL_URL_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
-    LEVERANSER_FRAME_URL_PROP,
-    LEVERANSER_PROPS,
-    MANUAL_LEVERANSE_STATUSES,
-    OPPGAVE_KIND_KORREKSJON,
-    OPPGAVE_KIND_KORREKSJONSRUNDE,
-    OPPGAVE_KIND_OPPSTART,
+    OPPGAVER_FRAME_URL_PROP,
     OPPGAVER_PROPS,
+    KORREKSJONER_PROPS,
+    MANUAL_DELIVERABLE_STATUSES,
+    KORREKSJON_KIND_KORREKSJON,
+    KORREKSJON_KIND_KORREKSJONSRUNDE,
     SYNC_QUEUE_PROPS,
     settings,
 )
@@ -277,12 +276,12 @@ def read_relation_ids(page: dict[str, Any], prop_name: str) -> list[str]:
 
 
 def task_project_id(page: dict[str, Any]) -> str | None:
-    """Return the single project page id a task is related to, or None.
+    """Return the single project page id an Oppgave row is related to, or None.
 
-    A task should belong to exactly one project; if Notion has more than one
+    A row should belong to exactly one project; if Notion has more than one
     related page we log and use the first — Notion's UI doesn't prevent it.
     """
-    ids = read_relation_ids(page, LEVERANSER_PROPS["project"])
+    ids = read_relation_ids(page, OPPGAVER_PROPS["project"])
     if len(ids) > 1:
         logger.warning(
             "task %s has %d Prosjekt relations; using the first (%s)",
@@ -294,12 +293,12 @@ def task_project_id(page: dict[str, Any]) -> str | None:
 
 
 def task_discipline(page: dict[str, Any]) -> str | None:
-    """Return the task's `Type` single-select option name, or None if unset.
+    """Return the row's `Type` single-select option name, or None if unset.
 
     The raw label (e.g. "Interiør") is what callers pass to the NAS layer; it
     normalizes to a canonical key via DISCIPLINE_KEYS.
     """
-    prop = (page.get("properties") or {}).get(LEVERANSER_PROPS["discipline"]) or {}
+    prop = (page.get("properties") or {}).get(OPPGAVER_PROPS["discipline"]) or {}
     sel = prop.get("select") or {}
     name = sel.get("name")
     return name or None
@@ -366,24 +365,32 @@ async def _query_projects_db(db_id: str) -> list[dict[str, Any]]:
     return [r for r in rows if not r.get("archived") and not r.get("in_trash")]
 
 
-async def tasks_for_project(project_page_id: str) -> list[dict[str, Any]]:
-    """Every non-archived Leveranser row that relates to this project, paginated.
+async def oppgaver_for_project(project_page_id: str) -> list[dict[str, Any]]:
+    """Every non-archived Oppgaver row that relates to this project, paginated.
 
     Used by the project-button flow to derive which discipline branches to
     create — the set of disciplines is "the union of Type across this
-    project's Leveranser", so we don't need a separate discipline field on
-    the project. Returns [] if LEVERANSER_DB_ID is unset (feature disabled)
-    or the project has no Leveranser yet.
-
-    The function name `tasks_for_project` is legacy from the old DB name;
-    callers will be renamed in Step 5's full rename pass.
+    project's Oppgaver", so we don't need a separate discipline field on the
+    project. Both deliverables and internal tasks contribute their discipline
+    (intentional: a project's NAS branches should cover everything the team
+    works on under it). Korreksjonsrunde sub-rows are excluded — their Type is
+    "Korreksjonsrunde", not a discipline. Returns [] if OPPGAVER_DB_ID is
+    unset (feature disabled) or the project has no Oppgaver yet.
     """
-    if not settings.leveranser_db_id:
+    if not settings.oppgaver_db_id:
         return []
     filter_body = {
         "filter": {
-            "property": LEVERANSER_PROPS["project"],
-            "relation": {"contains": project_page_id},
+            "and": [
+                {
+                    "property": OPPGAVER_PROPS["project"],
+                    "relation": {"contains": project_page_id},
+                },
+                {
+                    "property": OPPGAVER_PROPS["kind"],
+                    "select": {"does_not_equal": KORREKSJON_KIND_KORREKSJONSRUNDE},
+                },
+            ]
         }
     }
     rows: list[dict[str, Any]] = []
@@ -394,7 +401,7 @@ async def tasks_for_project(project_page_id: str) -> list[dict[str, Any]]:
             if start_cursor:
                 body["start_cursor"] = start_cursor
             response = await client.post(
-                f"/databases/{settings.leveranser_db_id}/query", json=body
+                f"/databases/{settings.oppgaver_db_id}/query", json=body
             )
             _raise_for_status(response)
             payload = response.json()
@@ -607,31 +614,20 @@ async def create_email_row(properties: dict[str, Any], db_id: str) -> dict[str, 
         return response.json()
 
 
-async def create_oppgave_row(
+async def create_korreksjonsrunde_row(
     *,
-    name: str,
-    leveranse_page_id: str,
-    kind: str,
-    round_number: int | None = None,
-    parent_oppgave_id: str | None = None,
+    deliverable_page_id: str,
+    round_number: int,
 ) -> dict[str, Any]:
-    """Create a row in the Oppgaver DB. Returns the created page object.
+    """Create a "Korreksjonsrunde N" sub-row in the Oppgaver DB, parented
+    (sub-item) under its deliverable. Returns the created page object.
 
-    `kind` is one of OPPGAVE_KIND_OPPSTART / OPPGAVE_KIND_KORREKSJONSRUNDE
-    / OPPGAVE_KIND_KORREKSJON. For an Oppstart row, `round_number` is left
-    null; for a Korreksjonsrunde row, pass the Frame file's version number
-    (V01 → 1, V02 → 2, …); for a Korreksjon row (per-comment), `round_number`
-    is inherited from the parent (caller passes the value).
+    The round row carries Type=Korreksjonsrunde + Runde=N and sits as a
+    sub-item of the deliverable via the OPPGAVER_PROPS["parent"] relation.
+    It is the Notion anchor that the individual Korreksjon rows (in the
+    Korreksjoner DB) relate back to.
 
-    `parent_oppgave_id`, when set, writes the self-referential
-    OPPGAVER_PROPS["parent"] relation so Notion renders this row as a
-    sub-item of the parent. Used by Phase 2.5 to nest:
-      Korreksjon (per-comment row) under Korreksjonsrunde N, and
-      Korreksjon (reply) under its parent Korreksjon (3-level deep).
-
-    The caller is responsible for the dedup check (see
-    `find_oppgave_by_round`) — this function blindly creates.
-
+    Caller is responsible for the dedup check (see find_korreksjonsrunde_row).
     Raises RuntimeError if OPPGAVER_DB_ID is unset.
     """
     if not settings.oppgaver_db_id:
@@ -639,18 +635,15 @@ async def create_oppgave_row(
             "OPPGAVER_DB_ID is not set — Oppgaver writes are disabled."
         )
     properties: dict[str, Any] = {
-        OPPGAVER_PROPS["name"]: {"title": [{"text": {"content": name}}]},
-        OPPGAVER_PROPS["leveranse"]: {
-            "relation": [{"id": leveranse_page_id}]
+        OPPGAVER_PROPS["name"]: {
+            "title": [{"text": {"content": f"Korreksjonsrunde {round_number}"}}]
         },
-        OPPGAVER_PROPS["kind"]: {"select": {"name": kind}},
+        OPPGAVER_PROPS["kind"]: {
+            "select": {"name": KORREKSJON_KIND_KORREKSJONSRUNDE}
+        },
+        OPPGAVER_PROPS["round"]: {"number": round_number},
+        OPPGAVER_PROPS["parent"]: {"relation": [{"id": deliverable_page_id}]},
     }
-    if round_number is not None:
-        properties[OPPGAVER_PROPS["round"]] = {"number": round_number}
-    if parent_oppgave_id is not None:
-        properties[OPPGAVER_PROPS["parent"]] = {
-            "relation": [{"id": parent_oppgave_id}]
-        }
     async with _client() as client:
         response = await _with_retries(
             lambda: client.post(
@@ -660,61 +653,102 @@ async def create_oppgave_row(
                     "properties": properties,
                 },
             ),
-            op_name=f"POST /pages oppgave({kind} round={round_number})",
+            op_name=f"POST /pages korreksjonsrunde(round={round_number})",
         )
         _raise_for_status(response)
         return response.json()
 
 
-async def find_oppgave_by_round(
-    leveranse_page_id: str, round_number: int | None
+async def create_korreksjon_row(
+    *,
+    name: str,
+    korreksjonsrunde_page_id: str,
+    round_number: int,
+    parent_korreksjon_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a Korreksjon row (one per Frame comment) in the Korreksjoner DB.
+    Returns the created page object.
+
+    The row relates to its Korreksjonsrunde row (which lives in the Oppgaver
+    DB) via KORREKSJONER_PROPS["korreksjonsrunde"], carries Runde=N inherited
+    from the round, and Type=Korreksjon.
+
+    `parent_korreksjon_id`, when set, writes the self-referential
+    KORREKSJONER_PROPS["parent"] relation so Notion renders this row as a
+    sub-item — used for replies (a reply Korreksjon nests under the parent
+    comment's Korreksjon, 3-level deep). Replies do NOT carry the
+    Korreksjonsrunde relation: that keeps the round's direct-child count
+    (count_korreksjon_children) free of replies.
+
+    Raises RuntimeError if KORREKSJONER_DB_ID is unset.
+    """
+    if not settings.korreksjoner_db_id:
+        raise RuntimeError(
+            "KORREKSJONER_DB_ID is not set — Korreksjoner writes are disabled."
+        )
+    properties: dict[str, Any] = {
+        KORREKSJONER_PROPS["name"]: {"title": [{"text": {"content": name}}]},
+        KORREKSJONER_PROPS["kind"]: {
+            "select": {"name": KORREKSJON_KIND_KORREKSJON}
+        },
+        KORREKSJONER_PROPS["round"]: {"number": round_number},
+    }
+    if parent_korreksjon_id is not None:
+        # Reply: nest under the parent comment, no direct round relation
+        # (so it doesn't inflate the round's child count).
+        properties[KORREKSJONER_PROPS["parent"]] = {
+            "relation": [{"id": parent_korreksjon_id}]
+        }
+    else:
+        # Top-level comment: direct child of the Korreksjonsrunde.
+        properties[KORREKSJONER_PROPS["korreksjonsrunde"]] = {
+            "relation": [{"id": korreksjonsrunde_page_id}]
+        }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.post(
+                "/pages",
+                json={
+                    "parent": {"database_id": settings.korreksjoner_db_id},
+                    "properties": properties,
+                },
+            ),
+            op_name=f"POST /pages korreksjon(round={round_number})",
+        )
+        _raise_for_status(response)
+        return response.json()
+
+
+async def find_korreksjonsrunde_row(
+    deliverable_page_id: str, round_number: int
 ) -> str | None:
-    """Find an existing Oppgave row for a Leveranse + round, or None.
+    """Find an existing "Korreksjonsrunde N" sub-row for a deliverable, or None.
 
-    `round_number=None` looks for the Oppstart row (kind=Oppstart, no round).
-    Any other value looks for the Korreksjonsrunde N row. Returns the page
-    id of the first non-archived match, or None if there isn't one yet
-    (caller then creates via `create_oppgave_row`).
+    Queries the Oppgaver DB filtering on the sub-item parent relation
+    (contains the deliverable) + Type=Korreksjonsrunde + Runde=N. Returns the
+    page id of the first non-archived match, or None if the round hasn't been
+    created yet (caller then creates via create_korreksjonsrunde_row).
 
-    Returns None silently if OPPGAVER_DB_ID is unset — callers that
-    depend on the lookup decision (e.g. the comment engine that needs to
-    know whether to create round N) MUST also gate on the env, since
-    "couldn't look up" and "doesn't exist" are not the same.
+    Returns None silently if OPPGAVER_DB_ID is unset — callers that depend on
+    the lookup decision MUST also gate on the env, since "couldn't look up"
+    and "doesn't exist" are not the same.
     """
     if not settings.oppgaver_db_id:
         return None
-    # Filter by relation (Leveranse) + kind (Type) + round (Runde or empty).
-    kind_value = (
-        OPPGAVE_KIND_OPPSTART if round_number is None else OPPGAVE_KIND_KORREKSJONSRUNDE
-    )
     conditions: list[dict[str, Any]] = [
         {
-            "property": OPPGAVER_PROPS["leveranse"],
-            "relation": {"contains": leveranse_page_id},
+            "property": OPPGAVER_PROPS["parent"],
+            "relation": {"contains": deliverable_page_id},
         },
         {
             "property": OPPGAVER_PROPS["kind"],
-            "select": {"equals": kind_value},
+            "select": {"equals": KORREKSJON_KIND_KORREKSJONSRUNDE},
+        },
+        {
+            "property": OPPGAVER_PROPS["round"],
+            "number": {"equals": round_number},
         },
     ]
-    if round_number is None:
-        # Distinguish Oppstart from a Korreksjonsrunde row where someone
-        # accidentally cleared the Runde field — require the number to be
-        # empty (kind=Oppstart already encodes "no round" semantically but
-        # we belt-and-suspender against schema drift).
-        conditions.append(
-            {
-                "property": OPPGAVER_PROPS["round"],
-                "number": {"is_empty": True},
-            }
-        )
-    else:
-        conditions.append(
-            {
-                "property": OPPGAVER_PROPS["round"],
-                "number": {"equals": round_number},
-            }
-        )
     body = {
         "filter": {"and": conditions},
         "page_size": 1,
@@ -724,7 +758,7 @@ async def find_oppgave_by_round(
             lambda: client.post(
                 f"/databases/{settings.oppgaver_db_id}/query", json=body
             ),
-            op_name=f"POST /databases/oppgaver/query lookup({kind_value} round={round_number})",
+            op_name=f"POST /databases/oppgaver/query lookup(korreksjonsrunde round={round_number})",
         )
         _raise_for_status(response)
         results = response.json().get("results", [])
@@ -831,57 +865,55 @@ async def set_project_toggl_url(project_page_id: str, url: str | None) -> None:
         _raise_for_status(response)
 
 
-async def set_task_frame_url(task_page_id: str, url: str | None) -> None:
-    """Write the Frame.io URL property on a Leveranser-DB page. Idempotent.
+async def set_deliverable_frame_url(deliverable_page_id: str, url: str | None) -> None:
+    """Write the Frame.io URL property on a deliverable row (Oppgaver DB).
+    Idempotent.
 
-    Same shape and rationale as set_project_frame_url, just for a Leveranse
-    row. Pass `url=None` to clear (e.g. if the Leveranse's Frame folder is
+    Same shape and rationale as set_project_frame_url, just for a deliverable
+    row. Pass `url=None` to clear (e.g. if the deliverable's Frame folder is
     deleted manually and we want the property to reflect "not provisioned").
-
-    Function name `set_task_frame_url` is legacy from the old DB name;
-    callers will be renamed in Step 5's full rename pass.
     """
-    props = {LEVERANSER_FRAME_URL_PROP: {"url": url}}
+    props = {OPPGAVER_FRAME_URL_PROP: {"url": url}}
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
-                f"/pages/{task_page_id}", json={"properties": props}
+                f"/pages/{deliverable_page_id}", json={"properties": props}
             ),
-            op_name=f"PATCH /pages/{task_page_id} frame_url (task)",
+            op_name=f"PATCH /pages/{deliverable_page_id} frame_url (deliverable)",
         )
         _raise_for_status(response)
 
 
 # ============================================================
-# Phase 2.5 — Leveranse Status + Oppgave Ferdig helpers
+# Phase 2.5 — Deliverable Status + Ferdig helpers
 # ============================================================
 
 
-async def get_leveranse_status(leveranse_page_id: str) -> str | None:
-    """Read the current `Status` select option name on a Leveranser page.
+async def get_deliverable_status(deliverable_page_id: str) -> str | None:
+    """Read the current `Status` select option name on a deliverable row.
 
     Returns the option name (e.g. "Klar til oppstart") or None if the
     property is empty / the page doesn't have a Status set yet. Used as
     the read-first half of the "skip if same / skip if manual" gate in
-    `set_leveranse_status`.
+    `set_deliverable_status`.
     """
-    page = await get_page(leveranse_page_id)
-    prop = (page.get("properties") or {}).get(LEVERANSER_PROPS["status"]) or {}
+    page = await get_page(deliverable_page_id)
+    prop = (page.get("properties") or {}).get(OPPGAVER_PROPS["status"]) or {}
     sel = prop.get("select") or {}
     name = sel.get("name")
     return name or None
 
 
-async def set_leveranse_status(
-    leveranse_page_id: str, status_name: str
+async def set_deliverable_status(
+    deliverable_page_id: str, status_name: str
 ) -> str:
-    """Set the `Status` select on a Leveranser page. Single chokepoint
+    """Set the `Status` select on a deliverable row. Single chokepoint
     for auto-writes.
 
     Returns the action taken: "written" | "unchanged" | "skipped_manual".
 
     Three-way guard:
-      1. If the current status is in MANUAL_LEVERANSE_STATUSES
+      1. If the current status is in MANUAL_DELIVERABLE_STATUSES
          (Trenger avklaring, Utgår), return "skipped_manual" without
          writing. The team's manual override always wins; they have to
          move the status out of these states themselves.
@@ -892,43 +924,48 @@ async def set_leveranse_status(
     The read-first behavior is also the loop-prevention guard for the
     cascading webhooks that fire when this status flips.
     """
-    current = await get_leveranse_status(leveranse_page_id)
-    if current in MANUAL_LEVERANSE_STATUSES:
+    current = await get_deliverable_status(deliverable_page_id)
+    if current in MANUAL_DELIVERABLE_STATUSES:
         logger.info(
-            "leveranse_status: skipped (current=%r is a manual state) on %s",
+            "deliverable_status: skipped (current=%r is a manual state) on %s",
             current,
-            leveranse_page_id,
+            deliverable_page_id,
         )
         return "skipped_manual"
     if current == status_name:
         return "unchanged"
-    props = {LEVERANSER_PROPS["status"]: {"select": {"name": status_name}}}
+    props = {OPPGAVER_PROPS["status"]: {"select": {"name": status_name}}}
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
-                f"/pages/{leveranse_page_id}", json={"properties": props}
+                f"/pages/{deliverable_page_id}", json={"properties": props}
             ),
-            op_name=f"PATCH /pages/{leveranse_page_id} status (leveranse)",
+            op_name=f"PATCH /pages/{deliverable_page_id} status (deliverable)",
         )
         _raise_for_status(response)
     logger.info(
-        "leveranse_status: %s → %r on %s",
+        "deliverable_status: %s → %r on %s",
         current or "(empty)",
         status_name,
-        leveranse_page_id,
+        deliverable_page_id,
     )
     return "written"
 
 
-async def get_oppgave_done(oppgave_page_id: str) -> bool:
-    """Read the current `Ferdig` checkbox state on an Oppgaver page."""
-    page = await get_page(oppgave_page_id)
-    prop = (page.get("properties") or {}).get(OPPGAVER_PROPS["done"]) or {}
+async def get_row_done(page_id: str) -> bool:
+    """Read the current `Ferdig` checkbox state on a row.
+
+    DB-agnostic: the `Ferdig` checkbox lives on both Korreksjon rows
+    (Korreksjoner DB) and Korreksjonsrunde sub-rows (Oppgaver DB), and the
+    property name is the same in both schemas, so one helper covers both.
+    """
+    page = await get_page(page_id)
+    prop = (page.get("properties") or {}).get(KORREKSJONER_PROPS["done"]) or {}
     return bool(prop.get("checkbox"))
 
 
-async def set_oppgave_done(oppgave_page_id: str, done: bool) -> str:
-    """Set the `Ferdig` checkbox on an Oppgaver page. Idempotent.
+async def set_row_done(page_id: str, done: bool) -> str:
+    """Set the `Ferdig` checkbox on a row. Idempotent. DB-agnostic.
 
     Returns "written" | "unchanged". Read-first to skip same-value
     writes — this is the loop-prevention guard for the Notion ↔ Frame
@@ -936,59 +973,54 @@ async def set_oppgave_done(oppgave_page_id: str, done: bool) -> str:
     state, Notion's automation will fire back; the resulting
     sync_oppgave_done call reads Frame, sees it already matches the
     new Notion checkbox, and skips the PATCH back. No infinite loop.
+
+    Used for both a Korreksjon row's Ferdig (Korreksjoner DB) and the
+    auto-tick of a Korreksjonsrunde row's own Ferdig (Oppgaver DB).
     """
-    current = await get_oppgave_done(oppgave_page_id)
+    current = await get_row_done(page_id)
     if current == done:
         return "unchanged"
-    props = {OPPGAVER_PROPS["done"]: {"checkbox": done}}
+    props = {KORREKSJONER_PROPS["done"]: {"checkbox": done}}
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
-                f"/pages/{oppgave_page_id}", json={"properties": props}
+                f"/pages/{page_id}", json={"properties": props}
             ),
-            op_name=f"PATCH /pages/{oppgave_page_id} done (oppgave)",
+            op_name=f"PATCH /pages/{page_id} done",
         )
         _raise_for_status(response)
     logger.info(
-        "oppgave_done: %s → %s on %s",
+        "row_done: %s → %s on %s",
         current,
         done,
-        oppgave_page_id,
+        page_id,
     )
     return "written"
 
 
 async def count_korreksjon_children(
-    parent_oppgave_id: str,
+    korreksjonsrunde_page_id: str,
 ) -> tuple[int, int]:
-    """Return (total, done_count) for the Korreksjon children of an Oppgave.
+    """Return (total, done_count) for the Korreksjon rows of a Korreksjonsrunde.
 
-    Used by the status-rollup engine: count the per-comment Korreksjon
-    rows under a Korreksjonsrunde to decide between `Under arbeid`
-    (some done) and `Oppgaver ferdig` (all done).
+    Used by the status-rollup engine: count the per-comment Korreksjon rows
+    (Korreksjoner DB) related to a Korreksjonsrunde row (Oppgaver DB) to
+    decide between `Under arbeid` (some done) and `Oppgaver ferdig` (all
+    done).
 
-    Returns (0, 0) when OPPGAVER_DB_ID is unset or the parent has no
-    children — caller treats both as "leave status alone". Filter:
-    parent relation contains `parent_oppgave_id` + kind = Korreksjon.
-    Reply Korreksjon rows are skipped from the count by filtering on
-    kind — replies share the Korreksjon kind but parent at the
-    comment level, not the runde level, so they aren't direct children
-    of the Korreksjonsrunde anyway.
+    Returns (0, 0) when KORREKSJONER_DB_ID is unset or the round has no
+    Korreksjoner — caller treats both as "leave status alone". Filter:
+    the `Korreksjonsrunde` relation contains `korreksjonsrunde_page_id`.
+    Reply Korreksjon rows are excluded automatically: replies don't carry
+    the round relation (they nest under their parent comment via Parent
+    item), so they never match this filter.
     """
-    if not settings.oppgaver_db_id:
+    if not settings.korreksjoner_db_id:
         return 0, 0
     body = {
         "filter": {
-            "and": [
-                {
-                    "property": OPPGAVER_PROPS["parent"],
-                    "relation": {"contains": parent_oppgave_id},
-                },
-                {
-                    "property": OPPGAVER_PROPS["kind"],
-                    "select": {"equals": OPPGAVE_KIND_KORREKSJON},
-                },
-            ]
+            "property": KORREKSJONER_PROPS["korreksjonsrunde"],
+            "relation": {"contains": korreksjonsrunde_page_id},
         },
         "page_size": 100,
     }
@@ -1001,9 +1033,9 @@ async def count_korreksjon_children(
                 body["start_cursor"] = start_cursor
             response = await _with_retries(
                 lambda: client.post(
-                    f"/databases/{settings.oppgaver_db_id}/query", json=body
+                    f"/databases/{settings.korreksjoner_db_id}/query", json=body
                 ),
-                op_name="POST /databases/oppgaver/query count_korreksjon_children",
+                op_name="POST /databases/korreksjoner/query count_korreksjon_children",
             )
             _raise_for_status(response)
             payload = response.json()
@@ -1012,7 +1044,7 @@ async def count_korreksjon_children(
                     continue
                 total += 1
                 props = row.get("properties") or {}
-                done_prop = props.get(OPPGAVER_PROPS["done"]) or {}
+                done_prop = props.get(KORREKSJONER_PROPS["done"]) or {}
                 if done_prop.get("checkbox"):
                     done += 1
             if not payload.get("has_more"):

@@ -30,14 +30,14 @@ Idempotent and self-healing, mirroring sync_thread:
     project is ADOPTED rather than duplicated (same for nested folders).
 
 The queue worker calls `sync_frame_project` for a `frame_project_sync` task
-and `sync_frame_leveranse` for `frame_leveranse_sync`. Both fan out from the
-existing Notion webhook — the same button click that enqueues a Gmail
-label_sync also enqueues a Frame sync when SYNC_FRAME=true.
+and `sync_frame_leveranse` for `frame_leveranse_sync`. Only deliverable rows
+(Type is a recognized discipline — Interiør/Eksteriør/Animasjon/Annet — in the
+Oppgaver DB) reach the leveranse sync; the webhook gate filters internal tasks
+(e.g. Type="Klargjøre modell") out before enqueuing.
 
-In Phase 2, `sync_frame_leveranse` ALSO auto-creates an "Oppstart" Oppgave
-row alongside the Frame folder + placeholder, so every Leveranse has a
-place to track pre-delivery work. Korreksjonsrunde rows are created later
-by sync_frame_comments when Frame comments arrive.
+Korreksjonsrunde sub-rows are created later by sync_frame_comments (in the
+Oppgaver DB, under their deliverable) when Frame comments arrive; the
+individual Korreksjon rows land in the Korreksjoner DB.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
     DISCIPLINE_KEYS,
     FRAME_DISCIPLINE_FOLDER_NAMES,
-    OPPGAVE_KIND_OPPSTART,
+    STATUS_KLAR_TIL_OPPSTART,
     settings,
 )
 from gb_automations.db import SessionLocal
@@ -478,52 +478,6 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
     return result
 
 
-async def _ensure_oppstart_oppgave(
-    leveranse_page_id: str, leveranse_title: str
-) -> None:
-    """Best-effort: make sure an "Oppstart" Oppgave row exists for this
-    Leveranse. Called from `sync_frame_leveranse` after the Frame folder
-    + placeholder are provisioned.
-
-    Idempotent — re-running is a no-op once the row exists. An
-    Oppgaver-DB outage (or OPPGAVER_DB_ID unset) is logged and swallowed
-    so it can't break the Frame sync: the Leveranse + Frame folder + URL
-    write-back are the contract of `sync_frame_leveranse`; Oppstart is a
-    convenience the team can also create by hand if this fails.
-    """
-    if not settings.oppgaver_db_id:
-        logger.info(
-            "frame: OPPGAVER_DB_ID unset — skipping Oppstart auto-create "
-            "for leveranse %s",
-            leveranse_page_id,
-        )
-        return
-    try:
-        existing = await notion_client.find_oppgave_by_round(
-            leveranse_page_id, round_number=None
-        )
-        if existing:
-            return
-        await notion_client.create_oppgave_row(
-            name="Oppstart",
-            leveranse_page_id=leveranse_page_id,
-            kind=OPPGAVE_KIND_OPPSTART,
-            round_number=None,
-        )
-        logger.info(
-            "frame: created Oppstart Oppgave for leveranse %s (%r)",
-            leveranse_page_id,
-            leveranse_title,
-        )
-    except Exception:
-        logger.exception(
-            "frame: Oppstart auto-create for leveranse %s failed — "
-            "Frame folder still provisioned, team can create the row "
-            "by hand",
-            leveranse_page_id,
-        )
-
-
 async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
     """Mirror one Notion Leveranse page to a Frame.io folder + placeholder
     file under its project's discipline subfolder. Recursively provisions
@@ -720,17 +674,32 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
         return result
 
     try:
-        await notion_client.set_task_frame_url(leveranse_page_id, url)
+        await notion_client.set_deliverable_frame_url(leveranse_page_id, url)
     except Exception:
         logger.exception(
-            "frame: failed to patch Frame URL on leveranse page %s",
+            "frame: failed to patch Frame URL on deliverable page %s",
             leveranse_page_id,
         )
 
-    # Best-effort Oppstart auto-create — independent of the Frame writeback
-    # so a Notion outage on the URL patch doesn't skip the Oppgave creation
-    # (and vice versa). `_ensure_oppstart_oppgave` is itself best-effort.
-    await _ensure_oppstart_oppgave(leveranse_page_id, leveranse_name)
+    # Provisioning a deliverable puts it into the pipeline → set Status to
+    # "Klar til oppstart", but ONLY when it has no status yet. A re-click of
+    # Sync on a deliverable that's already mid-cycle (Under arbeid / Ferdig /
+    # …) must not regress it; and a blank read here means "fresh provision".
+    # set_deliverable_status additionally respects MANUAL_DELIVERABLE_STATUSES,
+    # so a manual override is never overwritten even if it were somehow blank.
+    # Best-effort: a Notion blip here shouldn't fail the Frame sync.
+    try:
+        current_status = await notion_client.get_deliverable_status(leveranse_page_id)
+        if current_status is None:
+            await notion_client.set_deliverable_status(
+                leveranse_page_id, STATUS_KLAR_TIL_OPPSTART
+            )
+    except Exception:
+        logger.exception(
+            "frame: failed to set initial Status on deliverable page %s "
+            "(non-fatal)",
+            leveranse_page_id,
+        )
 
     result.action = action
     # `frame_folder_id` on the result now records the (shared) discipline

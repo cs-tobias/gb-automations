@@ -40,7 +40,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
-from gb_automations.config import EMAILS_PROPS, settings
+from gb_automations.config import DISCIPLINE_KEYS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.jobs import queue_worker
 from gb_automations.models import EmailRow, SyncCursor, User
@@ -137,19 +137,19 @@ def _page_parented_to_projects_db(page: dict[str, Any]) -> bool:
     return parent_db == target
 
 
-def _page_parented_to_leveranser_db(page: dict[str, Any]) -> bool:
-    """Parent check: page is a row in the configured Leveranser database.
+def _page_parented_to_oppgaver_db(page: dict[str, Any]) -> bool:
+    """Parent check: page is a row in the configured Oppgaver database.
 
-    Unlike the Projects check, an unset LEVERANSER_DB_ID means "Leveranse
+    Unlike the Projects check, an unset OPPGAVER_DB_ID means "Oppgaver-row
     webhooks disabled" rather than "skip the check" — we never want to
-    misroute a project-button click as a Leveranse-folder sync. Returns
+    misroute a project-button click as an Oppgaver-folder sync. Returns
     False if unset.
     """
-    if not settings.leveranser_db_id:
+    if not settings.oppgaver_db_id:
         return False
     parent = page.get("parent") or {}
     parent_db = (parent.get("database_id") or "").replace("-", "").lower()
-    target = settings.leveranser_db_id.replace("-", "").lower()
+    target = settings.oppgaver_db_id.replace("-", "").lower()
     return parent_db == target
 
 
@@ -536,20 +536,20 @@ async def _notion_oppgave_done_impl(request: Request) -> Response:
     data = payload.get("data") or {}
     page_id = data.get("id")
     parent = (data.get("parent") or {}).get("database_id") or ""
-    target_db = (settings.oppgaver_db_id or "").replace("-", "").lower()
+    target_db = (settings.korreksjoner_db_id or "").replace("-", "").lower()
     payload_db = parent.replace("-", "").lower()
 
     if not page_id:
         logger.warning("oppgave-done: no page id in payload")
         return _json({"action": "skipped", "reason": "no page id"})
 
-    # Defense: confirm the row really is in the Oppgaver DB (the
-    # automation should only target that DB, but a misconfigured
-    # automation pointing at Korreksjoner or another DB would silently
-    # send junk events here otherwise).
+    # Defense: confirm the row really is in the Korreksjoner DB (the
+    # automation fires on a Korreksjon row's Ferdig toggle, so it should
+    # only target that DB; a misconfigured automation pointing at another
+    # DB would silently send junk events here otherwise).
     if target_db and payload_db != target_db:
         logger.info(
-            "oppgave-done: page %s parent DB %s does not match OPPGAVER_DB_ID — skipping",
+            "oppgave-done: page %s parent DB %s does not match KORREKSJONER_DB_ID — skipping",
             page_id,
             parent,
         )
@@ -608,20 +608,41 @@ async def _notion_webhook_impl(request: Request) -> Response:
     parent_db = (page.get("parent") or {}).get("database_id")
     logger.info("↳ click parent.database_id=%s page=%s", parent_db, page_id)
 
-    # Leveranser DB takes priority: same button on a Leveranse row → folder
-    # sync (NAS + Frame). The project-DB check below is a `True` no-op if
-    # PROJECTS_DB_ID is unset (used as "skip the gate" for dev), so we
-    # check Leveranser first to avoid a Leveranse-row click being misrouted
+    # Oppgaver DB takes priority: the per-row "Sync" button on a deliverable
+    # row → folder sync (NAS + Frame). The project-DB check below is a `True`
+    # no-op if PROJECTS_DB_ID is unset (used as "skip the gate" for dev), so
+    # we check Oppgaver first to avoid an Oppgaver-row click being misrouted
     # as a project sync in that mode.
-    if _page_parented_to_leveranser_db(page):
+    if _page_parented_to_oppgaver_db(page):
         title = notion_client.extract_page_title(page)
         if not title:
-            logger.info("↳ task %s has no title yet, skipping", page_id)
+            logger.info("↳ oppgave %s has no title yet, skipping", page_id)
             return _json(
                 {
                     "page_id": page_id,
                     "action": "skipped",
-                    "reason": "task has no title yet",
+                    "reason": "row has no title yet",
+                }
+            )
+        # The Oppgaver DB holds BOTH deliverables and internal tasks,
+        # distinguished by `Type`: a real discipline (Interiør/Eksteriør/
+        # Animasjon/Annet) is a deliverable and gets Frame + NAS provisioning;
+        # any other Type (e.g. "Klargjøre modell") or a blank Type is an
+        # internal task — nothing to mirror, skip cleanly.
+        discipline = notion_client.task_discipline(page)
+        discipline_key = DISCIPLINE_KEYS.get((discipline or "").strip().lower())
+        if not discipline_key:
+            logger.info(
+                "↳ oppgave %s is not a deliverable (type=%r is not a discipline) — skipping",
+                page_id,
+                discipline,
+            )
+            return _json(
+                {
+                    "page_id": page_id,
+                    "action": "skipped",
+                    "reason": "not a deliverable (Type is not a discipline)",
+                    "type": discipline,
                 }
             )
         inserted = await enqueue_task_folder_sync(page_id)
@@ -633,7 +654,7 @@ async def _notion_webhook_impl(request: Request) -> Response:
             frame_inserted = await enqueue_frame_leveranse_sync(page_id)
         queue_worker.wake()
         logger.info(
-            "📋 task folder sync requested for %r (page %s) — nas=%s frame=%s",
+            "📋 deliverable folder sync requested for %r (page %s) — nas=%s frame=%s",
             title,
             page_id,
             "enqueued" if inserted else "already queued",

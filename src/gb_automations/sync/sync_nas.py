@@ -154,7 +154,7 @@ async def sync_nas_folder(project_page_id: str) -> NasSyncResult:
     # task on a transient Notion blip).
     disciplines: list[str] = []
     try:
-        task_pages = await notion_client.tasks_for_project(project_page_id)
+        task_pages = await notion_client.oppgaver_for_project(project_page_id)
         for task_page in task_pages:
             label = notion_client.task_discipline(task_page)
             if label:

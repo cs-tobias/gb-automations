@@ -47,16 +47,24 @@ App is schema-agnostic — only the DB ID is needed (`PROJECTS_DB_ID`). Existing
 
 ---
 
-## Leveranser DB (one row per deliverable image / render)
+## Oppgaver DB (deliverables + internal tasks + Korreksjonsrunde sub-rows)
 
-`LEVERANSER_DB_ID` — historically called the Oppgaver DB, renamed in Phase 2. Each row is a deliverable entity (e.g. "Stue v1"); the Frame.io folder + version stack lives against this row.
+`OPPGAVER_DB_ID` (falls back to `LEVERANSER_DB_ID` / `TASKS_DB_ID` for un-migrated .env files). One DB holding everything the team works on:
+
+- **Deliverables** — `Type` is a real discipline (Interiør/Eksteriør/Animasjon/Annet). The Frame.io folder + version stack lives against this row. Only these get Frame/NAS provisioning.
+- **Internal tasks** — `Type=Klargjøre modell` (or any other non-discipline value, or blank). General prep/project work. No Frame.
+- **Korreksjonsrunde N** — sub-rows of a deliverable (via `Parent item`), `Type=Korreksjonsrunde`, auto-created on the first Frame comment of round N.
+
+`Type` carries both axes: the four disciplines mean "deliverable, in this discipline" (and a view grouped by `Type` puts all Eksteriør work together); `Klargjøre modell` (or anything not in the discipline list) means "internal task". The Frame/NAS gate is simply "is `Type` a recognized discipline?". There is NO separate Kategori property.
 
 Navn (title)
 Prosjekt (relation → Projects)
-Type (single_select) — Interiør / Eksteriør / Animasjon
-Frame.io (url) — auto-written by sync_frame_leveranse
-Status (single_select) — see options below; auto-managed in Phase 2.5
-Oppgaver (relation → Oppgaver) — inverse of Oppgaver.Leveranse
+Type (single_select) — Interiør / Eksteriør / Animasjon / Annet / Klargjøre modell (and `Korreksjonsrunde` on round sub-rows)
+Frame.io (url) — auto-written by sync_frame_leveranse on deliverables
+Status (single_select) — deliverable lifecycle, see options below; auto-managed in Phase 2.5
+Runde (number) — round N on Korreksjonsrunde sub-rows
+Ferdig (checkbox) — on Korreksjonsrunde sub-rows; auto-ticks when the round is fully done
+Parent item (self-referential relation, Notion sub-items feature) — Korreksjonsrunde rows point at their deliverable
 
 Status select options (Phase 2.5):
 
@@ -69,19 +77,13 @@ Status select options (Phase 2.5):
 
 ---
 
-## Oppgaver DB (the actual tasks)
+## Korreksjoner DB (individual feedback items, one row per Frame comment)
 
-`OPPGAVER_DB_ID` — new in Phase 2. Three row kinds (see `Type` select).
+`KORREKSJONER_DB_ID` — must be set explicitly (does NOT fall back to the old `OPPGAVER_DB_ID` name, which now points at the deliverables DB above).
 
-Navn (title)
-Leveranse (relation → Leveranser, single page)
-Type (single_select) — see kinds below
-Runde (number) — round N for Korreksjonsrunde/Korreksjon rows; null for Oppstart
+Navn (title) — author + comment text
+Korreksjonsrunde (relation → Oppgaver, single page) — the Korreksjonsrunde N row this comment belongs to
+Type (single_select) — `Korreksjon`
+Runde (number) — inherited from the round
 Ferdig (checkbox) — bidirectional Phase 2.5: ticking propagates to the linked Frame comment's `completed_at` and back
-Parent item (self-referential relation, auto-created by Notion's sub-items feature) — Korreksjon rows point at their Korreksjonsrunde; reply Korreksjon rows point at the parent comment's Korreksjon row (3-level nesting)
-
-Type select options:
-
-- `Oppstart` — auto-created on Leveranse Initialize. Pre-delivery work. Round empty.
-- `Korreksjonsrunde` — auto-created on the first Frame comment of round N. Parent of N Korreksjon rows.
-- `Korreksjon` — auto-created on every Frame comment. One row per comment. Replies are also Korreksjon rows nested under their parent (3-deep).
+Parent item (self-referential relation, Notion sub-items feature) — a reply Korreksjon points at the parent comment's Korreksjon row (3-level nesting). Replies do NOT carry the Korreksjonsrunde relation, so they're excluded from the round's rollup count.
