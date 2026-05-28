@@ -61,9 +61,8 @@ Navn (title)
 Prosjekt (relation → Projects)
 Type (single_select) — Interiør / Eksteriør / Animasjon / Annet / Klargjøre modell (and `Korreksjonsrunde` on round sub-rows)
 Frame.io (url) — auto-written by sync_frame_leveranse on deliverables
-Status (single_select) — deliverable lifecycle, see options below; auto-managed in Phase 2.5
-Runde (number) — round N on Korreksjonsrunde sub-rows
-Ferdig (checkbox) — on Korreksjonsrunde sub-rows; auto-ticks when the round is fully done
+Status (single_select) — deliverable lifecycle, see options below; auto-managed in Phase 2.5. Reaching `Oppgaver ferdig` IS the round-done signal — there is no per-round Ferdig checkbox.
+Runde (number) — round N on Korreksjonsrunde sub-rows (engine plumbing for dedup + active-round detection; team can hide it in views)
 Parent item (self-referential relation, Notion sub-items feature) — Korreksjonsrunde rows point at their deliverable
 
 Status select options (Phase 2.5):
@@ -83,7 +82,9 @@ Status select options (Phase 2.5):
 
 Navn (title) — author + comment text
 Korreksjonsrunde (relation → Oppgaver, single page) — the Korreksjonsrunde N row this comment belongs to
-Type (single_select) — `Korreksjon`
-Runde (number) — inherited from the round
+Prosjekt (relation → Projects, single page) — the project this comment's deliverable belongs to; auto-written on every Korreksjon (incl. replies) so the feedback list is filterable/groupable by project
+Runde (number) — inherited from the round; UX-only filter, not read by the engine
 Ferdig (checkbox) — bidirectional Phase 2.5: ticking propagates to the linked Frame comment's `completed_at` and back
 Parent item (self-referential relation, Notion sub-items feature) — a reply Korreksjon points at the parent comment's Korreksjon row (3-level nesting). Replies do NOT carry the Korreksjonsrunde relation, so they're excluded from the round's rollup count.
+
+(No `Type` property — every row in this DB is a Korreksjon by construction.)

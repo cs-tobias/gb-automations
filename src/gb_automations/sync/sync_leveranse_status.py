@@ -21,10 +21,11 @@ Algorithm:
        - done == 0:               leave status alone (don't downgrade from
                                   Klar til oppstart).
        - 0 < done < total:        Under arbeid.
-       - done == total > 0:       Oppgaver ferdig. Also auto-tick the
-                                  round row's own Ferdig checkbox.
+       - done == total > 0:       Oppgaver ferdig.
   4. Call set_deliverable_status. Read-first / skip-if-same handles the
-     "no actual change" case.
+     "no actual change" case. The deliverable Status reaching
+     `Oppgaver ferdig` IS the round-done signal — there's no per-round
+     checkbox.
 
 Idempotent — the rollup is a pure function of the current Oppgaver
 state. Multiple consecutive recheck tasks on the same Leveranse
@@ -233,21 +234,6 @@ async def recheck_leveranse_status(
         return result
 
     result.action = action  # written | unchanged | skipped_manual
-
-    # When all Korreksjoner of the round are done, auto-tick the round
-    # row's own Ferdig checkbox too (it lives in the Oppgaver DB). Visual
-    # signal that the round is wrapped up. set_row_done is read-first/
-    # idempotent so an already-ticked round is a no-op. We DO NOT auto-untick
-    # on a downgrade — the team can manually flip it back if they reopened a
-    # round on purpose.
-    if done == total and total > 0:
-        try:
-            await notion_client.set_row_done(runde_oppgave_id, True)
-        except Exception:
-            logger.exception(
-                "leveranse_status: auto-tick round %s Ferdig failed (non-fatal)",
-                runde_oppgave_id,
-            )
 
     logger.info(
         "leveranse_status: leveranse %s round %s (%d/%d done) → %s (%s)",

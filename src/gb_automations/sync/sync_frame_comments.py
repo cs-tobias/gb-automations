@@ -485,6 +485,7 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
             name=name,
             korreksjonsrunde_page_id=runde_oppgave_id,
             round_number=round_number,
+            project_page_id=project_page_id,
             parent_korreksjon_id=parent_korreksjon_id,
         )
     except Exception as err:  # noqa: BLE001

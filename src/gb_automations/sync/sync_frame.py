@@ -511,12 +511,18 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
     discipline_label = notion_client.task_discipline(page)
 
     if not leveranse_name:
+        logger.info("frame: leveranse %s has no title yet — skipping", leveranse_page_id)
         result.note = "no title yet"
         return result
     if not project_page_id:
+        logger.info(
+            "frame: leveranse %r has no Prosjekt relation — skipping",
+            leveranse_name,
+        )
         result.note = "no project relation"
         return result
     if not discipline_label:
+        logger.info("frame: leveranse %r has no Type — skipping", leveranse_name)
         result.note = "no Type (discipline) set"
         return result
 

@@ -26,7 +26,6 @@ from gb_automations.config import (
     OPPGAVER_PROPS,
     KORREKSJONER_PROPS,
     MANUAL_DELIVERABLE_STATUSES,
-    KORREKSJON_KIND_KORREKSJON,
     KORREKSJON_KIND_KORREKSJONSRUNDE,
     SYNC_QUEUE_PROPS,
     settings,
@@ -664,14 +663,21 @@ async def create_korreksjon_row(
     name: str,
     korreksjonsrunde_page_id: str,
     round_number: int,
+    project_page_id: str | None = None,
     parent_korreksjon_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a Korreksjon row (one per Frame comment) in the Korreksjoner DB.
     Returns the created page object.
 
     The row relates to its Korreksjonsrunde row (which lives in the Oppgaver
-    DB) via KORREKSJONER_PROPS["korreksjonsrunde"], carries Runde=N inherited
-    from the round, and Type=Korreksjon.
+    DB) via KORREKSJONER_PROPS["korreksjonsrunde"] and carries Runde=N
+    inherited from the round. There's no per-row Type: every row in the
+    Korreksjoner DB is a Korreksjon by construction.
+
+    `project_page_id`, when set, writes the KORREKSJONER_PROPS["project"]
+    relation → Projects DB, denormalized onto the row so the feedback list is
+    filterable/groupable by project. Set on top-level comments AND replies.
+    Skipped silently if None (the row still lands; the relation is just empty).
 
     `parent_korreksjon_id`, when set, writes the self-referential
     KORREKSJONER_PROPS["parent"] relation so Notion renders this row as a
@@ -688,11 +694,12 @@ async def create_korreksjon_row(
         )
     properties: dict[str, Any] = {
         KORREKSJONER_PROPS["name"]: {"title": [{"text": {"content": name}}]},
-        KORREKSJONER_PROPS["kind"]: {
-            "select": {"name": KORREKSJON_KIND_KORREKSJON}
-        },
         KORREKSJONER_PROPS["round"]: {"number": round_number},
     }
+    if project_page_id is not None:
+        properties[KORREKSJONER_PROPS["project"]] = {
+            "relation": [{"id": project_page_id}]
+        }
     if parent_korreksjon_id is not None:
         # Reply: nest under the parent comment, no direct round relation
         # (so it doesn't inflate the round's child count).
@@ -953,19 +960,17 @@ async def set_deliverable_status(
 
 
 async def get_row_done(page_id: str) -> bool:
-    """Read the current `Ferdig` checkbox state on a row.
-
-    DB-agnostic: the `Ferdig` checkbox lives on both Korreksjon rows
-    (Korreksjoner DB) and Korreksjonsrunde sub-rows (Oppgaver DB), and the
-    property name is the same in both schemas, so one helper covers both.
-    """
+    """Read the current `Ferdig` checkbox state on a Korreksjon row
+    (Korreksjoner DB). The Oppgaver DB no longer has a Ferdig checkbox, so
+    this is only ever called on Korreksjon rows."""
     page = await get_page(page_id)
     prop = (page.get("properties") or {}).get(KORREKSJONER_PROPS["done"]) or {}
     return bool(prop.get("checkbox"))
 
 
 async def set_row_done(page_id: str, done: bool) -> str:
-    """Set the `Ferdig` checkbox on a row. Idempotent. DB-agnostic.
+    """Set the `Ferdig` checkbox on a Korreksjon row (Korreksjoner DB).
+    Idempotent.
 
     Returns "written" | "unchanged". Read-first to skip same-value
     writes — this is the loop-prevention guard for the Notion ↔ Frame
@@ -973,9 +978,6 @@ async def set_row_done(page_id: str, done: bool) -> str:
     state, Notion's automation will fire back; the resulting
     sync_oppgave_done call reads Frame, sees it already matches the
     new Notion checkbox, and skips the PATCH back. No infinite loop.
-
-    Used for both a Korreksjon row's Ferdig (Korreksjoner DB) and the
-    auto-tick of a Korreksjonsrunde row's own Ferdig (Oppgaver DB).
     """
     current = await get_row_done(page_id)
     if current == done:

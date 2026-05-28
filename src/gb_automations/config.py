@@ -496,22 +496,23 @@ FRAME_DISCIPLINE_FOLDER_NAMES = {
 # normalizes the disciplines to canonical keys (interior/exterior/animation/
 # other); a Type that isn't in DISCIPLINE_KEYS is the internal-task marker, so
 # the Frame/NAS gate is simply "is Type a recognized discipline?". The
-# Korreksjonsrunde sub-rows reuse the `kind` (Type) + `round` + `done` +
-# `parent` slots.
+# Korreksjonsrunde sub-rows reuse the `kind` (Type) + `round` + `parent` slots.
 OPPGAVER_PROPS = {
     "name": "Navn",            # title
     "project": "Prosjekt",     # relation → Projects DB
     "discipline": "Type",      # single_select: Interiør / Eksteriør / Animasjon / Annet / Klargjøre modell
     # Deliverable lifecycle state. Driven by Frame events + Korreksjon
     # rollup (see STATUS_* constants). Left blank on internal-task rows.
+    # This select IS the round-done signal too: when all of a round's
+    # Korreksjoner are done, the rollup sets the deliverable to
+    # `Oppgaver ferdig` — there's no per-round Ferdig checkbox.
     "status": "Status",
-    # Korreksjonsrunde sub-rows reuse these three. On deliverable / internal
+    # Korreksjonsrunde sub-rows reuse these two. On deliverable / internal
     # rows they're unused. `kind` shares the `Type` column with discipline —
     # a Korreksjonsrunde sub-row carries Type="Korreksjonsrunde", which is
     # outside the discipline set, so the two never collide on one row.
     "kind": "Type",
     "round": "Runde",          # number — round N on Korreksjonsrunde sub-rows
-    "done": "Ferdig",          # checkbox — auto-ticks when the round is fully done
     # Self-referential "sub-items" relation (Notion auto-creates it when
     # sub-items are enabled; default label "Parent item"). Korreksjonsrunde
     # sub-rows point at their deliverable.
@@ -526,7 +527,13 @@ KORREKSJONER_PROPS = {
     "name": "Navn",                        # title — author + comment text
     # relation → Oppgaver DB: the Korreksjonsrunde N row this comment belongs to.
     "korreksjonsrunde": "Korreksjonsrunde",
-    "kind": "Type",                        # single_select: KORREKSJON_KIND_KORREKSJON
+    # relation → Projects DB: the project this comment's deliverable belongs to.
+    # Denormalized onto every Korreksjon (incl. replies) so the feedback list is
+    # filterable/groupable by project at a glance, without traversing the
+    # Korreksjonsrunde → deliverable → Prosjekt chain.
+    "project": "Prosjekt",
+    # No `kind` discriminator: every row in this DB is a Korreksjon by
+    # construction, so storing the type on each row was redundant.
     "round": "Runde",                      # number — inherited from the round
     # Checkbox. Bidirectionally syncs with the Frame comment's `completed`
     # state: a Notion toggle PATCHes Frame; a Frame ✓ writes here.
@@ -536,17 +543,13 @@ KORREKSJONER_PROPS = {
     "parent": "Parent item",
 }
 
-# `Type`/`kind` values that mark a row as a correction-round container
-# (Oppgaver DB) or an individual feedback item (Korreksjoner DB). Oppstart
-# was dropped — general internal Oppgaver rows replace the auto-created
-# pre-delivery anchor.
-#   - Korreksjonsrunde: a sub-row under a deliverable in the Oppgaver DB,
-#     auto-created on the first Frame comment of round N (round=N).
-#   - Korreksjon: a row in the Korreksjoner DB, one per Frame comment.
-#     Replies are also Korreksjon rows, parented (Parent item) to the
-#     comment they reply to. Round inherited from the Korreksjonsrunde.
+# `Type` value that marks an Oppgaver-DB sub-row as a correction-round
+# container. A Korreksjonsrunde is a sub-row under a deliverable, auto-created
+# on the first Frame comment of round N (round=N), and carries Type=
+# "Korreksjonsrunde" — outside the discipline set, so the discipline gate
+# ignores it. (The Korreksjoner DB no longer stores a per-row kind: every row
+# there is a Korreksjon by construction.)
 KORREKSJON_KIND_KORREKSJONSRUNDE = "Korreksjonsrunde"
-KORREKSJON_KIND_KORREKSJON = "Korreksjon"
 
 
 # Phase 2.5 — Status options on the Oppgaver DB's `Status` select (deliverables).

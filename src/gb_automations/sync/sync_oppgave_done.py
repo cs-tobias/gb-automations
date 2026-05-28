@@ -6,19 +6,17 @@ The receiver enqueues `oppgave_done_sync` with the page id; this engine
 drains it.
 
 Algorithm:
-  1. GET the Korreksjon page; read current `Ferdig` checkbox + `Type`.
-  2. Skip non-Korreksjon rows (defensive — the automation targets the
-     Korreksjoner DB, but a stray row of another kind is ignored).
-     A Korreksjonsrunde row's own Ferdig is auto-ticked by the rollup
-     engine, not via this path.
-  3. Find the linked FrameComment by oppgave_page_id (= the Korreksjon
+  1. GET the Korreksjon page; read its current `Ferdig` checkbox.
+  2. Find the linked FrameComment by oppgave_page_id (= the Korreksjon
      page id). None → row was manually created, or a legacy row — skip.
-  4. GET the Frame comment's current `completed_at`. If it already
+     (No per-row kind check: every row in the Korreksjoner DB is a
+     Korreksjon by construction, and the webhook already guards the DB.)
+  3. GET the Frame comment's current `completed_at`. If it already
      matches Notion's checkbox state, skip (LOOP GUARD: we're seeing
      our own write bouncing back via Frame's webhook → our engine →
      Notion's automation → this receiver).
-  5. `frame.set_comment_completed(comment_id, checkbox)`.
-  6. Enqueue `leveranse_status_recheck` so the rollup runs.
+  4. `frame.set_comment_completed(comment_id, checkbox)`.
+  5. Enqueue `leveranse_status_recheck` so the rollup runs.
 
 Idempotent: re-running the same Korreksjon page id with the same checkbox
 state is a no-op via the loop guard.
@@ -34,7 +32,6 @@ from sqlalchemy import select
 from gb_automations.clients import frame as frame_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
-    KORREKSJON_KIND_KORREKSJON,
     KORREKSJONER_PROPS,
     settings,
 )
@@ -72,12 +69,12 @@ async def sync_oppgave_done(oppgave_page_id: str) -> OppgaveDoneResult:
         result.note = "SYNC_FRAME=false"
         return result
 
-    # 1. Read the Oppgave's current Ferdig + Type.
+    # 1. Read the Korreksjon row's current Ferdig.
     try:
         page = await notion_client.get_page(oppgave_page_id)
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "oppgave_done: failed to GET Oppgave page %s",
+            "oppgave_done: failed to GET Korreksjon page %s",
             oppgave_page_id,
         )
         result.action = "failed"
@@ -85,26 +82,15 @@ async def sync_oppgave_done(oppgave_page_id: str) -> OppgaveDoneResult:
         return result
 
     props = page.get("properties") or {}
-    kind_prop = props.get(KORREKSJONER_PROPS["kind"]) or {}
-    kind = (kind_prop.get("select") or {}).get("name")
     done_prop = props.get(KORREKSJONER_PROPS["done"]) or {}
     desired_done = bool(done_prop.get("checkbox"))
     result.desired_done = desired_done
 
-    # 2. Only Korreksjon rows (per-comment) participate in this sync.
-    # Defensive: a Korreksjonsrunde row's Ferdig is managed by the rollup
-    # engine, not here, and shouldn't reach this DB's automation anyway.
-    if kind != KORREKSJON_KIND_KORREKSJON:
-        logger.info(
-            "oppgave_done: page %s has kind=%r (not Korreksjon) — skipping",
-            oppgave_page_id,
-            kind,
-        )
-        result.action = "skipped"
-        result.note = f"kind={kind!r}, not Korreksjon"
-        return result
-
-    # 3. Find the linked Frame comment.
+    # 2. Find the linked Frame comment. The webhook already guards that this
+    # event came from the Korreksjoner DB, and every row there is a Korreksjon
+    # by construction, so there's no per-row kind to check — a row with no
+    # cached Frame comment (manual row, or a row we don't track) just skips
+    # at the lookup below.
     async with SessionLocal() as session:
         stmt = select(FrameComment).where(
             FrameComment.oppgave_page_id == oppgave_page_id
@@ -125,7 +111,7 @@ async def sync_oppgave_done(oppgave_page_id: str) -> OppgaveDoneResult:
     result.frame_comment_id = comment_id
     result.leveranse_page_id = comment_row.leveranse_page_id
 
-    # 4. Read Frame's current state. If it already matches Notion's
+    # 3. Read Frame's current state. If it already matches Notion's
     # checkbox, we're seeing our own write bouncing back through the
     # webhook cycle → no-op.
     try:
@@ -162,7 +148,7 @@ async def sync_oppgave_done(oppgave_page_id: str) -> OppgaveDoneResult:
         await _enqueue_recheck(comment_row.leveranse_page_id)
         return result
 
-    # 5. PATCH Frame to match Notion.
+    # 4. PATCH Frame to match Notion.
     try:
         await frame_client.set_comment_completed(comment_id, desired_done)
     except Exception as err:  # noqa: BLE001
@@ -182,7 +168,7 @@ async def sync_oppgave_done(oppgave_page_id: str) -> OppgaveDoneResult:
         desired_done,
     )
 
-    # 6. Enqueue rollup recheck.
+    # 5. Enqueue rollup recheck.
     await _enqueue_recheck(comment_row.leveranse_page_id)
     return result
 

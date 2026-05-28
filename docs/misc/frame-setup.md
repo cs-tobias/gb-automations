@@ -106,7 +106,7 @@ What this adds on top of Phase 1:
    - `Ferdig`
    - `Utgår`
 
-2. **Add `Ferdig` checkbox properties** to BOTH the Oppgaver DB (for the Korreksjonsrunde sub-rows) and the Korreksjoner DB (for the individual feedback items).
+2. **Add a `Ferdig` checkbox property to the Korreksjoner DB** (for the individual feedback items). The Oppgaver DB has NO Ferdig checkbox — a round's completion is signalled by the deliverable `Status` reaching `Oppgaver ferdig`, not a per-round checkbox.
 
 3. **Enable sub-items on BOTH DBs.** Newer Notion auto-creates the `Parent item` relation. In the Oppgaver DB, Korreksjonsrunde rows are sub-items of their deliverable. In the Korreksjoner DB, reply rows are sub-items of the parent comment's row. The default relation label is `"Parent item"` (`OPPGAVER_PROPS["parent"]` / `KORREKSJONER_PROPS["parent"]` in `config.py`) — rename if your workspace uses a different label.
 
@@ -145,7 +145,7 @@ What this adds on top of Phase 1:
 
 4. **Tick checkbox in Notion → Frame updates.** On another open Korreksjon row, check `Ferdig` in Notion. Within seconds, the linked Frame comment's `completed_at` populates (visible by reopening the comment in Frame's UI — it shows ✓ resolved).
 
-5. **All done → Oppgaver ferdig.** Resolve the last open comment in either tool. Status → **Oppgaver ferdig**. The Korreksjonsrunde sub-row's own `Ferdig` checkbox auto-ticks.
+5. **All done → Oppgaver ferdig.** Resolve the last open comment in either tool. The deliverable's `Status` → **Oppgaver ferdig** — that status IS the round-done signal (there's no per-round checkbox).
 
 6. **Re-upload V02 → Ferdig.** Drag a new image as V02. Status → **Ferdig**. The old Korreksjonsrunde 1 stays in Notion as history.
 
