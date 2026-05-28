@@ -164,6 +164,16 @@ docker compose logs -f api | grep -v "GET /health"
 # need the container; they run against the source tree.
 uv run pytest
 
+# WINDOWS NOTE: on Tobias's Windows dev box `uv` is NOT on the shell PATH
+# (PowerShell or Bash), so `uv run pytest` fails with "command not found".
+# Use a one-time sidecar venv instead (pattern proven across prior chats):
+#   python -m venv .venv-test
+#   .\.venv-test\Scripts\python.exe -m pip install -q pytest pytest-asyncio -e .
+#   .\.venv-test\Scripts\python.exe -m pytest --tb=short
+# .venv-test/ is gitignored (a throwaway); reuse it if it already exists rather
+# than recreating. Run from the repo root in PowerShell. NEVER `git add .` with
+# it present without confirming .venv-test/ is ignored — it's thousands of files.
+
 # reload .env (restart does NOT reload it — must --force-recreate)
 docker compose up -d --force-recreate api
 
