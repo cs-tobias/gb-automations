@@ -7,10 +7,10 @@ folder structure inside it:
     <workspace>/<ProjectName> (Frame Project)
                  └── (project's root_folder_id, auto-created by Frame)
                      ├── Interiør/
-                     │   ├── <project>_..._<LeveranseA>_V00.png
-                     │   └── <project>_..._<LeveranseB>_V00.png
+                     │   ├── <LeveranseA>_<studio>_V00.png
+                     │   └── <LeveranseB>_<studio>_V00.png
                      └── Eksteriør/
-                         └── <project>_..._<LeveranseC>_V00.png
+                         └── <LeveranseC>_<studio>_V00.png
 
 Each Notion Project is its own top-level Frame Project, visible in Frame V4's
 "Active Projects" view. Discipline folders are lazily created from each
@@ -73,18 +73,20 @@ _discipline_folder_cache: dict[tuple[str, str], str] = {}
 def _placeholder_filename(project_name: str, task_name: str) -> str:
     """Build the per-task placeholder filename.
 
-    Shape: `<project>_<studio>_<task>_V00.png` — e.g.
-    `1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png`. The placeholder
-    is always V00; the team's first real delivery uploads on top as V01 in
-    Frame's version stack.
+    Shape: `<task>_<studio>_V00.png` — e.g. `Vinkel 1_Goldbox.no_V00.png`.
+    The leveranse name alone (no project prefix) keeps filenames uniquely
+    labelled within a shared discipline folder while matching the format
+    Goldbox wants to see in Frame. The placeholder is always V00; the team's
+    first real delivery uploads on top as V01 in Frame's version stack.
 
     The studio slot comes from settings.frame_filename_studio (default
     "Goldbox.no"). Renaming the studio in .env affects only NEW placeholders
     — existing uploads keep their filename (Frame's version stack is keyed
-    by file slot, not name).
+    by file slot, not name). `project_name` is no longer part of the filename
+    but is kept in the signature so callers don't need to change.
     """
     studio = settings.frame_filename_studio or "Goldbox.no"
-    return f"{project_name}_{studio}_{task_name}_V00.png"
+    return f"{task_name}_{studio}_V00.png"
 
 # Frame's V4 API returns a canonical `view_url` on every project/folder/file
 # response, so we just persist what Frame gives us instead of building URLs
@@ -601,11 +603,10 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
         project_id_for_url = project_row.frame_project_id
 
         # Per-leveranse placeholder filename, e.g.
-        #   "1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png"
-        # Computed from the project's CURRENT cached name plus the leveranse
-        # title + the configured studio slot. The "_V00" marks this as the
-        # placeholder version; the team's first real delivery uploads on
-        # top of it as V01 in Frame's version stack.
+        #   "Vinkel 1_Goldbox.no_V00.png"
+        # Computed from the leveranse title + the configured studio slot. The
+        # "_V00" marks this as the placeholder version; the team's first real
+        # delivery uploads on top of it as V01 in Frame's version stack.
         #
         # Renames in Notion (project or leveranse) won't auto-rename an
         # existing uploaded placeholder file — Frame's version stack keys

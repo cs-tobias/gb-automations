@@ -213,10 +213,10 @@ def test_first_sync_creates_placeholder(monkeypatch):
     assert result.action == "created"
     assert result.frame_placeholder_file_id == "newFileF"
     # frame_folder_id is the SHARED discipline folder, not a per-leveranse one.
-    # The placeholder filename embeds project name + studio + leveranse name +
-    # V00: _FakeProjectRow's "Acme" + studio "Goldbox.no" + "Fasade Nord".
+    # The placeholder filename is <leveranse>_<studio>_V00: "Fasade Nord" +
+    # studio "Goldbox.no" (no project prefix).
     assert file_calls == [
-        ("discF", "Acme_Goldbox.no_Fasade Nord_V00.png", "http://x/p.png")
+        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/p.png")
     ]
     assert len(sessions[1].added) == 1
     added = sessions[1].added[0]
@@ -269,7 +269,7 @@ def test_rename_renames_placeholder_file(monkeypatch):
     result = asyncio.run(sf.sync_frame_leveranse("t1"))
 
     assert result.action == "renamed"
-    assert rename_calls == [("fileF", "Acme_Goldbox.no_New Name_V00.png")]
+    assert rename_calls == [("fileF", "New Name_Goldbox.no_V00.png")]
     assert create_calls == 0
     assert result.frame_placeholder_file_id == "fileF"
     assert lev_row.current_name == "New Name"
@@ -357,7 +357,7 @@ def test_self_heal_evicts_stale_leveranse(monkeypatch):
     assert result.action == "created"
     assert result.frame_placeholder_file_id == "freshFile"
     assert file_calls == [
-        ("discF", "Acme_Goldbox.no_Fasade Nord_V00.png", "http://x/p.png")
+        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/p.png")
     ]
     assert sessions[1].deleted == [lev_row]
 
@@ -424,7 +424,7 @@ def test_adopts_existing_placeholder_with_view_url(monkeypatch):
         return {"id": "should-not-be-called"}
 
     async def fake_find_file(parent, name):
-        assert (parent, name) == ("discF", "Acme_Goldbox.no_Fasade Nord_V00.png")
+        assert (parent, name) == ("discF", "Fasade Nord_Goldbox.no_V00.png")
         return {
             "id": "preExistingFile",
             "name": name,
@@ -502,10 +502,11 @@ def test_adopts_existing_placeholder_fetches_url_when_missing(monkeypatch):
 
 def test_placeholder_filename_shape(monkeypatch):
     """Pin the exact filename shape so a future config-name change doesn't
-    silently shift it. The order matters: <project>_<studio>_<task>_V00.png."""
+    silently shift it. The order matters: <task>_<studio>_V00.png (no project
+    prefix)."""
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "Goldbox.no")
     out = sf._placeholder_filename("1230_Metropolis_Orangeriet", "Vinkel 1")
-    assert out == "1230_Metropolis_Orangeriet_Goldbox.no_Vinkel 1_V00.png"
+    assert out == "Vinkel 1_Goldbox.no_V00.png"
 
 
 def test_placeholder_filename_uses_configured_studio(monkeypatch):
@@ -513,15 +514,15 @@ def test_placeholder_filename_uses_configured_studio(monkeypatch):
     straight through to new uploads."""
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "OtherStudio")
     out = sf._placeholder_filename("Proj", "Task")
-    assert out == "Proj_OtherStudio_Task_V00.png"
+    assert out == "Task_OtherStudio_V00.png"
 
 
 def test_placeholder_filename_falls_back_when_studio_empty(monkeypatch):
     """A blank studio setting would produce a malformed filename
-    ('Proj__Task_V00.png'); fall back to 'Goldbox.no' as the default."""
+    ('Task__V00.png'); fall back to 'Goldbox.no' as the default."""
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "")
     out = sf._placeholder_filename("Proj", "Task")
-    assert out == "Proj_Goldbox.no_Task_V00.png"
+    assert out == "Task_Goldbox.no_V00.png"
 
 
 if __name__ == "__main__":

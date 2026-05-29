@@ -439,18 +439,36 @@ async def _sync_frame_impl(request: Request) -> Response:
             }
         )
     inserted = await enqueue_frame_project_sync(page_id)
+    # Fan out: sync every deliverable in this project too, so one button on the
+    # Projects DB provisions the project + ALL its Frame placeholders. The
+    # per-deliverable button still works for re-syncing a single row; both share
+    # the same idempotent enqueue, so re-clicking either is a no-op.
+    leveranser = await notion_client.oppgaver_for_project(page_id)
+    leveranse_queued = 0
+    for row in leveranser:
+        # Only real deliverables (Type is a recognized discipline) get a Frame
+        # placeholder; internal tasks (Klargjøre modell / blank Type) are
+        # skipped, mirroring the per-row button's gate. Skipping here also keeps
+        # us from enqueuing tasks that sync_frame_leveranse would just no-op.
+        discipline = notion_client.task_discipline(row)
+        if not DISCIPLINE_KEYS.get((discipline or "").strip().lower()):
+            continue
+        leveranse_queued += await enqueue_frame_leveranse_sync(row["id"])
     queue_worker.wake()
     logger.info(
-        "🎬 frame-only sync requested for %r (page %s) — %s",
+        "🎬 frame-only sync requested for %r (page %s) — project=%s leveranser_queued=%d (of %d deliverables)",
         title,
         page_id,
         "enqueued" if inserted else "already queued",
+        leveranse_queued,
+        len(leveranser),
     )
     return _json(
         {
             "page_id": page_id,
             "kind": "frame_project_sync",
             "action": "queued" if inserted else "already_queued",
+            "leveranser_queued": leveranse_queued,
         }
     )
 

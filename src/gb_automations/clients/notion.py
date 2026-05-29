@@ -25,6 +25,7 @@ from gb_automations.config import (
     OPPGAVER_FRAME_URL_PROP,
     OPPGAVER_PROPS,
     KORREKSJONER_PROPS,
+    DISCIPLINE_KEYS,
     MANUAL_DELIVERABLE_STATUSES,
     KORREKSJON_KIND_KORREKSJONSRUNDE,
     SYNC_QUEUE_PROPS,
@@ -292,12 +293,27 @@ def task_project_id(page: dict[str, Any]) -> str | None:
 
 
 def task_discipline(page: dict[str, Any]) -> str | None:
-    """Return the row's `Type` single-select option name, or None if unset.
+    """Return the row's `Type` option name (the discipline label), or None.
 
-    The raw label (e.g. "Interiør") is what callers pass to the NAS layer; it
-    normalizes to a canonical key via DISCIPLINE_KEYS.
+    Reads BOTH the `select` and `multi_select` shapes. Goldbox runs `Type` as a
+    multi_select but only ever sets one label per row, so for multi_select we
+    return the FIRST recognized discipline (an option whose normalized name is
+    in DISCIPLINE_KEYS); if none match we fall back to the first option so the
+    caller's own gate still does the final accept/reject. Single-select is read
+    as before. The raw label (e.g. "Interiør") is what callers pass to the NAS
+    layer; it normalizes to a canonical key via DISCIPLINE_KEYS.
     """
     prop = (page.get("properties") or {}).get(OPPGAVER_PROPS["discipline"]) or {}
+
+    multi = prop.get("multi_select")
+    if isinstance(multi, list) and multi:
+        names = [(opt.get("name") or "").strip() for opt in multi]
+        names = [n for n in names if n]
+        for n in names:
+            if DISCIPLINE_KEYS.get(n.lower()):
+                return n
+        return names[0] if names else None
+
     sel = prop.get("select") or {}
     name = sel.get("name")
     return name or None
@@ -375,21 +391,19 @@ async def oppgaver_for_project(project_page_id: str) -> list[dict[str, Any]]:
     works on under it). Korreksjonsrunde sub-rows are excluded — their Type is
     "Korreksjonsrunde", not a discipline. Returns [] if OPPGAVER_DB_ID is
     unset (feature disabled) or the project has no Oppgaver yet.
+
+    The Korreksjonsrunde exclusion is done CLIENT-SIDE, not via a Notion
+    `select` filter: Goldbox runs `Type` as a multi_select, and Notion's API
+    rejects a `select` filter clause on a multi_select property (400). Filtering
+    on the relation server-side and dropping Korreksjonsrunde rows here is robust
+    to either column type.
     """
     if not settings.oppgaver_db_id:
         return []
     filter_body = {
         "filter": {
-            "and": [
-                {
-                    "property": OPPGAVER_PROPS["project"],
-                    "relation": {"contains": project_page_id},
-                },
-                {
-                    "property": OPPGAVER_PROPS["kind"],
-                    "select": {"does_not_equal": KORREKSJON_KIND_KORREKSJONSRUNDE},
-                },
-            ]
+            "property": OPPGAVER_PROPS["project"],
+            "relation": {"contains": project_page_id},
         }
     }
     rows: list[dict[str, Any]] = []
@@ -410,7 +424,13 @@ async def oppgaver_for_project(project_page_id: str) -> list[dict[str, Any]]:
             start_cursor = payload.get("next_cursor")
             if not start_cursor:
                 break
-    return [r for r in rows if not r.get("archived") and not r.get("in_trash")]
+    return [
+        r
+        for r in rows
+        if not r.get("archived")
+        and not r.get("in_trash")
+        and task_discipline(r) != KORREKSJON_KIND_KORREKSJONSRUNDE
+    ]
 
 
 async def get_project_pages(*, force_refresh: bool = False) -> dict[str, dict[str, str]]:
