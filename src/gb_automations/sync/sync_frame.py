@@ -88,6 +88,23 @@ def _placeholder_filename(project_name: str, task_name: str) -> str:
     studio = settings.frame_filename_studio or "Goldbox.no"
     return f"{task_name}_{studio}_V00.png"
 
+
+def _placeholder_source_url(leveranse_page_id: str) -> str:
+    """URL Frame fetches the placeholder bytes from.
+
+    Prefer the per-deliverable dynamic render endpoint
+    (`<origin>/assets/placeholder/<page_id>.png`), which composes the
+    background + description text from the live Notion row. Falls back to the
+    static `frame_placeholder_url` when the public origin can't be derived
+    (e.g. frame_placeholder_url isn't an absolute URL). Frame fetches this
+    asynchronously after create_file_from_url returns, so the URL must stand
+    on its own — it carries the page id and the endpoint re-reads Notion.
+    """
+    base = settings.placeholder_render_base
+    if not base:
+        return settings.frame_placeholder_url
+    return f"{base}/assets/placeholder/{leveranse_page_id}.png"
+
 # Frame's V4 API returns a canonical `view_url` on every project/folder/file
 # response, so we just persist what Frame gives us instead of building URLs
 # from a template. That sidesteps any drift in the web-UI URL shape and
@@ -646,7 +663,7 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
                     placeholder = await frame_client.create_file_from_url(
                         discipline_folder_id,
                         placeholder_filename,
-                        settings.frame_placeholder_url,
+                        _placeholder_source_url(leveranse_page_id),
                     )
                     placeholder_id = placeholder["id"]
                     url = _file_view_url(placeholder, placeholder_id, project_id_for_url)

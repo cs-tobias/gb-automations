@@ -215,8 +215,10 @@ def test_first_sync_creates_placeholder(monkeypatch):
     # frame_folder_id is the SHARED discipline folder, not a per-leveranse one.
     # The placeholder filename is <leveranse>_<studio>_V00: "Fasade Nord" +
     # studio "Goldbox.no" (no project prefix).
+    # Placeholder source is the per-deliverable dynamic render endpoint, with
+    # the origin derived from frame_placeholder_url (http://x/p.png → http://x).
     assert file_calls == [
-        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/p.png")
+        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/assets/placeholder/t1.png")
     ]
     assert len(sessions[1].added) == 1
     added = sessions[1].added[0]
@@ -357,7 +359,7 @@ def test_self_heal_evicts_stale_leveranse(monkeypatch):
     assert result.action == "created"
     assert result.frame_placeholder_file_id == "freshFile"
     assert file_calls == [
-        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/p.png")
+        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/assets/placeholder/t1.png")
     ]
     assert sessions[1].deleted == [lev_row]
 

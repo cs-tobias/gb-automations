@@ -249,6 +249,29 @@ class Settings(BaseSettings):
     # slot, not name, so re-naming after the fact is purely cosmetic).
     frame_filename_studio: str = "Goldbox.no"
 
+    @property
+    def placeholder_render_base(self) -> str:
+        """Public origin (scheme://host[:port]) the dynamic placeholder endpoint
+        is reachable at, derived from `frame_placeholder_url`.
+
+        The dynamic per-deliverable placeholder lives at
+        `<origin>/assets/placeholder/<page_id>.png`. We derive the origin from
+        the already-required `frame_placeholder_url` (the static fallback,
+        e.g. https://hub.<domain>/assets/placeholder.png) rather than adding a
+        second env var — they're always the same host (our own FastAPI app
+        behind the Cloudflare tunnel). Empty when frame_placeholder_url is
+        unset; callers fall back to the static URL.
+        """
+        url = self.frame_placeholder_url.strip()
+        if not url:
+            return ""
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return f"{parts.scheme}://{parts.netloc}"
+
     # Toggl Track (timesheet integration).
     # Single workspace-admin API token. The Reports v3 API returns every
     # workspace member's entries when called by an admin, so one token is
@@ -421,6 +444,14 @@ PROJECTS_GMAIL_URL_PROP = "Gmail"
 PROJECTS_NAS_URL_PROP = "NAS"
 PROJECTS_FRAME_URL_PROP = "Frame.io"
 OPPGAVER_FRAME_URL_PROP = "Frame.io"
+# Deliverable-row fields that feed the dynamically-rendered Frame placeholder
+# (the V00 file). The render endpoint reads these live at fetch time:
+#   "Beskrivelse" (rich_text) — text drawn over the placeholder; falls back to
+#                 the row's title (Navn) when blank.
+#   "Thumbnail"   (files)     — optional uploaded reference image used as the
+#                 background; a plain black canvas is used when empty.
+OPPGAVER_DESC_PROP = "Beskrivelse"
+OPPGAVER_THUMB_PROP = "Thumbnail"
 # Toggl Track project URL — written back to the Projects DB by
 # sync_toggl_project so a single click in Notion opens the matching
 # project's timer dropdown / Reports view in Toggl. Same column-as-

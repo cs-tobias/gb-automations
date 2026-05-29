@@ -339,6 +339,26 @@ def read_rich_text_prop(page: dict[str, Any], prop_name: str) -> str | None:
     return text or None
 
 
+def read_first_file_url(page: dict[str, Any], prop_name: str) -> str | None:
+    """Return the URL of the first entry in a `files` property, or None.
+
+    Handles both shapes Notion uses: a Notion-hosted upload (`file.url`, a
+    time-limited signed S3 URL) and an external link (`external.url`). The
+    placeholder render endpoint reads this on a fresh page fetch, so the signed
+    URL is always current — callers must not cache it.
+    """
+    prop = (page.get("properties") or {}).get(prop_name)
+    if not prop:
+        return None
+    for entry in prop.get("files") or []:
+        url = (entry.get("file") or {}).get("url") or (
+            entry.get("external") or {}
+        ).get("url")
+        if url:
+            return url
+    return None
+
+
 # ============================================================
 # Project pages (top-level pages, used to match Gmail labels)
 # ============================================================

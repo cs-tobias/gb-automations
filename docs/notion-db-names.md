@@ -61,6 +61,8 @@ Navn (title)
 Prosjekt (relation → Projects)
 Type (single_select) — Interiør / Eksteriør / Animasjon / Annet / Klargjøre modell (and `Korreksjonsrunde` on round sub-rows)
 Frame.io (url) — auto-written by sync_frame_leveranse on deliverables
+Beskrivelse (rich_text) — text drawn on the Frame placeholder image; falls back to the row title (Navn) when blank. Read live by the placeholder render endpoint.
+Thumbnail (files) — optional uploaded reference image used as the placeholder background; a plain black canvas is used when empty.
 Status (single_select) — deliverable lifecycle, see options below; auto-managed in Phase 2.5. Reaching `Oppgaver ferdig` IS the round-done signal — there is no per-round Ferdig checkbox.
 Runde (number) — round N on Korreksjonsrunde sub-rows (engine plumbing for dedup + active-round detection; team can hide it in views)
 Parent item (self-referential relation, Notion sub-items feature) — Korreksjonsrunde rows point at their deliverable

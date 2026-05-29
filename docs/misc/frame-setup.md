@@ -28,6 +28,11 @@ The "Initialize" button on Projects fans out: it provisions Gmail labels + NAS f
 4. **Flip the toggle** and restart the api:
    ```
    SYNC_FRAME=true
+   # Static fallback placeholder + the origin the DYNAMIC placeholder endpoint
+   # is derived from (scheme+host only). The V00 placeholder is normally
+   # rendered per-deliverable at /assets/placeholder/{page_id}.png (description
+   # text over the deliverable's uploaded Thumbnail, or a black canvas); this
+   # static URL is only used as a fallback when the origin can't be derived.
    FRAME_PLACEHOLDER_URL=https://hub.<your-domain>/assets/Goldbox_Logo_White.png
    # Optional: studio slot baked into each placeholder filename.
    # Default is "Goldbox.no" so this only needs setting if the studio
@@ -61,7 +66,9 @@ Frame.io workspace (FRAME_WORKSPACE_ID)
 │  └─ ...
 ```
 
-Each Notion project becomes its own Frame Project entity (with its own `project_id`, its own `root_folder_id`, and its own active/inactive flag visible in Frame's UI). Discipline folder names live in `FRAME_DISCIPLINE_FOLDER_NAMES` (`config.py`); the placeholder file is the 69-byte 1×1 PNG checked into `src/gb_automations/assets/placeholder.png` and served by the FastAPI app over the Cloudflare tunnel.
+Each Notion project becomes its own Frame Project entity (with its own `project_id`, its own `root_folder_id`, and its own active/inactive flag visible in Frame's UI). Discipline folder names live in `FRAME_DISCIPLINE_FOLDER_NAMES` (`config.py`).
+
+The placeholder file bytes are **rendered on the fly per deliverable**. `sync_frame_leveranse` hands Frame's `create_file_from_url` the URL `https://hub.<domain>/assets/placeholder/<deliverable_page_id>.png` (origin derived from `FRAME_PLACEHOLDER_URL`); Frame fetches it over the Cloudflare tunnel. That endpoint ([routes/assets.py](../../src/gb_automations/routes/assets.py)) reads the deliverable's Notion row live and renders (Pillow) a 1080×1080 (1:1) PNG: the **`Beskrivelse`** text — falling back to the row title when blank — drawn over the **`Thumbnail`** upload, or a solid black canvas when no thumbnail is set. The endpoint is public + unauthenticated (same exposure as the static `/assets/` mount) and always returns a valid PNG — on any Notion/fetch error it degrades to a plain black image so Frame never stores a broken V00. Frame fetches the URL *once, asynchronously, after* the create call, so later edits to the description/thumbnail in Notion only show up on the **next** provisioning of that deliverable, not retroactively on the already-fetched file.
 
 Placeholder files sit DIRECTLY under the discipline folder — there is no per-leveranse wrapping folder. The placeholder filename embeds the leveranse name (`<project>_<studio>_<leveranse>_V00.png`), which both guarantees uniqueness within a shared discipline folder and provides the visible label in Frame's UI. A leveranse rename in Notion PATCHes the file's name in Frame to match (the file id is preserved, so the version stack and cached comment joins survive the rename).
 

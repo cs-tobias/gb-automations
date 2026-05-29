@@ -12,6 +12,7 @@ from sqlalchemy import text
 from gb_automations.config import settings
 from gb_automations.db import engine
 from gb_automations.jobs.scheduler import shutdown_scheduler, start_scheduler
+from gb_automations.routes import assets as assets_routes
 from gb_automations.routes import debug as debug_routes
 from gb_automations.routes import oauth as oauth_routes
 from gb_automations.routes import webhooks as webhook_routes
@@ -274,6 +275,13 @@ app = FastAPI(title="gb-automations", version="0.1.0", lifespan=lifespan)
 app.include_router(debug_routes.router)
 app.include_router(oauth_routes.router)
 app.include_router(webhook_routes.router)
+# The dynamic placeholder route (/assets/placeholder/{id}.png) must be
+# registered BEFORE the static /assets mount below: a Mount matches by path
+# prefix and would otherwise swallow the request (and 404, since no such file
+# exists on disk). Explicit routes are matched ahead of mounts in registration
+# order, so the dynamic render wins and the static mount still serves
+# everything else under /assets.
+app.include_router(assets_routes.router)
 
 # Static assets exposed publicly (through the Cloudflare tunnel as
 # https://hub.<domain>/assets/...). Used by the Frame.io sync to give Frame a
