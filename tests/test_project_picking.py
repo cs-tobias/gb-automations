@@ -48,7 +48,7 @@ def test_projects_from_matches_single():
 def test_assemble_row_props_writes_multi_target_project_relation():
     # body shorter than 10 chars skips the LLM tagging call — keeps this test
     # a pure function check with no mocks.
-    props = asyncio.run(
+    props, _tags = asyncio.run(
         _assemble_row_props(
             emails_db_props={EMAILS_PROPS["project"]},
             subject="hi",
@@ -69,7 +69,7 @@ def test_assemble_row_props_writes_multi_target_project_relation():
 
 
 def test_assemble_row_props_writes_single_relation_for_single_project():
-    props = asyncio.run(
+    props, _tags = asyncio.run(
         _assemble_row_props(
             emails_db_props={EMAILS_PROPS["project"]},
             subject="hi",
