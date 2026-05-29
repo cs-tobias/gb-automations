@@ -78,22 +78,16 @@ async def _find_active_korreksjonsrunde(
         return None, None
     body: dict[str, Any] = {
         "filter": {
-            "and": [
-                {
-                    # Korreksjonsrunde rows are sub-items of the deliverable —
-                    # the Parent item relation points at it.
-                    "property": OPPGAVER_PROPS["parent"],
-                    "relation": {"contains": leveranse_page_id},
-                },
-                {
-                    "property": OPPGAVER_PROPS["kind"],
-                    "select": {"equals": KORREKSJON_KIND_KORREKSJONSRUNDE},
-                },
-            ]
+            # Korreksjonsrunde rows are sub-items of the deliverable — the
+            # Parent item relation points at it. The Type/kind match is done
+            # client-side below (the Type column may be multi_select, on which
+            # a `select` filter clause is rejected by Notion).
+            "property": OPPGAVER_PROPS["parent"],
+            "relation": {"contains": leveranse_page_id},
         },
         # Sort by Runde descending — first result is the highest round.
         "sorts": [{"property": OPPGAVER_PROPS["round"], "direction": "descending"}],
-        "page_size": 5,  # we only need the first; small page for cheap call
+        "page_size": 10,
     }
     from gb_automations.clients.notion import _client, _raise_for_status, _with_retries
 
@@ -108,6 +102,9 @@ async def _find_active_korreksjonsrunde(
         results = response.json().get("results", [])
     for row in results:
         if row.get("archived") or row.get("in_trash"):
+            continue
+        # Client-side kind match (the Type column may be multi_select).
+        if notion_client.task_discipline(row) != KORREKSJON_KIND_KORREKSJONSRUNDE:
             continue
         page_id = row.get("id")
         props = row.get("properties") or {}

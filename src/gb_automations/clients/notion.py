@@ -633,6 +633,45 @@ async def create_email_row(properties: dict[str, Any], db_id: str) -> dict[str, 
         return response.json()
 
 
+# The Oppgaver `Type` column is a single `select` in some workspaces and a
+# `multi_select` in others (Goldbox). A write must match the column's actual
+# type or Notion 400s, so we look the type up once and cache it. Cleared
+# implicitly per process; the schema doesn't change at runtime.
+_oppgaver_type_kind: str | None = None
+
+
+async def _oppgaver_type_property_kind() -> str:
+    """Return "multi_select" or "select" for the Oppgaver `Type` property.
+
+    Cached after the first lookup. Defaults to "select" if the property or DB
+    can't be read, preserving the historical behavior.
+    """
+    global _oppgaver_type_kind
+    if _oppgaver_type_kind is not None:
+        return _oppgaver_type_kind
+    _oppgaver_type_kind = "select"
+    if settings.oppgaver_db_id:
+        async with _client() as client:
+            response = await _with_retries(
+                lambda: client.get(f"/databases/{settings.oppgaver_db_id}"),
+                op_name="GET /databases/oppgaver (Type property kind)",
+            )
+            _raise_for_status(response)
+            prop = (response.json().get("properties") or {}).get(
+                OPPGAVER_PROPS["discipline"]
+            ) or {}
+            if prop.get("type") == "multi_select":
+                _oppgaver_type_kind = "multi_select"
+    return _oppgaver_type_kind
+
+
+def _type_property_value(kind: str, option_name: str) -> dict[str, Any]:
+    """Build a Type property write payload matching the column's kind."""
+    if kind == "multi_select":
+        return {"multi_select": [{"name": option_name}]}
+    return {"select": {"name": option_name}}
+
+
 async def create_korreksjonsrunde_row(
     *,
     deliverable_page_id: str,
@@ -653,13 +692,14 @@ async def create_korreksjonsrunde_row(
         raise RuntimeError(
             "OPPGAVER_DB_ID is not set — Oppgaver writes are disabled."
         )
+    type_kind = await _oppgaver_type_property_kind()
     properties: dict[str, Any] = {
         OPPGAVER_PROPS["name"]: {
             "title": [{"text": {"content": f"Korreksjonsrunde {round_number}"}}]
         },
-        OPPGAVER_PROPS["kind"]: {
-            "select": {"name": KORREKSJON_KIND_KORREKSJONSRUNDE}
-        },
+        OPPGAVER_PROPS["kind"]: _type_property_value(
+            type_kind, KORREKSJON_KIND_KORREKSJONSRUNDE
+        ),
         OPPGAVER_PROPS["round"]: {"number": round_number},
         OPPGAVER_PROPS["parent"]: {"relation": [{"id": deliverable_page_id}]},
     }
@@ -782,14 +822,15 @@ async def find_korreksjonsrunde_row(
     """
     if not settings.oppgaver_db_id:
         return None
+    # Filter only on type-stable properties server-side (parent relation +
+    # round number). The Type/kind match is done client-side below: Goldbox
+    # runs `Type` as a multi_select, and a `select` filter clause on a
+    # multi_select property is rejected by Notion (400). task_discipline()
+    # reads either shape, so the kind check works regardless of column type.
     conditions: list[dict[str, Any]] = [
         {
             "property": OPPGAVER_PROPS["parent"],
             "relation": {"contains": deliverable_page_id},
-        },
-        {
-            "property": OPPGAVER_PROPS["kind"],
-            "select": {"equals": KORREKSJON_KIND_KORREKSJONSRUNDE},
         },
         {
             "property": OPPGAVER_PROPS["round"],
@@ -798,7 +839,7 @@ async def find_korreksjonsrunde_row(
     ]
     body = {
         "filter": {"and": conditions},
-        "page_size": 1,
+        "page_size": 10,
     }
     async with _client() as client:
         response = await _with_retries(
@@ -810,7 +851,10 @@ async def find_korreksjonsrunde_row(
         _raise_for_status(response)
         results = response.json().get("results", [])
     for page in results:
-        if not page.get("archived") and not page.get("in_trash"):
+        if page.get("archived") or page.get("in_trash"):
+            continue
+        # Client-side kind match (the Type column may be multi_select).
+        if task_discipline(page) == KORREKSJON_KIND_KORREKSJONSRUNDE:
             return page.get("id")
     return None
 
