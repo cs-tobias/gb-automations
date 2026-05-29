@@ -2430,6 +2430,13 @@ class ThreadAttachmentTracker:
     # later messages that re-carry the same bytes skip it. This is what stops
     # every reply row from getting the whole thread's attachments.
     attached_this_pass: set[str] = field(default_factory=set)
+    # (filename, size) -> content_sha1 for attachments already downloaded AND
+    # hashed THIS pass. Lets a later re-carried copy (identical bytes Outlook
+    # re-embeds on every reply) reuse the known sha1 WITHOUT re-downloading from
+    # Gmail. Outcome-identical: same bytes => same sha1 => same skip/relink
+    # decision. Starts empty every pass, so it never substitutes for the
+    # authoritative byte-hash on a file's first sighting.
+    sha1_by_namesize: dict[tuple[str, int], str] = field(default_factory=dict)
 
     @property
     def sha1s(self) -> set[str]:
@@ -2551,37 +2558,54 @@ async def _upload_attachments(
                 "    ⏏  skip attachment %r: %s", d.attachment.filename, d.skip_reason
             )
             continue
-        if d.attachment.attachment_id:
-            try:
-                content = await asyncio.to_thread(
-                    gmail_client.get_attachment_bytes,
-                    user_email,
-                    parent_msg.message_id,
-                    d.attachment.attachment_id,
-                )
-            except Exception:
-                logger.exception(
-                    "    ✗ Gmail attachment fetch failed for %r", d.attachment.filename
+        # Cheap pre-download shortcut: Outlook re-carries the SAME inline bytes
+        # on every reply's MIME tree. If a file with this (filename, size) was
+        # already downloaded AND hashed earlier THIS pass, the re-carried copy is
+        # byte-identical, so reuse the known sha1 and skip the Gmail round-trip.
+        # Outcome-identical (same bytes => same sha1 => same skip/relink branch
+        # below). `content` stays None on this path — only the relink branch
+        # needs bytes, and the first occurrence already ran that with real bytes.
+        namesize_key = (d.attachment.filename or "", d.attachment.size or 0)
+        content: bytes | None = None
+        content_sha1: str | None = None
+        if d.attachment.size and namesize_key in thread_tracker.sha1_by_namesize:
+            content_sha1 = thread_tracker.sha1_by_namesize[namesize_key]
+        else:
+            if d.attachment.attachment_id:
+                try:
+                    content = await asyncio.to_thread(
+                        gmail_client.get_attachment_bytes,
+                        user_email,
+                        parent_msg.message_id,
+                        d.attachment.attachment_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "    ✗ Gmail attachment fetch failed for %r",
+                        d.attachment.filename,
+                    )
+                    continue
+            elif d.attachment.inline_data:
+                # Inline-embedded part: Gmail returned the bytes in body.data with
+                # no attachmentId. Decode the bytes we already downloaded instead
+                # of making a (impossible) attachments.get call. This is the path
+                # Outlook inline photos take — without it they're silently lost.
+                content = gmail_client.decode_inline_data(d.attachment.inline_data)
+            else:
+                logger.info(
+                    "    ⏏  skip attachment %r: inline-embedded, no id and no data",
+                    d.attachment.filename,
                 )
                 continue
-        elif d.attachment.inline_data:
-            # Inline-embedded part: Gmail returned the bytes in body.data with
-            # no attachmentId. Decode the bytes we already downloaded instead
-            # of making a (impossible) attachments.get call. This is the path
-            # Outlook inline photos take — without it they're silently lost.
-            content = gmail_client.decode_inline_data(d.attachment.inline_data)
-        else:
-            logger.info(
-                "    ⏏  skip attachment %r: inline-embedded, no id and no data",
-                d.attachment.filename,
-            )
-            continue
-        if not content:
-            logger.warning(
-                "    ⏏  skip attachment %r: empty content from Gmail", d.attachment.filename
-            )
-            continue
-        content_sha1 = hashlib.sha1(content).hexdigest()
+            if not content:
+                logger.warning(
+                    "    ⏏  skip attachment %r: empty content from Gmail",
+                    d.attachment.filename,
+                )
+                continue
+            content_sha1 = hashlib.sha1(content).hexdigest()
+            if d.attachment.size:
+                thread_tracker.sha1_by_namesize[namesize_key] = content_sha1
 
         # Row-attribution: Gmail/Outlook re-carries identical bytes on every
         # reply's MIME tree, so the same file reappears under each later author.
@@ -2617,8 +2641,24 @@ async def _upload_attachments(
             )
             # Already on Drive, but maybe never made it to the NAS (synced before
             # the NAS feature, or while the share was down). Reconcile it now —
-            # idempotent, so a no-op when the file is already in Mottatt.
-            await _ensure_in_nas(d.attachment.filename, content)
+            # idempotent, so a no-op when the file is already in Mottatt. Skipped
+            # when bytes weren't downloaded (the (filename,size) shortcut hit): the
+            # first occurrence this pass already reconciled with real bytes.
+            if content is not None:
+                await _ensure_in_nas(d.attachment.filename, content)
+            continue
+
+        # Reaching the upload path with no bytes should be impossible: a
+        # (filename,size) shortcut hit means the sha1 was already attached this
+        # pass, so one of the two skip branches above caught it. Guard anyway so
+        # a future refactor can't silently corrupt an upload with None bytes.
+        if content is None:
+            logger.warning(
+                "    ⏏  skip attachment %r: dedup shortcut left no bytes to upload "
+                "(sha1=%s)",
+                d.attachment.filename,
+                content_sha1,
+            )
             continue
 
         # Upload once per matched project subfolder. Each project's folder

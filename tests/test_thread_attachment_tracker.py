@@ -17,7 +17,15 @@ Two separate concerns the tracker keeps apart:
 
 from __future__ import annotations
 
-from gb_automations.sync.sync_thread import ThreadAttachmentTracker
+import asyncio
+from datetime import datetime, timezone
+
+import gb_automations.sync.sync_thread as st
+from gb_automations.clients.gmail import GmailAttachment, GmailMessage
+from gb_automations.sync.sync_thread import (
+    AttachmentDecision,
+    ThreadAttachmentTracker,
+)
 
 
 def test_known_sha1_returns_stored_links():
@@ -84,3 +92,122 @@ def test_sha1s_view_reflects_recorded_links():
     tracker.links_by_sha1["a"] = [{"name": "f", "url": "u"}]
     tracker.links_by_sha1["b"] = []
     assert tracker.sha1s == {"a", "b"}
+
+
+# --------------------------------------------------------------------------
+# Download short-circuit: a re-carried (filename, size) is not re-fetched.
+# This is the perf fix — Outlook re-embeds identical inline bytes on every
+# reply, and we must not pay a Gmail round-trip per re-carry just to hash and
+# discard. Detection is unchanged: the byte-sha1 is still authoritative; the
+# (filename,size) map only ever returns a sha1 we computed from real bytes
+# earlier THIS pass.
+# --------------------------------------------------------------------------
+
+
+def _att(filename: str, size: int) -> GmailAttachment:
+    return GmailAttachment(
+        filename=filename,
+        mime_type="image/png",
+        size=size,
+        attachment_id=f"att-{filename}-{size}",
+    )
+
+
+def _msg(attachments: list[GmailAttachment]) -> GmailMessage:
+    return GmailMessage(
+        message_id="m1",
+        thread_id="t1",
+        date=datetime(2026, 5, 29, tzinfo=timezone.utc),
+        subject="Svar: Tekstil liftgardin",
+        from_field="a@b.no",
+        to_field="c@d.no",
+        cc_field="",
+        plain_body="",
+        attachments=attachments,
+        label_ids=[],
+    )
+
+
+class _NullSession:
+    async def get(self, *a, **k):
+        return None
+
+    async def execute(self, *a, **k):
+        return None
+
+
+def _run_upload(monkeypatch, decisions, tracker):
+    """Drive `_upload_attachments` with all external I/O faked out.
+
+    Returns the list of message_ids passed to get_attachment_bytes so the test
+    can assert how many real downloads happened.
+    """
+    fetched: list[str] = []
+
+    def fake_get_bytes(user_email, message_id, attachment_id):
+        fetched.append(attachment_id)
+        # The attachment_id encodes name+size (see _att), so identical name+size
+        # yields identical bytes (the re-carry case) and distinct ones differ —
+        # matching how real Gmail bytes track the (filename, size) fingerprint.
+        return attachment_id.encode()
+
+    uploaded_calls: list = []
+
+    def fake_upload(user_email, folder_path, filename, mime, content):
+        uploaded_calls.append(filename)
+        return f"https://drive/{filename}"
+
+    monkeypatch.setattr(st.gmail_client, "get_attachment_bytes", fake_get_bytes)
+    monkeypatch.setattr(st.drive_client, "upload_attachment", fake_upload)
+    # NAS off => received_dirs empty => _ensure_in_nas is a no-op, no FS calls.
+    monkeypatch.setattr(st.settings, "sync_nas_folders", False)
+    monkeypatch.setattr(st.settings, "attachments_folder_name", "Vedlegg")
+
+    result = asyncio.run(
+        st._upload_attachments(
+            parent_msg=_msg([d.attachment for d in decisions]),
+            decisions=decisions,
+            attributed_sender="a@b.no",
+            user_email="me@goldbox.no",
+            session=_NullSession(),
+            thread_tracker=tracker,
+            project_label_paths=["Prosjekt/2026/Acme"],
+            project_page_ids=[],
+            email_date=datetime(2026, 5, 29, tzinfo=timezone.utc),
+            tags=[],
+        )
+    )
+    return fetched, uploaded_calls, result
+
+
+def test_recarried_namesize_is_not_redownloaded(monkeypatch):
+    # Three decisions for the SAME re-carried inline image (identical name+size),
+    # as Outlook produces across a 3-reply thread. Only the FIRST should hit
+    # Gmail; the other two reuse the sha1 from sha1_by_namesize and skip the
+    # download entirely.
+    tracker = ThreadAttachmentTracker()
+    decisions = [
+        AttachmentDecision(_att("Outlook-Bilde.png", 4096), upload=True),
+        AttachmentDecision(_att("Outlook-Bilde.png", 4096), upload=True),
+        AttachmentDecision(_att("Outlook-Bilde.png", 4096), upload=True),
+    ]
+    fetched, uploaded_calls, _ = _run_upload(monkeypatch, decisions, tracker)
+
+    assert len(fetched) == 1, "re-carried copies must not re-download from Gmail"
+    # First copy uploads once (one project folder); re-carries skip via
+    # attached_this_pass — no second upload, no duplicate row link.
+    assert len(uploaded_calls) == 1
+
+
+def test_distinct_size_still_downloads(monkeypatch):
+    # Same filename but DIFFERENT byte size = a different file (revised version).
+    # Detection must NOT be weakened: both download and both upload.
+    tracker = ThreadAttachmentTracker()
+    decisions = [
+        AttachmentDecision(_att("revisjon.pdf", 1000), upload=True),
+        AttachmentDecision(_att("revisjon.pdf", 2000), upload=True),
+    ]
+    fetched, uploaded_calls, _ = _run_upload(monkeypatch, decisions, tracker)
+
+    assert len(fetched) == 2
+    assert len(uploaded_calls) == 2
