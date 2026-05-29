@@ -686,6 +686,7 @@ async def create_korreksjon_row(
     project_page_id: str | None = None,
     parent_korreksjon_id: str | None = None,
     commenter_contact_id: str | None = None,
+    commented_at: str | None = None,
 ) -> dict[str, Any]:
     """Create a Korreksjon row (one per Frame comment) in the Korreksjoner DB.
     Returns the created page object.
@@ -713,6 +714,10 @@ async def create_korreksjon_row(
     The contact carries the name + email, so they aren't duplicated onto the
     row. Skipped silently if None.
 
+    `commented_at`, when set, writes the KORREKSJONER_PROPS["commented_at"] date
+    — the ISO timestamp of when the comment was made in Frame
+    (comment.created_at). Skipped silently if None.
+
     Raises RuntimeError if KORREKSJONER_DB_ID is unset.
     """
     if not settings.korreksjoner_db_id:
@@ -730,6 +735,10 @@ async def create_korreksjon_row(
     if commenter_contact_id:
         properties[KORREKSJONER_PROPS["commenter"]] = {
             "relation": [{"id": commenter_contact_id}]
+        }
+    if commented_at:
+        properties[KORREKSJONER_PROPS["commented_at"]] = {
+            "date": {"start": commented_at}
         }
     if parent_korreksjon_id is not None:
         # Reply: nest under the parent comment, no direct round relation

@@ -509,6 +509,7 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
             project_page_id=project_page_id,
             parent_korreksjon_id=parent_korreksjon_id,
             commenter_contact_id=commenter_contact_id,
+            commented_at=comment.get("created_at"),
         )
     except Exception as err:  # noqa: BLE001
         logger.exception(

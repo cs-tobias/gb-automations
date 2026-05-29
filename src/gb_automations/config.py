@@ -530,6 +530,8 @@ KORREKSJONER_PROPS = {
     # The contact carries the name + email, so we don't duplicate those onto the
     # row. Configured as a two-way relation so each Contact shows its comments.
     "commenter": "Kommentert av",          # relation → Contacts DB
+    # date — when the comment was made in Frame (comment.created_at).
+    "commented_at": "Dato",
     # relation → Oppgaver DB: the Korreksjonsrunde N row this comment belongs to.
     "korreksjonsrunde": "Korreksjonsrunde",
     # relation → Projects DB: the project this comment's deliverable belongs to.
