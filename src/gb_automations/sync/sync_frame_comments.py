@@ -48,7 +48,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,7 +59,11 @@ from gb_automations.config import (
     settings,
 )
 from gb_automations.db import SessionLocal
-from gb_automations.models import FrameComment, FrameLeveranseFolder
+from gb_automations.models import (
+    FrameComment,
+    FrameKorreksjonsrunde,
+    FrameLeveranseFolder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,11 +259,24 @@ async def _resolve_leveranse(
 
 
 async def _ensure_korreksjonsrunde_oppgave(
-    *, leveranse_page_id: str, round_number: int
+    *, leveranse_page_id: str, round_number: int, project_page_id: str | None
 ) -> str | None:
     """Return the page id of the "Korreksjonsrunde N" sub-row for this
     deliverable (in the Oppgaver DB), creating it lazily on the first
     comment of the round.
+
+    Dedup is keyed on the local `frame_korreksjonsrunder` cache, NOT a
+    Notion query: Notion's `/databases/query` index is eventually
+    consistent and lags page creation by seconds, so a burst of comments
+    in a fresh round would each fail to see the row a prior comment just
+    created and spawn duplicate "Korreksjonsrunde N" rows. Postgres is
+    read-your-writes, so the cache closes that race. Resolution order:
+
+      1. Local cache hit → validate the page is still live in Notion
+         (self-heal: evict + fall through on a stale id).
+      2. Notion query fallback (covers rows created before this cache
+         existed, or after a cache eviction) → backfill the cache.
+      3. Create the row, persist to the cache.
 
     Returns None if OPPGAVER_DB_ID is unset OR the create fails — caller
     treats that as "skip the Notion write" (the FrameComment row is also
@@ -273,16 +290,51 @@ async def _ensure_korreksjonsrunde_oppgave(
             round_number,
         )
         return None
+
+    # 1. Local cache — strongly consistent, immune to Notion's query lag.
+    async with SessionLocal() as session:
+        cached = await session.get(
+            FrameKorreksjonsrunde, (leveranse_page_id, round_number)
+        )
+    if cached is not None:
+        if await notion_client.page_is_live(cached.notion_page_id):
+            return cached.notion_page_id
+        # Stale cache id (round row deleted/archived in Notion) — evict and
+        # re-resolve below.
+        logger.info(
+            "frame_comments: cached Korreksjonsrunde %d for deliverable %s "
+            "(page %s) is gone — evicting cache",
+            round_number,
+            leveranse_page_id,
+            cached.notion_page_id,
+        )
+        async with SessionLocal() as session:
+            await session.execute(
+                delete(FrameKorreksjonsrunde).where(
+                    FrameKorreksjonsrunde.leveranse_page_id == leveranse_page_id,
+                    FrameKorreksjonsrunde.round_number == round_number,
+                )
+            )
+            await session.commit()
+
+    # 2. Notion query fallback (pre-cache rows, or post-eviction). Backfill
+    # the cache on a hit so the next comment skips the query.
     existing = await notion_client.find_korreksjonsrunde_row(
         leveranse_page_id, round_number
     )
     if existing:
+        await _cache_korreksjonsrunde(leveranse_page_id, round_number, existing)
         return existing
+
+    # 3. Create + cache.
     created = await notion_client.create_korreksjonsrunde_row(
         deliverable_page_id=leveranse_page_id,
         round_number=round_number,
+        project_page_id=project_page_id,
     )
     page_id = created.get("id")
+    if page_id:
+        await _cache_korreksjonsrunde(leveranse_page_id, round_number, page_id)
     logger.info(
         "frame_comments: created Korreksjonsrunde %d sub-row for deliverable %s (page %s)",
         round_number,
@@ -290,6 +342,32 @@ async def _ensure_korreksjonsrunde_oppgave(
         page_id,
     )
     return page_id
+
+
+async def _cache_korreksjonsrunde(
+    leveranse_page_id: str, round_number: int, notion_page_id: str
+) -> None:
+    """Upsert the (deliverable, round) → round-row-page-id dedup cache.
+
+    ON CONFLICT DO NOTHING: a concurrent/duplicate writer that already
+    inserted the (leveranse, round) key wins — we keep whichever page id
+    landed first. (Worker is single-consumer today, so the conflict path
+    is purely belt-and-suspenders for a future CONCURRENCY>1.)
+    """
+    stmt = (
+        pg_insert(FrameKorreksjonsrunde)
+        .values(
+            leveranse_page_id=leveranse_page_id,
+            round_number=round_number,
+            notion_page_id=notion_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["leveranse_page_id", "round_number"]
+        )
+    )
+    async with SessionLocal() as session:
+        await session.execute(stmt)
+        await session.commit()
 
 
 # ============================================================
@@ -469,6 +547,7 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
     runde_oppgave_id = await _ensure_korreksjonsrunde_oppgave(
         leveranse_page_id=leveranse_page_id,
         round_number=round_number,
+        project_page_id=project_page_id,
     )
     if runde_oppgave_id is None:
         result.action = "skipped"

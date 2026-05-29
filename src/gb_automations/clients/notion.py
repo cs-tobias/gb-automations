@@ -676,6 +676,7 @@ async def create_korreksjonsrunde_row(
     *,
     deliverable_page_id: str,
     round_number: int,
+    project_page_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a "Korreksjonsrunde N" sub-row in the Oppgaver DB, parented
     (sub-item) under its deliverable. Returns the created page object.
@@ -684,6 +685,12 @@ async def create_korreksjonsrunde_row(
     sub-item of the deliverable via the OPPGAVER_PROPS["parent"] relation.
     It is the Notion anchor that the individual Korreksjon rows (in the
     Korreksjoner DB) relate back to.
+
+    `project_page_id`, when set, writes the OPPGAVER_PROPS["project"]
+    relation → Projects DB. Deliverable rows carry this relation, and the
+    team's Oppgaver views group/filter by project; a round sub-row missing
+    it falls out of those grouped views and reads as orphaned. Skipped
+    silently if None.
 
     Caller is responsible for the dedup check (see find_korreksjonsrunde_row).
     Raises RuntimeError if OPPGAVER_DB_ID is unset.
@@ -703,6 +710,10 @@ async def create_korreksjonsrunde_row(
         OPPGAVER_PROPS["round"]: {"number": round_number},
         OPPGAVER_PROPS["parent"]: {"relation": [{"id": deliverable_page_id}]},
     }
+    if project_page_id:
+        properties[OPPGAVER_PROPS["project"]] = {
+            "relation": [{"id": project_page_id}]
+        }
     async with _client() as client:
         response = await _with_retries(
             lambda: client.post(

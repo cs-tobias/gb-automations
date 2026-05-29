@@ -446,6 +446,39 @@ class FrameComment(Base):
     )
 
 
+class FrameKorreksjonsrunde(Base):
+    """Notion "Korreksjonsrunde N" row ↔ its (deliverable, round) key.
+
+    Dedup cache for the lazily-created round sub-rows. The first Frame
+    comment of round N under a deliverable creates the "Korreksjonsrunde N"
+    row in the Oppgaver DB; this table records `(leveranse_page_id,
+    round_number) → notion_page_id` so the *next* comment of the same round
+    finds the existing row from Postgres instead of querying Notion.
+
+    Why this can't ride on a Notion query alone: Notion's
+    `/databases/{id}/query` index is eventually consistent, lagging page
+    creation by seconds. When two comments of a fresh round arrive in a
+    burst (the normal review pattern), the second comment's query doesn't
+    yet see the round row the first one created → it creates a duplicate.
+    Postgres is read-your-writes, so caching the create here closes the
+    race. Notion stays the source of truth; this is pure dedup (same
+    contract as ContactCache / FrameLeveranseFolder).
+
+    Self-heal: if the cached page id is later found archived/deleted in
+    Notion, the read path evicts the row and re-resolves (falling back to
+    the Notion query, then create).
+    """
+
+    __tablename__ = "frame_korreksjonsrunder"
+
+    leveranse_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    round_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    inserted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class TogglProject(Base):
     """Notion project page ↔ Toggl Track project, one row per project.
 
