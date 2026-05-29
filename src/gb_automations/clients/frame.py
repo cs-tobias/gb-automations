@@ -214,7 +214,14 @@ async def _get_all_pages(
         if isinstance(nxt, dict):
             nxt = nxt.get("href") or nxt.get("url")
         if isinstance(nxt, str) and nxt:
-            next_path = nxt.replace(FRAME_API_BASE, "") or None
+            # Strip the base URL if Frame returns an absolute next link.
+            # Frame also returns relative paths like /v4/accounts/... —
+            # strip the leading /v4 so httpx doesn't double it with the
+            # /v4 already in FRAME_API_BASE (the client's base_url).
+            stripped = nxt.replace(FRAME_API_BASE, "")
+            if stripped.startswith("/v4/"):
+                stripped = stripped[3:]  # /v4/accounts/... → /accounts/...
+            next_path = stripped or None
             continue
         cursor = (
             pagination.get("next_cursor")
