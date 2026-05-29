@@ -685,6 +685,7 @@ async def create_korreksjon_row(
     round_number: int,
     project_page_id: str | None = None,
     parent_korreksjon_id: str | None = None,
+    commenter_contact_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a Korreksjon row (one per Frame comment) in the Korreksjoner DB.
     Returns the created page object.
@@ -692,7 +693,8 @@ async def create_korreksjon_row(
     The row relates to its Korreksjonsrunde row (which lives in the Oppgaver
     DB) via KORREKSJONER_PROPS["korreksjonsrunde"] and carries Runde=N
     inherited from the round. There's no per-row Type: every row in the
-    Korreksjoner DB is a Korreksjon by construction.
+    Korreksjoner DB is a Korreksjon by construction. `name` is the clean
+    comment body (the commenter is recorded structurally, not prefixed in).
 
     `project_page_id`, when set, writes the KORREKSJONER_PROPS["project"]
     relation → Projects DB, denormalized onto the row so the feedback list is
@@ -705,6 +707,11 @@ async def create_korreksjon_row(
     comment's Korreksjon, 3-level deep). Replies do NOT carry the
     Korreksjonsrunde relation: that keeps the round's direct-child count
     (count_korreksjon_children) free of replies.
+
+    `commenter_contact_id`, when set, writes the KORREKSJONER_PROPS["commenter"]
+    relation → Contacts DB (the find-or-created contact for the Frame author).
+    The contact carries the name + email, so they aren't duplicated onto the
+    row. Skipped silently if None.
 
     Raises RuntimeError if KORREKSJONER_DB_ID is unset.
     """
@@ -719,6 +726,10 @@ async def create_korreksjon_row(
     if project_page_id is not None:
         properties[KORREKSJONER_PROPS["project"]] = {
             "relation": [{"id": project_page_id}]
+        }
+    if commenter_contact_id:
+        properties[KORREKSJONER_PROPS["commenter"]] = {
+            "relation": [{"id": commenter_contact_id}]
         }
     if parent_korreksjon_id is not None:
         # Reply: nest under the parent comment, no direct round relation

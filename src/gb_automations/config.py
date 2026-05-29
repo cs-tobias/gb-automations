@@ -524,7 +524,12 @@ OPPGAVER_PROPS = {
 # items, one row per Frame comment (replies nested via `parent`). Each row
 # relates to its Korreksjonsrunde row, which lives over in the Oppgaver DB.
 KORREKSJONER_PROPS = {
-    "name": "Navn",                        # title — author + comment text
+    "name": "Navn",                        # title — the clean comment text
+    # The Frame commenter, as a relation to the Contacts DB (find-or-created by
+    # email — Frame requires a name + email to comment, so there's always one).
+    # The contact carries the name + email, so we don't duplicate those onto the
+    # row. Configured as a two-way relation so each Contact shows its comments.
+    "commenter": "Kommentert av",          # relation → Contacts DB
     # relation → Oppgaver DB: the Korreksjonsrunde N row this comment belongs to.
     "korreksjonsrunde": "Korreksjonsrunde",
     # relation → Projects DB: the project this comment's deliverable belongs to.

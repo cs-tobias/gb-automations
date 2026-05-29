@@ -108,16 +108,36 @@ def _author_display(comment: dict) -> str:
     return "External reviewer"
 
 
-def _bullet_text(comment: dict) -> str:
-    """`<Author>: <comment text>` — same format used for both top-level
-    and reply bullets. Empty body falls back to a placeholder so the
-    bullet still has *something* to display (Notion rejects empty
-    rich_text in some block types)."""
-    author = _author_display(comment)
+def _comment_body(comment: dict) -> str:
+    """The clean comment text for the Korreksjon row title — no author prefix.
+    Empty body falls back to a placeholder so the title isn't blank (Notion
+    rejects empty rich_text in some contexts)."""
     text = (comment.get("text") or "").strip()
-    if not text:
-        text = "(empty comment)"
-    return f"{author}: {text}"
+    return text or "(empty comment)"
+
+
+async def _resolve_commenter(comment: dict) -> str | None:
+    """Resolve the Frame comment's author to a Contacts DB page id, or None.
+
+    Find-or-create the contact by email — mirrors the email-sync contact
+    upsert so a commenter automatically becomes a Contact. Frame requires a
+    name + email to comment, so an email is normally present; with no email
+    (or no Contacts DB configured) we make no relation. The contact row holds
+    the name + email, so the Korreksjon row only needs the relation.
+    """
+    owner = comment.get("owner")
+    if not isinstance(owner, dict):
+        return None
+    name = (owner.get("name") or "").strip() or None
+    email = (owner.get("email") or "").strip() or None
+    if not (email and settings.contacts_db_id):
+        return None
+
+    existing = await notion_client.find_contact_by_email(email)
+    if existing is None:
+        created = await notion_client.create_contact(name=name or email, email=email)
+        return created.get("id")
+    return existing.get("id")
 
 
 # ============================================================
@@ -440,8 +460,9 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
     result.is_reply = parent_comment_id is not None
     result.parent_comment_id = parent_comment_id
 
-    name = _bullet_text(comment)  # used as the row title; same author + text format
+    name = _comment_body(comment)  # row title is the CLEAN comment text
     body_snippet = (comment.get("text") or "")[:512]
+    commenter_contact_id = await _resolve_commenter(comment)
 
     # Find or create the Korreksjonsrunde N row. Round-create is rare —
     # only the first comment of a new round needs it.
@@ -487,6 +508,7 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
             round_number=round_number,
             project_page_id=project_page_id,
             parent_korreksjon_id=parent_korreksjon_id,
+            commenter_contact_id=commenter_contact_id,
         )
     except Exception as err:  # noqa: BLE001
         logger.exception(
