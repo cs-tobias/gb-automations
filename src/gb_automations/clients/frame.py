@@ -171,6 +171,70 @@ def _client_id() -> str:
 # ============================================================
 
 
+# A defensive cap so a malformed cursor (one that never advances or loops back)
+# can't spin forever. 50 pages * the V4 default page size is far more than any
+# real Goldbox workspace/folder will ever hold.
+_MAX_PAGES = 50
+
+
+async def _get_all_pages(
+    client: httpx.AsyncClient, path: str, *, op_name: str
+) -> list[dict[str, Any]]:
+    """GET every page of a V4 list endpoint and return the concatenated `data`.
+
+    The adopt-by-name logic MUST see every existing project/folder — if a
+    match falls on page 2 and we only read page 1, we'd create a duplicate
+    instead of adopting. So we follow the cursor to exhaustion.
+
+    V4 paginates via a `links.next` (a full or relative URL to the next page)
+    and/or a `cursor`/`next_cursor` token echoed under `links`/`pagination`.
+    We handle both shapes and a `?page=N` fallback, stopping when no further
+    cursor is offered. The page cap (`_MAX_PAGES`) guards against a cursor that
+    never terminates.
+    """
+    items: list[dict[str, Any]] = []
+    next_path: str | None = path
+    seen_paths: set[str] = set()
+    for _ in range(_MAX_PAGES):
+        if not next_path or next_path in seen_paths:
+            break
+        seen_paths.add(next_path)
+        response = await _with_retries(
+            lambda p=next_path: client.get(p), op_name=op_name
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        items.extend(payload.get("data", []))
+
+        links = payload.get("links") or {}
+        pagination = payload.get("pagination") or {}
+        # `links.next` may be an absolute URL — strip the base so it stays a
+        # path the client (with its base_url) can re-issue.
+        nxt = links.get("next")
+        if isinstance(nxt, dict):
+            nxt = nxt.get("href") or nxt.get("url")
+        if isinstance(nxt, str) and nxt:
+            next_path = nxt.replace(FRAME_API_BASE, "") or None
+            continue
+        cursor = (
+            pagination.get("next_cursor")
+            or pagination.get("cursor")
+            or links.get("next_cursor")
+        )
+        if cursor:
+            sep = "&" if "?" in path else "?"
+            next_path = f"{path}{sep}cursor={cursor}"
+            continue
+        next_path = None
+    else:
+        logger.warning(
+            "frame %s hit the %d-page cap — adoption may have missed entries",
+            op_name,
+            _MAX_PAGES,
+        )
+    return items
+
+
 async def whoami() -> dict[str, Any]:
     """`GET /v4/me` — returns the authenticated user's profile.
 
@@ -226,19 +290,20 @@ async def list_projects(account_id: str, workspace_id: str) -> list[dict[str, An
     sync_frame uses this to find existing same-name projects before creating
     a duplicate (adopt-by-name pattern). Each Notion project corresponds to
     one Frame Project, listed here in the workspace's Active Projects view.
-    Returns the raw `data` array — each item has at least `id` and `name`,
-    plus typically `root_folder_id` and `view_url`.
+    Returns the concatenated `data` across all pages — each item has at least
+    `id` and `name`, plus typically `root_folder_id` and `view_url`.
+
+    Paginated to exhaustion: adoption must see EVERY project, or a match on a
+    later page is missed and we'd create a duplicate project alongside the
+    client's existing one.
     """
     token = await frame_auth.get_access_token()
     async with await _client(access_token=token) as client:
-        response = await _with_retries(
-            lambda: client.get(
-                f"/accounts/{account_id}/workspaces/{workspace_id}/projects"
-            ),
+        return await _get_all_pages(
+            client,
+            f"/accounts/{account_id}/workspaces/{workspace_id}/projects",
             op_name="list_projects",
         )
-        _raise_for_status(response)
-        return response.json().get("data", [])
 
 
 async def create_project(workspace_id: str, name: str) -> dict[str, Any]:
@@ -356,23 +421,23 @@ async def get_folder(folder_id: str) -> dict[str, Any]:
 
 
 async def list_folder_children(folder_id: str) -> list[dict[str, Any]]:
-    """List a folder's direct children. Used by `_ensure_discipline_folder` to
-    find an existing discipline folder before creating a duplicate.
+    """List a folder's direct children. Used by `_ensure_discipline_folder`
+    and the placeholder-file lookup to find an existing entity before creating
+    a duplicate.
 
-    No pagination cursor passed for now: a Goldbox project never has more
-    than a handful of discipline folders. Add ?after=... if a real project
-    ever blows past the default page size.
+    Paginated to exhaustion: when adoption runs against a CLIENT'S already-
+    populated project (turning the integration on mid-project), the root folder
+    can hold many entries. If our discipline folder / placeholder match sits on
+    a later page and we only read the first, we'd create a duplicate alongside
+    their existing structure.
     """
     token = await frame_auth.get_access_token()
     async with await _client(access_token=token) as client:
-        response = await _with_retries(
-            lambda: client.get(
-                f"/accounts/{_account_id()}/folders/{folder_id}/children"
-            ),
+        return await _get_all_pages(
+            client,
+            f"/accounts/{_account_id()}/folders/{folder_id}/children",
             op_name="list_folder_children",
         )
-        _raise_for_status(response)
-        return response.json().get("data", [])
 
 
 async def create_folder(parent_folder_id: str, name: str) -> dict[str, Any]:

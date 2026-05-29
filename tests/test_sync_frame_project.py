@@ -456,9 +456,17 @@ def test_adopts_existing_workspace_project(monkeypatch):
     async def fake_set_url(page_id, url):
         set_url_calls.append((page_id, url))
 
+    children_listed: list[str] = []
+
+    async def fake_list_children(folder_id):
+        # The adopt branch audits pre-existing root contents for the log line.
+        children_listed.append(folder_id)
+        return [{"id": "f1", "name": "Interiør", "type": "folder"}]
+
     monkeypatch.setattr(sf, "_find_workspace_project_by_name", fake_find)
     monkeypatch.setattr(sf.frame_client, "create_project", fake_create_project)
     monkeypatch.setattr(sf.frame_client, "get_project", fake_get_project)
+    monkeypatch.setattr(sf.frame_client, "list_folder_children", fake_list_children)
     monkeypatch.setattr(sf.notion_client, "set_project_frame_url", fake_set_url)
 
     session = _FakeSession(get_returns=None)
@@ -467,6 +475,8 @@ def test_adopts_existing_workspace_project(monkeypatch):
     result = asyncio.run(sf.sync_frame_project("p1"))
 
     assert result.action == "adopted"
+    # The adoption audit log must inspect the adopted project's root folder.
+    assert children_listed == ["preRoot"]
     assert result.frame_project_id == "preExisting"
     assert result.frame_folder_id == "preRoot"
     assert result.frame_url == "https://next.frame.io/project/preExisting"
@@ -503,6 +513,7 @@ def test_adopts_existing_then_fetches_when_view_url_missing(monkeypatch):
     monkeypatch.setattr(sf, "_find_workspace_project_by_name", fake_find)
     monkeypatch.setattr(sf.frame_client, "get_project", fake_get_project)
     monkeypatch.setattr(sf.frame_client, "create_project", fake_create_project)
+    monkeypatch.setattr(sf.frame_client, "list_folder_children", _aval([]))
     monkeypatch.setattr(sf.notion_client, "set_project_frame_url", _aval(None))
 
     session = _FakeSession(get_returns=None)
@@ -515,6 +526,101 @@ def test_adopts_existing_then_fetches_when_view_url_missing(monkeypatch):
     assert result.frame_folder_id == "preRoot"
     assert get_project_calls == ["preExisting"]
     assert result.frame_url == "https://next.frame.io/project/preExisting"
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+        self.is_success = True
+        self.status_code = 200
+
+    def json(self):
+        return self._payload
+
+
+class _PagingClient:
+    """Fake httpx client returning a scripted sequence of pages keyed by the
+    path requested. Records every path so we can assert the cursor was
+    followed."""
+
+    def __init__(self, pages_by_path):
+        self._pages = pages_by_path
+        self.requested: list[str] = []
+
+    async def get(self, path):
+        self.requested.append(path)
+        return _FakeResp(self._pages[path])
+
+
+def test_get_all_pages_follows_links_next():
+    """_get_all_pages must concatenate every page so adoption sees entries on
+    later pages — otherwise a same-name folder/project past page 1 is missed
+    and we'd create a duplicate."""
+    base = "/accounts/a/workspaces/w/projects"
+    client = _PagingClient(
+        {
+            base: {
+                "data": [{"id": "1", "name": "A"}],
+                "links": {"next": frame_client.FRAME_API_BASE + base + "?cursor=c2"},
+            },
+            base + "?cursor=c2": {
+                "data": [{"id": "2", "name": "B"}],
+                "links": {},
+            },
+        }
+    )
+    items = asyncio.run(
+        frame_client._get_all_pages(client, base, op_name="list_projects")
+    )
+    assert [i["id"] for i in items] == ["1", "2"]
+    assert client.requested == [base, base + "?cursor=c2"]
+
+
+def test_get_all_pages_single_page_stops():
+    """No next cursor → exactly one request, no duplicate fetches."""
+    base = "/accounts/a/folders/f/children"
+    client = _PagingClient({base: {"data": [{"id": "1"}], "links": {}}})
+    items = asyncio.run(
+        frame_client._get_all_pages(client, base, op_name="list_folder_children")
+    )
+    assert [i["id"] for i in items] == ["1"]
+    assert client.requested == [base]
+
+
+def test_get_all_pages_pagination_cursor_token():
+    """The `pagination.next_cursor` shape is followed too (not just links.next)."""
+    base = "/accounts/a/folders/f/children"
+    client = _PagingClient(
+        {
+            base: {
+                "data": [{"id": "1"}],
+                "pagination": {"next_cursor": "tok"},
+            },
+            base + "?cursor=tok": {"data": [{"id": "2"}], "pagination": {}},
+        }
+    )
+    items = asyncio.run(
+        frame_client._get_all_pages(client, base, op_name="list_folder_children")
+    )
+    assert [i["id"] for i in items] == ["1", "2"]
+
+
+def test_get_all_pages_breaks_on_repeated_path():
+    """A cursor that points back at a path already seen must not loop forever."""
+    base = "/accounts/a/folders/f/children"
+    client = _PagingClient(
+        {
+            base: {
+                "data": [{"id": "1"}],
+                "links": {"next": frame_client.FRAME_API_BASE + base},
+            }
+        }
+    )
+    items = asyncio.run(
+        frame_client._get_all_pages(client, base, op_name="list_folder_children")
+    )
+    assert [i["id"] for i in items] == ["1"]
+    assert client.requested == [base]
 
 
 if __name__ == "__main__":

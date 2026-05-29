@@ -398,6 +398,35 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
                         )
                     url = _project_view_url(adopted, project_id)
                     action = "adopted"
+                    # Adoption means we're now operating inside a project the
+                    # client may already have content in. Log what's there so a
+                    # first sync is auditable (we never delete/move/overwrite —
+                    # only add our discipline folders + V00 placeholders beside
+                    # whatever exists).
+                    try:
+                        preexisting = await frame_client.list_folder_children(
+                            root_folder_id
+                        )
+                        n_folders = sum(
+                            1
+                            for c in preexisting
+                            if c.get("type") in (None, "folder")
+                        )
+                        logger.info(
+                            "frame: adopted existing project %r (id=%s) — "
+                            "root holds %d pre-existing entries (%d folders); "
+                            "sync only adds alongside, never overwrites",
+                            leaf,
+                            project_id,
+                            len(preexisting),
+                            n_folders,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "frame: adopted project %s but failed to list "
+                            "pre-existing root contents (non-fatal)",
+                            project_id,
+                        )
                 else:
                     new_project = await frame_client.create_project(
                         settings.frame_workspace_id, leaf
