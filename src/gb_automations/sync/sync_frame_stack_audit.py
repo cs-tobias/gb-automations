@@ -217,12 +217,20 @@ async def audit_frame_stack(stack_id: str) -> FrameStackAuditResult:
         )
         result.rounds_seen += 1
 
-    # 5. Mirror the live `sync_frame_comment` path: if we backfilled any
-    # comments, ensure the deliverable's status is at least `Klar til
+    # 5. Mirror the live `sync_frame_comment` path: if the stack has ANY
+    # comments at all (newly inserted OR already cached from a prior
+    # run), ensure the deliverable's status is at least `Klar til
     # oppstart`. The live path does this on the first top-level comment
     # (see sync_frame_comments.py around line 710); the audit needs the
     # same nudge so the end state matches "what would have happened if
     # these comments had landed live, one by one".
+    #
+    # Gating on `comments_inserted + comments_already_cached` (not just
+    # `inserted`) is what makes a RE-RUN of the audit on a project
+    # whose comments were already backfilled still produce the right
+    # status. Pre-fix, the user saw a Sync re-click report "0 inserted,
+    # N already cached" and then the rollup engine refused to downgrade
+    # a stale Ferdig because 0/N done left status alone.
     #
     # The rollup engine downstream (enqueued just below) handles the
     # higher transitions: any Korreksjon checked → Under arbeid; all
@@ -232,7 +240,7 @@ async def audit_frame_stack(stack_id: str) -> FrameStackAuditResult:
     # and respects MANUAL_DELIVERABLE_STATUSES, so this is safe when
     # the deliverable is already further along or pinned to a manual
     # override.
-    if result.comments_inserted > 0:
+    if (result.comments_inserted + result.comments_already_cached) > 0:
         try:
             await notion_client.set_deliverable_status(
                 leveranse_page_id, STATUS_KLAR_TIL_OPPSTART
