@@ -539,6 +539,27 @@ async def get_file(file_id: str) -> dict[str, Any]:
         return _unwrap(response.json())
 
 
+async def delete_file(file_id: str) -> None:
+    """Delete a Frame file. Used by the placeholder re-upload path when
+    Frame's async background fetcher dropped the source-url fetch and
+    left the file with empty media — we re-create the file from scratch
+    instead of trying to PATCH bytes onto an existing slot (V4 doesn't
+    expose that). 404 is treated as already-gone (idempotent)."""
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.delete(
+                f"/accounts/{_account_id()}/files/{file_id}"
+            ),
+            op_name="delete_file",
+        )
+        if response.status_code == 404:
+            logger.info("frame file %s already deleted", file_id)
+            return
+        _raise_for_status(response)
+        logger.info("frame file %s deleted", file_id)
+
+
 async def rename_file(file_id: str, new_name: str) -> dict[str, Any]:
     """Rename a file in place. Same `PATCH /accounts/{aid}/files/{id}` shape as
     `rename_folder` — Frame V4 keeps the file id stable, so its membership in a

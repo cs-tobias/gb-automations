@@ -42,6 +42,7 @@ individual Korreksjon rows land in the Korreksjoner DB.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -535,6 +536,128 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
     return result
 
 
+# How long to wait before checking whether Frame fetched the placeholder
+# source URL. Frame's async fetcher typically hits us within 1-2s of
+# `create_file_from_url` returning (verified via the `🖼 placeholder
+# render` log), so 15s leaves a comfortable margin for slow fetches +
+# Frame's internal retries.
+_PLACEHOLDER_VERIFY_WAIT_SECONDS = 15.0
+
+
+def _frame_file_has_media(file_obj: dict) -> bool:
+    """Did Frame's async background fetcher actually ingest bytes from
+    our source URL?
+
+    The load-bearing signal is `file_size > 0`. Verified live against
+    Frame V4 on Goldbox's tenant: a placeholder where Frame's fetch
+    dropped comes back with `status="transcoded"` (the standard
+    "processing done" status) and `media_type="image/png"` (derived from
+    the upload's filename extension at create time, NOT from fetched
+    bytes) — so neither field is a discriminator. Only `file_size: 0`
+    reliably indicates "Frame finished its pipeline with zero bytes
+    ingested."
+
+    Defensive: if the payload doesn't include `file_size` (older API
+    surface, or a shape drift), we treat the file as fetched-OK to
+    avoid spuriously re-uploading. The whole verify-and-retry path is
+    a workaround for a Frame-side race, not a hard correctness gate —
+    a false negative is acceptable, a false positive (= no retry when
+    we should retry) is what we're tightening here.
+    """
+    if not isinstance(file_obj, dict):
+        return False
+    if "file_size" not in file_obj:
+        return True  # field missing → can't say, assume OK
+    size = file_obj.get("file_size")
+    return isinstance(size, (int, float)) and size > 0
+
+
+async def _verify_or_reupload_placeholder(
+    *,
+    placeholder_id: str,
+    discipline_folder_id: str,
+    filename: str,
+    leveranse_page_id: str,
+) -> tuple[str, dict]:
+    """Wait for Frame to fetch the placeholder source URL, then verify
+    the file has media. If Frame dropped the fetch (bulk-concurrency
+    race observed under project-level Sync fan-out), delete the empty
+    file and re-create it once. Returns the (file_id, file_obj) of the
+    final placeholder.
+
+    Single retry: the race is rare enough that one re-upload nearly
+    always succeeds. If the second attempt also drops, we leave it as-is
+    and log a WARNING — the operator can re-click Sync on the row, or
+    spot it in the log and intervene.
+    """
+    await asyncio.sleep(_PLACEHOLDER_VERIFY_WAIT_SECONDS)
+    try:
+        file_obj = await frame_client.get_file(placeholder_id)
+    except Exception:
+        logger.warning(
+            "frame: placeholder verify GET failed for %s — assuming OK",
+            placeholder_id,
+            exc_info=True,
+        )
+        return placeholder_id, {}
+
+    if _frame_file_has_media(file_obj):
+        logger.info(
+            "frame: placeholder %s for leveranse %s verified — Frame "
+            "ingested the source URL ok",
+            placeholder_id,
+            leveranse_page_id,
+        )
+        return placeholder_id, file_obj
+
+    logger.warning(
+        "frame: placeholder %s for leveranse %s has NO media after "
+        "%.0fs — Frame's async fetcher dropped the fetch. Deleting + "
+        "re-uploading.",
+        placeholder_id,
+        leveranse_page_id,
+        _PLACEHOLDER_VERIFY_WAIT_SECONDS,
+    )
+    try:
+        await frame_client.delete_file(placeholder_id)
+    except Exception:
+        logger.warning(
+            "frame: delete of empty placeholder %s failed — re-upload may "
+            "fail with a duplicate-name error",
+            placeholder_id,
+            exc_info=True,
+        )
+
+    new_file = await frame_client.create_file_from_url(
+        discipline_folder_id,
+        filename,
+        _placeholder_source_url(leveranse_page_id),
+    )
+    new_id = new_file["id"]
+    # Second verify — short wait, no retry beyond this. The race is
+    # rare; two drops in a row would be exceptional and worth surfacing.
+    await asyncio.sleep(_PLACEHOLDER_VERIFY_WAIT_SECONDS)
+    try:
+        verified = await frame_client.get_file(new_id)
+    except Exception:
+        return new_id, new_file
+    if not _frame_file_has_media(verified):
+        logger.warning(
+            "frame: placeholder %s for leveranse %s STILL has no media "
+            "after re-upload — operator should re-click Sync on this row",
+            new_id,
+            leveranse_page_id,
+        )
+    else:
+        logger.info(
+            "frame: placeholder %s for leveranse %s — re-upload succeeded, "
+            "Frame ingested the source URL",
+            new_id,
+            leveranse_page_id,
+        )
+    return new_id, verified
+
+
 async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
     """Mirror one Notion Leveranse page to a Frame.io folder + placeholder
     file under its project's discipline subfolder. Recursively provisions
@@ -675,6 +798,20 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
                         _placeholder_source_url(leveranse_page_id),
                     )
                     placeholder_id = placeholder["id"]
+                    # Verify Frame actually fetched the source URL. Under
+                    # bulk-Sync fan-out we've observed Frame's async
+                    # fetcher dropping the very first leveranse's fetch
+                    # (the file is created with the right name + id, but
+                    # `🖼 placeholder render` is never logged on our
+                    # side → Frame ingested empty bytes → broken preview).
+                    # If detected, the helper deletes + re-uploads once;
+                    # the (possibly new) id + payload is what we cache.
+                    placeholder_id, placeholder = await _verify_or_reupload_placeholder(
+                        placeholder_id=placeholder_id,
+                        discipline_folder_id=discipline_folder_id,
+                        filename=placeholder_filename,
+                        leveranse_page_id=leveranse_page_id,
+                    )
                     url = _file_view_url(placeholder, placeholder_id, project_id_for_url)
                     action = "created"
                 # `frame_folder_id` now stores the SHARED discipline folder id

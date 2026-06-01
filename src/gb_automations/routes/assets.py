@@ -34,6 +34,14 @@ router = APIRouter(prefix="/assets", tags=["assets"])
 _BG_FETCH_TIMEOUT = 15.0
 _BG_MAX_BYTES = 25 * 1024 * 1024
 
+# Pre-baked solid-black PNG used as a last-resort fallback when
+# `render_placeholder` raises. Generated once at import time so the
+# endpoint can serve a valid image without re-entering PIL on the
+# error path. Frame storing a plain-black tile is far better than
+# Frame storing a 500-error HTML body as the file content — the
+# operator can tell black-from-broken at a glance.
+_FALLBACK_PNG = render_placeholder(None, None)
+
 
 async def _fetch_bg(url: str) -> bytes | None:
     try:
@@ -71,7 +79,39 @@ async def placeholder_png(deliverable_page_id: str) -> Response:
             exc_info=True,
         )
 
-    png = await asyncio.to_thread(render_placeholder, text, bg_bytes)
+    # Bulletproof: any PIL failure (font cache race under bulk-concurrency,
+    # missing glyph, OOM, …) MUST NOT propagate as a 500 — Frame would store
+    # the error body as the file content and the deliverable shows a broken
+    # preview. Fall back to the pre-baked solid-black PNG so the endpoint
+    # always returns valid PNG bytes.
+    try:
+        png = await asyncio.to_thread(render_placeholder, text, bg_bytes)
+    except Exception:
+        logger.error(
+            "🖼  placeholder: render_placeholder raised for %s — "
+            "returning fallback PNG (Frame would otherwise store an error body)",
+            deliverable_page_id,
+            exc_info=True,
+        )
+        png = _FALLBACK_PNG
+
+    # One log line per render — surfaces which deliverables Frame actually
+    # fetches under a bulk-Sync fan-out, and what bytes we sent. Cross-
+    # reference against any broken-preview reports: missing log line →
+    # Frame never reached us (tunnel issue); log line present with normal
+    # png size → bytes were fine, problem is downstream; log line present
+    # with png size == fallback size → renderer raised (see ERROR above).
+    text_preview = (
+        text if not text else (text[:60] + "…" if len(text) > 60 else text)
+    )
+    logger.info(
+        "🖼  placeholder render for %s: text=%r bg_bytes=%d → png=%d bytes",
+        deliverable_page_id,
+        text_preview,
+        len(bg_bytes) if bg_bytes else 0,
+        len(png),
+    )
+
     # No-cache: the description/thumbnail can change between provisionings, and
     # Frame only fetches once per upload anyway, so a stale cache buys nothing.
     return Response(

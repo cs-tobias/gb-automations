@@ -115,6 +115,11 @@ def _patch_settings(monkeypatch):
     monkeypatch.setattr(sf.settings, "frame_account_id", "aP")
     monkeypatch.setattr(sf.settings, "frame_placeholder_url", "http://x/p.png")
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "Goldbox.no")
+    # Short-circuit the post-create verify step so tests don't sleep
+    # the production 15s wait. Returns the file as-is, no Frame round-trip.
+    async def _no_verify(*, placeholder_id, discipline_folder_id, filename, leveranse_page_id):
+        return placeholder_id, {}
+    monkeypatch.setattr(sf, "_verify_or_reupload_placeholder", _no_verify)
 
 
 def _aval(v):

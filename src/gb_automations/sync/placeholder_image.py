@@ -45,11 +45,24 @@ _TEXT_BOX_FRAC = 0.82
 def render_placeholder(text: str | None, bg_bytes: bytes | None) -> bytes:
     """Render a PNG placeholder. Background = `bg_bytes` (cover-cropped to the
     canvas) or solid black; `text` (when non-empty) is wrapped + centered in
-    white over a darkening scrim. Always returns valid PNG bytes."""
+    white over a darkening scrim. Always returns valid PNG bytes.
+
+    Text rendering is wrapped defensively — under bulk-Sync concurrency PIL
+    has occasionally raised on shared font handles. We log + skip the text
+    overlay rather than fail the whole render; the deliverable then shows
+    its background-or-black tile in Frame, still recognizable as the right
+    placeholder."""
     canvas = _make_background(bg_bytes)
     cleaned = (text or "").strip()
     if cleaned:
-        _draw_centered_text(canvas, cleaned, scrim=bg_bytes is not None)
+        try:
+            _draw_centered_text(canvas, cleaned, scrim=bg_bytes is not None)
+        except Exception:
+            logger.warning(
+                "placeholder: text render failed for %r — keeping bare background",
+                cleaned[:60] + "…" if len(cleaned) > 60 else cleaned,
+                exc_info=True,
+            )
     out = BytesIO()
     canvas.save(out, format="PNG")
     return out.getvalue()
