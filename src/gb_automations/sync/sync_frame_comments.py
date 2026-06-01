@@ -64,6 +64,10 @@ from gb_automations.models import (
     FrameKorreksjonsrunde,
     FrameLeveranseFolder,
 )
+from gb_automations.sync.frame_project_labels import (
+    frame_project_label_for_file,
+    frame_project_label_for_page,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -500,11 +504,17 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
     async with SessionLocal() as session:
         leveranse_row = await _resolve_leveranse(session, file_id)
     if leveranse_row is None:
+        # Best-effort: surface the Frame project name on the skip line so
+        # operators can tell at a glance which client project's noise is
+        # being dropped. One Frame round-trip per unique untracked file
+        # (memoized in frame_project_labels).
+        untracked_project = await frame_project_label_for_file(file_id)
         logger.info(
-            "frame_comments: comment %s on file %s is not on a tracked "
-            "Leveranse placeholder — skipping",
+            "frame_comments: comment %s on file %s (project=%s) is not on a "
+            "tracked Leveranse placeholder — skipping",
             comment_id,
             file_id,
+            untracked_project,
         )
         result.action = "skipped"
         result.note = "comment on untracked file"
@@ -514,28 +524,86 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
     project_page_id = leveranse_row.project_page_id
     result.leveranse_page_id = leveranse_page_id
     result.project_page_id = project_page_id
+    project_label = await frame_project_label_for_page(project_page_id)
 
     try:
-        round_number, _stack_id = await frame_client.get_file_version_info(file_id)
+        round_number, stack_id = await frame_client.get_file_version_info(file_id)
     except Exception:
         logger.exception(
-            "frame_comments: version derivation failed for file %s — "
-            "assuming round 0",
+            "frame_comments: version derivation failed for file %s "
+            "(project=%s) — assuming round 0",
             file_id,
+            project_label,
         )
         round_number = 0
+        stack_id = None
     result.round_number = round_number
 
-    # V00 placeholder noise — see Phase 2 decision.
+    # round_number == 0 means `get_file_version_info` thinks this comment
+    # lives on the V00 placeholder (the file at index 0 in the stack
+    # sorted by created_at). That's correct when V00 was really created
+    # FIRST. But it's WRONG when the team dragged a pre-existing Frame
+    # file onto V00 — the dragged file has an older created_at and ends
+    # up at index 0, while our placeholder slides to index 1+. The
+    # placeholder-id check below distinguishes the two cases:
+    #
+    #   - leveranse_row.frame_placeholder_file_id == file_id → real V00,
+    #     this is genuine placeholder noise; drop as before.
+    #
+    #   - placeholder file id is DIFFERENT from `file_id` → comment is
+    #     on a non-placeholder file the stack happens to sort first.
+    #     Defer to the stack audit, which identifies the placeholder by
+    #     cached id (not by sort index) and backfills correctly.
     if round_number == 0:
+        if leveranse_row.frame_placeholder_file_id == file_id:
+            logger.info(
+                "frame_comments: comment %s on V00 placeholder (file %s, "
+                "project=%s) — dropping (placeholder noise, not a real "
+                "delivery yet)",
+                comment_id,
+                file_id,
+                project_label,
+            )
+            result.action = "skipped"
+            result.note = "comment on V00 placeholder (pre-delivery noise)"
+            return result
+
+        # Misclassified: the index-based round inference disagrees with
+        # the placeholder-id-based truth. Hand off to the stack audit,
+        # which will (a) backfill THIS comment and any siblings on the
+        # same dragged file, (b) figure out the right round numbers
+        # for every non-placeholder version, and (c) enqueue a status
+        # recheck that uses the new branch in sync_leveranse_status.
+        if stack_id:
+            from gb_automations.sync.queue import enqueue_frame_version_sync
+
+            await enqueue_frame_version_sync(stack_id)
+            logger.info(
+                "frame_comments: comment %s on file %s (project=%s, leveranse %s) "
+                "sorts as round 0 but is not the cached placeholder — "
+                "deferring to stack audit on stack %s",
+                comment_id,
+                file_id,
+                project_label,
+                leveranse_page_id,
+                stack_id,
+            )
+            result.action = "skipped"
+            result.note = "deferred to stack audit"
+            return result
+
+        # No stack id available (the file wasn't in a stack at all per
+        # get_file_version_info). That means there's no real delivery
+        # to audit and we can't recover here — drop as before.
         logger.info(
-            "frame_comments: comment %s on V00 placeholder (file %s) — "
-            "dropping (placeholder noise, not a real delivery yet)",
+            "frame_comments: comment %s on file %s (project=%s) has no "
+            "version stack and isn't our cached placeholder — dropping",
             comment_id,
             file_id,
+            project_label,
         )
         result.action = "skipped"
-        result.note = "comment on V00 placeholder (pre-delivery noise)"
+        result.note = "comment on round-0 file with no stack"
         return result
 
     # Reply detection (Phase 2 logic, unchanged): walk the file's
@@ -658,13 +726,15 @@ async def sync_frame_comment(comment_id: str) -> FrameCommentResult:
             )
 
     logger.info(
-        "frame_comments: %s comment %s by %r → leveranse %s round %d → oppgave %s",
+        "frame_comments: %s comment %s by %r → leveranse %s round %d → "
+        "oppgave %s (project=%s)",
         "reply to " + parent_comment_id if parent_comment_id else "top-level",
         comment_id,
         _author_display(comment),
         leveranse_page_id,
         round_number,
         oppgave_page_id,
+        project_label,
     )
     return result
 

@@ -38,15 +38,19 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from gb_automations.clients import frame as frame_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
     KORREKSJON_KIND_KORREKSJONSRUNDE,
     MANUAL_DELIVERABLE_STATUSES,
     OPPGAVER_PROPS,
+    STATUS_FERDIG,
     STATUS_OPPGAVER_FERDIG,
     STATUS_UNDER_ARBEID,
     settings,
 )
+from gb_automations.db import SessionLocal
+from gb_automations.models import FrameLeveranseFolder
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +121,47 @@ async def _find_active_korreksjonsrunde(
     return None, None
 
 
+async def _has_real_version(leveranse_page_id: str) -> bool:
+    """Does this deliverable have at least one non-placeholder file in its
+    Frame version stack?
+
+    Used by the "no Korreksjonsrunde, no comments anywhere" clean-upload
+    branch to decide between `Ferdig` (a real version landed; nobody
+    commented; done) and leaving the status untouched at
+    `Klar til oppstart` (just the V00 placeholder, no real delivery yet).
+
+    Returns False on any Frame error (treat as "can't confirm a real
+    version exists, don't promote"). Returns False when SYNC_FRAME is
+    off (no Frame side to read).
+    """
+    if not settings.sync_frame:
+        return False
+    async with SessionLocal() as session:
+        row = await session.get(FrameLeveranseFolder, leveranse_page_id)
+    if row is None:
+        return False
+    placeholder_id = row.frame_placeholder_file_id
+    try:
+        file_obj = await frame_client.get_file(placeholder_id)
+    except Exception:  # noqa: BLE001
+        return False
+    parent_id = file_obj.get("parent_id")
+    if not parent_id:
+        return False
+    try:
+        children = await frame_client.list_version_stack_children(parent_id)
+    except frame_client.FrameAPIError as err:
+        if getattr(err, "status_code", None) in (404, 422):
+            # Parent is a folder, not a stack → placeholder alone, no real
+            # version on top.
+            return False
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+    # Any child id that is NOT our placeholder is a real version.
+    return any(c.get("id") != placeholder_id for c in children if c.get("id"))
+
+
 async def recheck_leveranse_status(
     leveranse_page_id: str,
 ) -> LeveranseStatusResult:
@@ -162,11 +207,54 @@ async def recheck_leveranse_status(
         return result
 
     if runde_oppgave_id is None:
+        # No correction rounds at all. Two sub-cases:
+        #
+        #   (a) "Clean upload" — a real version was uploaded on top of the
+        #       V00 placeholder and nobody commented on it. The team's
+        #       expectation here is `Ferdig`: the deliverable is done and
+        #       went through without correction. Detect this by reading
+        #       the placeholder's version stack; if there's a non-
+        #       placeholder sibling, promote to Ferdig.
+        #
+        #   (b) "Pre-delivery" — the placeholder exists alone, no real
+        #       version yet. Leave status alone (it'll be `Klar til
+        #       oppstart` from sync_frame_leveranse).
+        #
+        # Without (a) the post-audit refactor would leave clean uploads
+        # stuck at `Klar til oppstart` forever — the audit no longer
+        # writes Ferdig blindly on file.versioned; this branch does it
+        # for the "no comments anywhere" case.
+        promote = await _has_real_version(leveranse_page_id)
+        if not promote:
+            logger.info(
+                "leveranse_status: no Korreksjonsrunde rows and no real "
+                "version on stack for %s — skipping",
+                leveranse_page_id,
+            )
+            result.action = "skipped_no_round"
+            return result
+
+        try:
+            action = await notion_client.set_deliverable_status(
+                leveranse_page_id, STATUS_FERDIG
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.exception(
+                "leveranse_status: set_deliverable_status(Ferdig) failed for %s "
+                "(clean-upload branch)",
+                leveranse_page_id,
+            )
+            result.action = "failed"
+            result.note = f"Notion set_status: {err}"
+            return result
+        result.new_status = STATUS_FERDIG
+        result.action = action
+        result.note = "clean upload (no comments on real version) → Ferdig"
         logger.info(
-            "leveranse_status: no Korreksjonsrunde rows for %s — skipping",
+            "leveranse_status: leveranse %s — clean upload, no comments → Ferdig (%s)",
             leveranse_page_id,
+            action,
         )
-        result.action = "skipped_no_round"
         return result
 
     result.active_round_oppgave_id = runde_oppgave_id
