@@ -15,19 +15,19 @@ import httpx
 from gb_automations.config import (
     COMPANIES_PROPS,
     CONTACTS_PROPS,
+    DISCIPLINE_KEYS,
     EMAILS_PROPS,
+    KORREKSJON_KIND_KORREKSJONSRUNDE,
+    KORREKSJONER_PROPS,
+    MANUAL_DELIVERABLE_STATUSES,
+    OPPGAVER_FRAME_URL_PROP,
+    OPPGAVER_PROPS,
     PROJECTS_FRAME_URL_PROP,
     PROJECTS_GMAIL_URL_PROP,
     PROJECTS_NAS_URL_PROP,
-    PROJECTS_TOGGL_URL_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
-    OPPGAVER_FRAME_URL_PROP,
-    OPPGAVER_PROPS,
-    KORREKSJONER_PROPS,
-    DISCIPLINE_KEYS,
-    MANUAL_DELIVERABLE_STATUSES,
-    KORREKSJON_KIND_KORREKSJONSRUNDE,
+    PROJECTS_TOGGL_URL_PROP,
     SYNC_QUEUE_PROPS,
     settings,
 )
@@ -1393,9 +1393,16 @@ async def set_project_sync_state(
 
 
 async def find_contact_by_email(email: str) -> dict[str, Any] | None:
-    """Query the Contacts DB for an existing contact with this email address."""
+    """Query the Contacts DB for an existing contact with this email address.
+
+    Lowercased internally so callers can't accidentally create casing-based
+    duplicates. The Gmail path already normalizes upstream (`Participant.email`
+    is documented as always-lowercased); the Frame path now does too; this is
+    the chokepoint that closes the loop for any future caller.
+    """
     if not settings.contacts_db_id:
         raise RuntimeError("CONTACTS_DB_ID is not configured")
+    email = email.strip().lower()
     async with _client() as client:
         response = await client.post(
             f"/databases/{settings.contacts_db_id}/query",
@@ -1464,6 +1471,10 @@ async def create_contact(
     """
     if not settings.contacts_db_id:
         raise RuntimeError("CONTACTS_DB_ID is not configured")
+    # Lowercased so two callsites passing different casings for the same
+    # address can't produce two visually-distinct rows. Mirrors the
+    # normalization in `find_contact_by_email`.
+    email = email.strip().lower()
     properties: dict[str, Any] = {
         CONTACTS_PROPS["name"]: {"title": [{"text": {"content": name}}]},
         CONTACTS_PROPS["email"]: {"email": email},

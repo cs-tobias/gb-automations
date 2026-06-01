@@ -133,7 +133,13 @@ async def _resolve_commenter(comment: dict) -> str | None:
     if not isinstance(owner, dict):
         return None
     name = (owner.get("name") or "").strip() or None
-    email = (owner.get("email") or "").strip() or None
+    # Lowercase: Frame may emit the same address with varying case across
+    # comments. Notion's email filter is already case-insensitive in practice,
+    # but the written `E-post` value isn't — without normalizing we'd risk
+    # storing two visually-different rows for the same person. See
+    # `find_contact_by_email` / `create_contact` which also lowercase as
+    # defense in depth.
+    email = (owner.get("email") or "").strip().lower() or None
     if not (email and settings.contacts_db_id):
         return None
 
