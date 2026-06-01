@@ -53,12 +53,11 @@ from sqlalchemy import select
 
 from gb_automations.clients import frame as frame_client
 from gb_automations.clients import notion as notion_client
-from gb_automations.config import settings
+from gb_automations.config import STATUS_KLAR_TIL_OPPSTART, settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import (
     FrameComment,
     FrameLeveranseFolder,
-    FrameProjectFolder,
 )
 from gb_automations.sync.frame_project_labels import frame_project_label_for_page
 
@@ -218,10 +217,38 @@ async def audit_frame_stack(stack_id: str) -> FrameStackAuditResult:
         )
         result.rounds_seen += 1
 
-    # 5. Hand off to the rollup engine. It reads the active round's
+    # 5. Mirror the live `sync_frame_comment` path: if we backfilled any
+    # comments, ensure the deliverable's status is at least `Klar til
+    # oppstart`. The live path does this on the first top-level comment
+    # (see sync_frame_comments.py around line 710); the audit needs the
+    # same nudge so the end state matches "what would have happened if
+    # these comments had landed live, one by one".
+    #
+    # The rollup engine downstream (enqueued just below) handles the
+    # higher transitions: any Korreksjon checked → Under arbeid; all
+    # checked → Oppgaver ferdig. It deliberately does NOT downgrade
+    # from Klar til oppstart on a 0/N pass, so the audit must set the
+    # floor itself. set_deliverable_status is read-first / skip-if-same
+    # and respects MANUAL_DELIVERABLE_STATUSES, so this is safe when
+    # the deliverable is already further along or pinned to a manual
+    # override.
+    if result.comments_inserted > 0:
+        try:
+            await notion_client.set_deliverable_status(
+                leveranse_page_id, STATUS_KLAR_TIL_OPPSTART
+            )
+        except Exception:
+            logger.exception(
+                "frame_stack_audit: set_deliverable_status(Klar til oppstart) "
+                "failed for %s (non-fatal; rollup will still run)",
+                leveranse_page_id,
+            )
+
+    # 6. Hand off to the rollup engine. It reads the active round's
     # Korreksjon children and writes the correct deliverable status —
-    # `Under arbeid` / `Oppgaver ferdig` / `Ferdig` (the latter via the
-    # clean-upload branch when no rounds exist but a real version does).
+    # `Under arbeid` (some done) / `Oppgaver ferdig` (all done) /
+    # `Ferdig` (clean-upload branch when no rounds exist but a real
+    # version does).
     try:
         await enqueue_leveranse_status_recheck(leveranse_page_id)
     except Exception:
