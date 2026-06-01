@@ -35,7 +35,7 @@ collapse to a single one via the active-dedup index on sync_tasks.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from gb_automations.clients import frame as frame_client
@@ -45,6 +45,7 @@ from gb_automations.config import (
     MANUAL_DELIVERABLE_STATUSES,
     OPPGAVER_PROPS,
     STATUS_FERDIG,
+    STATUS_KLAR_TIL_OPPSTART,
     STATUS_OPPGAVER_FERDIG,
     STATUS_UNDER_ARBEID,
     settings,
@@ -65,6 +66,9 @@ class LeveranseStatusResult:
     action: str = "skipped"  # written | unchanged | skipped_manual | skipped_no_round | skipped_no_children | failed
     note: str | None = None
     new_status: str | None = None
+    # {round_number: status_written} for every round row we updated this
+    # pass. Used for log narration; not load-bearing for control flow.
+    rounds_updated: dict[int, str] = field(default_factory=dict)
 
 
 async def _find_active_korreksjonsrunde(
@@ -121,6 +125,67 @@ async def _find_active_korreksjonsrunde(
     return None, None
 
 
+async def _list_korreksjonsrunder(
+    leveranse_page_id: str,
+) -> list[tuple[str, int]]:
+    """Return every Korreksjonsrunde sub-row for this leveranse as a
+    list of `(page_id, round_number)` tuples, sorted ascending by round.
+
+    Mirrors `_find_active_korreksjonsrunde` but doesn't early-return on
+    the highest round — we now write per-round Status, so the rollup
+    engine needs to see ALL rounds. An old round that wrapped at
+    `Oppgaver ferdig` legitimately stays there; an old round whose
+    Korreksjoner are still partially open gets the bidirectional
+    treatment too (e.g. someone unchecking a box on a historical round
+    drops its status back down to `Under arbeid`).
+    """
+    if not settings.oppgaver_db_id:
+        return []
+    body: dict[str, Any] = {
+        "filter": {
+            "property": OPPGAVER_PROPS["parent"],
+            "relation": {"contains": leveranse_page_id},
+        },
+        # Ascending so the log narration reads round 1 → 2 → 3.
+        "sorts": [{"property": OPPGAVER_PROPS["round"], "direction": "ascending"}],
+        "page_size": 100,
+    }
+    from gb_automations.clients.notion import _client, _raise_for_status, _with_retries
+
+    rounds: list[tuple[str, int]] = []
+    start_cursor: str | None = None
+    async with _client() as client:
+        while True:
+            if start_cursor:
+                body["start_cursor"] = start_cursor
+            response = await _with_retries(
+                lambda: client.post(
+                    f"/databases/{settings.oppgaver_db_id}/query", json=body
+                ),
+                op_name="POST /databases/oppgaver/query list_korreksjonsrunder",
+            )
+            _raise_for_status(response)
+            payload = response.json()
+            for row in payload.get("results", []):
+                if row.get("archived") or row.get("in_trash"):
+                    continue
+                if notion_client.task_discipline(row) != KORREKSJON_KIND_KORREKSJONSRUNDE:
+                    continue
+                page_id = row.get("id")
+                props = row.get("properties") or {}
+                round_prop = props.get(OPPGAVER_PROPS["round"]) or {}
+                round_number = round_prop.get("number")
+                if page_id and isinstance(round_number, (int, float)):
+                    rounds.append((page_id, int(round_number)))
+            if not payload.get("has_more"):
+                break
+            start_cursor = payload.get("next_cursor")
+            if not start_cursor:
+                break
+    rounds.sort(key=lambda x: x[1])
+    return rounds
+
+
 async def _has_real_version(leveranse_page_id: str) -> bool:
     """Does this deliverable have at least one non-placeholder file in its
     Frame version stack?
@@ -162,13 +227,99 @@ async def _has_real_version(leveranse_page_id: str) -> bool:
     return any(c.get("id") != placeholder_id for c in children if c.get("id"))
 
 
+async def _write_round_statuses(
+    leveranse_page_id: str, result: LeveranseStatusResult
+) -> None:
+    """Walk every Korreksjonsrunde sub-row of this deliverable and write
+    its own Status from a rollup of its Korreksjon children.
+
+    Rule (bidirectional — always reflects the current count):
+      - total == 0           → leave alone (round was just created with
+                               Klar til oppstart, that's still correct).
+      - done == 0 < total    → Klar til oppstart.
+      - 0 < done < total     → Under arbeid.
+      - done == total > 0    → Oppgaver ferdig.
+
+    Touches ALL rounds (not just the active one). An old round whose
+    Korreksjoner were never all checked off legitimately walks itself
+    through the same rule. `set_oppgave_status` is read-first / skip-if-
+    same and respects manual overrides, so this is safe to run on every
+    recheck and on rounds the team has manually pinned.
+
+    Best-effort per round — a Notion blip on one round shouldn't break
+    the rest of the recheck (or block the deliverable-status writeback
+    that follows). Errors get logged and the loop moves on.
+    """
+    try:
+        rounds = await _list_korreksjonsrunder(leveranse_page_id)
+    except Exception:
+        logger.exception(
+            "leveranse_status: _list_korreksjonsrunder failed for %s — "
+            "skipping per-round status writes (deliverable status still ran)",
+            leveranse_page_id,
+        )
+        return
+    for round_page_id, round_number in rounds:
+        try:
+            total, done = await notion_client.count_korreksjon_children(round_page_id)
+        except Exception:
+            logger.exception(
+                "leveranse_status: count_korreksjon_children failed for "
+                "round %s (round %d) — skipping",
+                round_page_id,
+                round_number,
+            )
+            continue
+        if total == 0:
+            continue  # freshly created, no comments yet
+        if done == 0:
+            target = STATUS_KLAR_TIL_OPPSTART
+        elif done < total:
+            target = STATUS_UNDER_ARBEID
+        else:  # done == total > 0
+            target = STATUS_OPPGAVER_FERDIG
+        try:
+            action = await notion_client.set_oppgave_status(round_page_id, target)
+        except Exception:
+            logger.exception(
+                "leveranse_status: set_oppgave_status failed for round %s "
+                "(round %d, target=%s) — skipping",
+                round_page_id,
+                round_number,
+                target,
+            )
+            continue
+        if action == "written":
+            result.rounds_updated[round_number] = target
+            logger.info(
+                "leveranse_status: round %d (%s) (%d/%d done) → %s",
+                round_number,
+                round_page_id,
+                done,
+                total,
+                target,
+            )
+
+
 async def recheck_leveranse_status(
     leveranse_page_id: str,
 ) -> LeveranseStatusResult:
     """Drain one leveranse_status_recheck task: recompute status from
     the active Korreksjonsrunde's children, write if different.
+
+    Also walks every Korreksjonsrunde sub-row and writes ITS own Status
+    from a rollup of its children — the round rows used to land with
+    Status blank and stay there. `_write_round_statuses` runs FIRST so
+    the per-round writes happen regardless of which deliverable branch
+    short-circuits (clean-upload, manual override, no rounds, etc.).
     """
     result = LeveranseStatusResult(leveranse_page_id=leveranse_page_id)
+
+    # 0. Per-round Status writeback. Runs unconditionally — it's
+    # orthogonal to the deliverable's own status branch, and we want
+    # it to fire even when the deliverable is at a manual state
+    # (Trenger avklaring / Utgår) that would otherwise return early.
+    await _write_round_statuses(leveranse_page_id, result)
 
     # 1. Manual override gate (early exit before the Oppgaver query).
     try:

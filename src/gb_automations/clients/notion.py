@@ -28,6 +28,7 @@ from gb_automations.config import (
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
     PROJECTS_TOGGL_URL_PROP,
+    STATUS_KLAR_TIL_OPPSTART,
     SYNC_QUEUE_PROPS,
     settings,
 )
@@ -729,6 +730,13 @@ async def create_korreksjonsrunde_row(
         ),
         OPPGAVER_PROPS["round"]: {"number": round_number},
         OPPGAVER_PROPS["parent"]: {"relation": [{"id": deliverable_page_id}]},
+        # Round rows are only ever created on the first comment of the
+        # round (see sync_frame_comments._ensure_korreksjonsrunde_oppgave),
+        # so "comment present, nothing done" is always the right initial
+        # state. The rollup engine (sync_leveranse_status) then walks this
+        # status up to Under arbeid / Oppgaver ferdig as Korreksjon Ferdig
+        # boxes get ticked off.
+        OPPGAVER_PROPS["status"]: {"select": {"name": STATUS_KLAR_TIL_OPPSTART}},
     }
     if project_page_id:
         properties[OPPGAVER_PROPS["project"]] = {
@@ -1011,26 +1019,26 @@ async def set_deliverable_frame_url(deliverable_page_id: str, url: str | None) -
 # ============================================================
 
 
-async def get_deliverable_status(deliverable_page_id: str) -> str | None:
-    """Read the current `Status` select option name on a deliverable row.
+async def get_oppgave_status(page_id: str) -> str | None:
+    """Read the current `Status` select option name on ANY Oppgaver row
+    (deliverable, Korreksjonsrunde sub-row, or internal task).
 
     Returns the option name (e.g. "Klar til oppstart") or None if the
     property is empty / the page doesn't have a Status set yet. Used as
     the read-first half of the "skip if same / skip if manual" gate in
-    `set_deliverable_status`.
+    `set_oppgave_status`.
     """
-    page = await get_page(deliverable_page_id)
+    page = await get_page(page_id)
     prop = (page.get("properties") or {}).get(OPPGAVER_PROPS["status"]) or {}
     sel = prop.get("select") or {}
     name = sel.get("name")
     return name or None
 
 
-async def set_deliverable_status(
-    deliverable_page_id: str, status_name: str
-) -> str:
-    """Set the `Status` select on a deliverable row. Single chokepoint
-    for auto-writes.
+async def set_oppgave_status(page_id: str, status_name: str) -> str:
+    """Set the `Status` select on ANY Oppgaver row by page id. Single
+    chokepoint for auto-writes against the Oppgaver DB's Status column
+    — used for deliverables AND for Korreksjonsrunde sub-rows.
 
     Returns the action taken: "written" | "unchanged" | "skipped_manual".
 
@@ -1046,12 +1054,12 @@ async def set_deliverable_status(
     The read-first behavior is also the loop-prevention guard for the
     cascading webhooks that fire when this status flips.
     """
-    current = await get_deliverable_status(deliverable_page_id)
+    current = await get_oppgave_status(page_id)
     if current in MANUAL_DELIVERABLE_STATUSES:
         logger.info(
-            "deliverable_status: skipped (current=%r is a manual state) on %s",
+            "oppgave_status: skipped (current=%r is a manual state) on %s",
             current,
-            deliverable_page_id,
+            page_id,
         )
         return "skipped_manual"
     if current == status_name:
@@ -1060,18 +1068,27 @@ async def set_deliverable_status(
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
-                f"/pages/{deliverable_page_id}", json={"properties": props}
+                f"/pages/{page_id}", json={"properties": props}
             ),
-            op_name=f"PATCH /pages/{deliverable_page_id} status (deliverable)",
+            op_name=f"PATCH /pages/{page_id} status (oppgave)",
         )
         _raise_for_status(response)
     logger.info(
-        "deliverable_status: %s → %r on %s",
+        "oppgave_status: %s → %r on %s",
         current or "(empty)",
         status_name,
-        deliverable_page_id,
+        page_id,
     )
     return "written"
+
+
+# Back-compat aliases: every existing call site in the codebase uses
+# these names. The generalized helpers above do exactly what the
+# deliverable-specific versions did; the rename is purely semantic so
+# Korreksjonsrunde callers don't have to import a function named for
+# deliverables.
+get_deliverable_status = get_oppgave_status
+set_deliverable_status = set_oppgave_status
 
 
 async def get_row_done(page_id: str) -> bool:
