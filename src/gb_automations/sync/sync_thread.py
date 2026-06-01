@@ -44,12 +44,12 @@ from gb_automations.clients import notion_emails_db
 from gb_automations.config import EMAIL_TAGS, EMAILS_PROPS, settings
 from gb_automations.db import SessionLocal
 from gb_automations.models import (
+    AttachmentBlob,
     CompanyCache,
     ContactCache,
     EmailContentDedup,
     EmailRow,
     ProjectFolder,
-    ThreadAttachment,
 )
 from gb_automations.obs import describe_error, log_api_error
 from gb_automations.sync import watches
@@ -239,19 +239,35 @@ async def sync_thread(
 
             # One tracker per thread — replies re-carry attachments from earlier
             # messages, and we only want to upload each unique-byte attachment
-            # once (to the original sender's row). Seed it from the durable
-            # ThreadAttachment record (sha1 → Drive links) so dedup survives
-            # across syncs: a later reply that re-carries a quoted attachment
-            # won't re-upload bytes a previous push already sent to Drive, but
-            # the stored links still let us set the new row's Files property.
+            # once (to the original sender's row). Seed it from AttachmentBlob,
+            # scoped to THIS thread's project folders (not the thread id) so
+            # dedup is cross-thread: a different thread that lands the same
+            # bytes in the same project's folder skips the upload and reuses
+            # the stored Drive link. "Already on Drive" must never mean "drop
+            # from the row" — the stored link still gets attached.
             thread_tracker = ThreadAttachmentTracker()
-            prior = await session.execute(
-                select(
-                    ThreadAttachment.content_sha1, ThreadAttachment.drive_links
-                ).where(ThreadAttachment.gmail_thread_id == thread_id)
-            )
-            for content_sha1, drive_links in prior:
-                thread_tracker.links_by_sha1[content_sha1] = drive_links or []
+            seed_folder_paths = [
+                (settings.attachments_folder_name, *label_path.split("/"))
+                for label_path in project_label_paths
+            ]
+            seed_folder_strings = [
+                "/".join(folder) for folder in seed_folder_paths
+            ]
+            if seed_folder_strings:
+                prior = await session.execute(
+                    select(
+                        AttachmentBlob.content_sha1,
+                        AttachmentBlob.drive_folder_path,
+                        AttachmentBlob.drive_name,
+                        AttachmentBlob.drive_url,
+                    ).where(AttachmentBlob.drive_folder_path.in_(seed_folder_strings))
+                )
+                for sha1, folder_str, name, url in prior:
+                    folder_tuple = tuple(folder_str.split("/"))
+                    thread_tracker.links_by_sha1_folder[(sha1, folder_tuple)] = {
+                        "name": name,
+                        "url": url,
+                    }
             for msg in thread.messages:
                 try:
                     created_count, skipped_count = await _sync_message(
@@ -2282,23 +2298,36 @@ def _partition_attachments(
 ) -> list[AttachmentDecision]:
     """Decide which attachments are worth downloading + uploading.
 
-    Only ONE skip rule survives — and it's the single most false-positive-safe
-    one we have:
+    Two structural skip rules, both safe against false positives on real files:
+
       - Tiny-image: image/* attachments under 1 KB are Office-generated
         signature thumbnails / tracking pixels (e.g. `~WRD0002.jpg`, a 1×1 gif),
         never real content. No real photo, logo, or document is under 1 KB, so
         this drops zero real files while keeping the Notion rows free of the
         tracking-pixel flood every Outlook email carries.
 
-    Every other heuristic was REMOVED on purpose. The earlier rules
-    (inline-repeated, fuzzy ±size same-name, repeating-signature) were guesses
-    that could drop a *real* distinct file — a revised CAD/PDF re-sent under the
-    same name, a recurring legitimate attachment from a frequent sender. The
-    operating rule now is the client's: if a file is sent, it must appear in
+      - Inline-signature-image: image/* parts whose Content-ID is referenced
+        by at least one `<img src="cid:...">` in the HTML body — UNLESS the
+        sender's MUA explicitly marked the part as `Content-Disposition:
+        attachment`. The `cid:`-reference signal is structural: the sender's
+        mail client inserted the part into the HTML editor, which is the
+        signature / inline-decoration path. A user-attached file is never
+        `cid:`-referenced (the user didn't drop it into the HTML), so this
+        skip is safe on first sighting and across senders — no statistics,
+        no learning. The disposition guard exists for the rare dual-mark
+        single-part case (sender attached + embedded the same image with a
+        single MIME part bearing `Content-Disposition: attachment`); a
+        missing disposition is treated as "not attachment" because Outlook
+        inline parts frequently omit the header.
+
+    Earlier statistical / fuzzy / per-sender-frequency rules were removed on
+    purpose: they dropped real distinct files (revised CAD/PDF re-sent under
+    the same name, recurring legitimate attachments). The operating rule is
+    the client's: if a file was sent as a deliverable, it must appear in
     Notion. Byte-identical re-carries (Gmail quoting an attachment on every
     reply) are still de-duplicated for *upload* by content sha1 in the upload
-    loop (`ThreadAttachmentTracker`) — but that dedup re-links the row instead
-    of dropping the file, so nothing real is ever lost.
+    loop — that dedup re-links the row instead of dropping the file, so
+    nothing real is ever lost.
 
     Returns one `AttachmentDecision` per input attachment, preserving order.
     """
@@ -2312,13 +2341,25 @@ def _partition_attachments(
             and att.size < _TINY_IMAGE_BYTES
         ):
             decision = AttachmentDecision(att, upload=False, skip_reason="tiny-image")
+        elif (
+            att.mime_type.startswith("image/")
+            and att.content_id
+            and att.inline_ref_count >= 1
+            and att.content_disposition != "attachment"
+        ):
+            decision = AttachmentDecision(
+                att, upload=False, skip_reason="inline-signature-image"
+            )
         else:
             decision = AttachmentDecision(att, upload=True)
         logger.debug(
-            "partition: %r mime=%s size=%s → upload=%s skip=%s",
+            "partition: %r mime=%s size=%s cid=%r refs=%s disp=%r → upload=%s skip=%s",
             att.filename,
             att.mime_type,
             att.size,
+            att.content_id,
+            att.inline_ref_count,
+            att.content_disposition,
             decision.upload,
             decision.skip_reason,
         )
@@ -2405,30 +2446,35 @@ def _attribute_attachments(
 
 @dataclass
 class ThreadAttachmentTracker:
-    """Per-thread memory of attachments already uploaded, and where to.
+    """Per-sync memory of attachments already uploaded, keyed by (sha1, folder).
 
     Gmail re-carries attachments on every reply (quoted MIME tree). Each later
     reply has a DIFFERENT author, so the same bytes show up again attributed to
-    a new sender. Without thread-wide content dedup the same file uploads once
-    per reply that quoted it.
+    a new sender. Without content dedup the same file uploads once per reply
+    that quoted it. The dedup is now ALSO cross-thread: identical bytes landing
+    in the same project's Drive folder reuse the existing upload no matter which
+    thread carries them, because the seed reads `AttachmentBlob` rows by
+    `drive_folder_path` rather than by `gmail_thread_id`.
 
-    `links_by_sha1` maps content sha1 → the Drive `{name, url}` entries those
-    bytes were uploaded to (one per matched project subfolder). An exact sha1
-    match is sender-independent: identical bytes are the same file no matter who
-    the quoting message is from (two distinct real files won't collide). That
-    kills the re-carry *upload* duplicates — but crucially we still hand the
-    stored links back so the row that quoted the file can be linked to it. A
-    skip must suppress the upload, never the link.
+    `links_by_sha1_folder` maps `(content_sha1, folder_path_tuple)` → the Drive
+    `{name, url}` link those bytes were uploaded to in that specific folder.
+    Different folder for the same bytes = separate entry (so each project's
+    Drive folder stays self-contained). An exact sha1 match is sender-
+    independent (two distinct real files won't collide on sha1). The dedup
+    suppresses the upload, never the link: the stored link is still returned
+    so the row that quoted the file gets linked to it.
     """
 
-    links_by_sha1: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    links_by_sha1_folder: dict[tuple[str, tuple[str, ...]], dict[str, str]] = field(
+        default_factory=dict
+    )
     # Content hashes that have already been ATTACHED to a row during THIS sync
-    # pass. Distinct from `links_by_sha1` (which is also pre-seeded from the
-    # durable ThreadAttachment table across syncs, so it can't tell "first
-    # message" from "re-sync"). `attached_this_pass` starts empty every sync, so
-    # the message that FIRST carries a file this pass attaches it, and only the
-    # later messages that re-carry the same bytes skip it. This is what stops
-    # every reply row from getting the whole thread's attachments.
+    # pass. Distinct from `links_by_sha1_folder` (which is pre-seeded from the
+    # durable AttachmentBlob table across syncs and threads, so it can't tell
+    # "first message" from "re-sync"). `attached_this_pass` starts empty every
+    # sync, so the message that FIRST carries a file this pass attaches it,
+    # and only the later messages that re-carry the same bytes skip it. This
+    # is what stops every reply row from getting the whole thread's attachments.
     attached_this_pass: set[str] = field(default_factory=set)
     # (filename, size) -> content_sha1 for attachments already downloaded AND
     # hashed THIS pass. Lets a later re-carried copy (identical bytes Outlook
@@ -2438,10 +2484,26 @@ class ThreadAttachmentTracker:
     # authoritative byte-hash on a file's first sighting.
     sha1_by_namesize: dict[tuple[str, int], str] = field(default_factory=dict)
 
-    @property
-    def sha1s(self) -> set[str]:
-        """Content hashes already uploaded in this thread (read-only view)."""
-        return set(self.links_by_sha1)
+    def links_for(
+        self, content_sha1: str, folder_paths: list[tuple[str, ...]]
+    ) -> tuple[list[dict[str, str]], list[tuple[str, ...]]]:
+        """Split a sha1's wanted folders into (known links, missing folders).
+
+        For each requested folder, if `(sha1, folder)` is already in the
+        tracker, return its stored link in `known`. Otherwise the folder is
+        appended to `missing` and the caller must upload to it. This is how
+        partial-coverage cases (cached for project A but not project B) reuse
+        what's cached AND upload only the new folder.
+        """
+        known: list[dict[str, str]] = []
+        missing: list[tuple[str, ...]] = []
+        for folder in folder_paths:
+            link = self.links_by_sha1_folder.get((content_sha1, folder))
+            if link is not None:
+                known.append(link)
+            else:
+                missing.append(folder)
+        return known, missing
 
 
 async def _upload_attachments(
@@ -2612,8 +2674,9 @@ async def _upload_attachments(
         # The file belongs to the message that FIRST carried it THIS pass; a
         # reply only quoted it. If we've already attached these bytes to an
         # earlier row this pass, drop them from this row entirely. (Using a
-        # per-pass set, not links_by_sha1, so a re-sync still attaches the first
-        # message's files — links_by_sha1 is pre-seeded across syncs.)
+        # per-pass set, not links_by_sha1_folder, so a re-sync still attaches
+        # the first message's files — links_by_sha1_folder is pre-seeded
+        # across syncs and threads.)
         if content_sha1 in thread_tracker.attached_this_pass:
             logger.info(
                 "    ⏏  skip attachment %r: already attached to an earlier message "
@@ -2622,51 +2685,51 @@ async def _upload_attachments(
             )
             continue
 
-        # Upload-dedup: if these exact bytes were already sent to Drive (this
-        # thread, possibly a previous sync), reuse the stored links instead of
-        # re-uploading — but DO attach them to this (first-this-pass) row.
-        known_links = thread_tracker.links_by_sha1.get(content_sha1)
-        if known_links:
-            relinked = [
-                {"name": d.attachment.filename or link.get("name") or "attachment",
-                 "url": link["url"]}
-                for link in known_links
-                if link.get("url")
-            ]
-            uploaded.extend(relinked)
-            thread_tracker.attached_this_pass.add(content_sha1)
-            logger.info(
-                "    📎 linked %r from Drive (already uploaded earlier)",
-                d.attachment.filename,
-            )
-            # Already on Drive, but maybe never made it to the NAS (synced before
-            # the NAS feature, or while the share was down). Reconcile it now —
-            # idempotent, so a no-op when the file is already in Mottatt. Skipped
-            # when bytes weren't downloaded (the (filename,size) shortcut hit): the
-            # first occurrence this pass already reconciled with real bytes.
-            if content is not None:
-                await _ensure_in_nas(d.attachment.filename, content)
-            continue
+        # Upload-dedup, per-folder: for each project folder the row wants this
+        # file in, check if (sha1, folder) is already in the tracker (either
+        # uploaded earlier this pass, or seeded from a prior sync / a different
+        # thread that hit the same folder). Cached folders skip the Drive call
+        # and reuse the stored link; missing folders upload fresh. This is the
+        # cross-thread / cross-sync dedup: identical bytes landing in the same
+        # project's folder upload exactly once, ever.
+        known_links, missing_folders = thread_tracker.links_for(
+            content_sha1, folder_paths
+        )
 
-        # Reaching the upload path with no bytes should be impossible: a
-        # (filename,size) shortcut hit means the sha1 was already attached this
-        # pass, so one of the two skip branches above caught it. Guard anyway so
-        # a future refactor can't silently corrupt an upload with None bytes.
-        if content is None:
-            logger.warning(
-                "    ⏏  skip attachment %r: dedup shortcut left no bytes to upload "
-                "(sha1=%s)",
+        # Reuse cached folders. Always re-attach the link to THIS row so the
+        # dedup never doubles as a link-suppressor.
+        att_links: list[dict[str, str]] = []
+        for link in known_links:
+            att_links.append(
+                {
+                    "name": d.attachment.filename or link.get("name") or "attachment",
+                    "url": link["url"],
+                }
+            )
+            logger.info(
+                "    📎 linked %r from Drive (already uploaded to %s)",
                 d.attachment.filename,
+                link.get("name"),
+            )
+
+        # Upload to missing folders. Bytes are required from here on; the
+        # (filename,size) shortcut path leaves `content=None` for re-carries, in
+        # which case all wanted folders were already covered by an
+        # earlier-this-pass attach and `missing_folders` should be empty. Guard
+        # anyway so a future refactor can't silently corrupt with None bytes.
+        if missing_folders and content is None:
+            logger.warning(
+                "    ⏏  skip upload for %r: dedup shortcut left no bytes "
+                "for new folder(s) %s (sha1=%s)",
+                d.attachment.filename,
+                [
+                    "/".join(folder) for folder in missing_folders
+                ],
                 content_sha1,
             )
-            continue
+            missing_folders = []
 
-        # Upload once per matched project subfolder. Each project's folder
-        # becomes self-contained (good for archival/export), at the cost of N
-        # Drive files for an N-project email — the team chose this trade-off
-        # deliberately.
-        att_links: list[dict[str, str]] = []
-        for folder_path in folder_paths:
+        for folder_path in missing_folders:
             try:
                 url = await asyncio.to_thread(
                     drive_client.upload_attachment,
@@ -2683,7 +2746,9 @@ async def _upload_attachments(
                     "/".join(folder_path),
                 )
                 continue
-            att_links.append({"name": d.attachment.filename, "url": url})
+            link = {"name": d.attachment.filename, "url": url}
+            att_links.append(link)
+            thread_tracker.links_by_sha1_folder[(content_sha1, folder_path)] = link
             logger.info(
                 "    📎 uploaded %r (%.1f KB) from %s → %s",
                 d.attachment.filename,
@@ -2691,38 +2756,43 @@ async def _upload_attachments(
                 sender,
                 "/".join(folder_path),
             )
+            # Persist the (sha1, folder) → link so the next sync — same thread
+            # or any other thread targeting this folder — reuses it instead of
+            # re-uploading. on_conflict_do_update refreshes name/url in the
+            # rare case the Drive file was replaced; safe under the concurrent-
+            # sync races the thread lock already guards against (within a
+            # thread) and the PK conflict resolution (across threads).
+            await session.execute(
+                insert(AttachmentBlob)
+                .values(
+                    content_sha1=content_sha1,
+                    drive_folder_path="/".join(folder_path),
+                    drive_name=(d.attachment.filename or "attachment")[:255],
+                    drive_url=url[:2048],
+                    first_filename=(d.attachment.filename or "")[:255],
+                )
+                .on_conflict_do_update(
+                    index_elements=["content_sha1", "drive_folder_path"],
+                    set_={
+                        "drive_name": (d.attachment.filename or "attachment")[:255],
+                        "drive_url": url[:2048],
+                    },
+                )
+            )
 
-        # Freshly uploaded to Drive — also drop a copy into each project's NAS
-        # Mottatt folder, reusing the bytes already in memory.
-        await _ensure_in_nas(d.attachment.filename, content)
+        # NAS reconciliation: drop a copy in each project's Mottatt folder.
+        # `write_to_received` is content-idempotent, so this is a no-op when
+        # the file is already there — covers both fresh uploads and the
+        # already-on-Drive-from-a-prior-sync case (which may have predated NAS
+        # support or run while the share was down). Skipped when bytes weren't
+        # downloaded (full re-carry hit), since an earlier message this pass
+        # already reconciled with the real bytes.
+        if content is not None:
+            await _ensure_in_nas(d.attachment.filename, content)
 
         if att_links:
             uploaded.extend(att_links)
             thread_tracker.attached_this_pass.add(content_sha1)
-            # Only record once at least one project copy made it through —
-            # otherwise a transient Drive failure would prevent a retry on
-            # the next thread sync. Storing the links (not just the sha1) is
-            # what lets a later re-carry — which skips the upload — still link
-            # its row to the file already on Drive.
-            thread_tracker.links_by_sha1[content_sha1] = att_links
-            # Persist sha1 + links so the next sync of this thread (a reply that
-            # re-carries the same bytes) skips the re-upload yet can still link.
-            # on_conflict_do_update refreshes the links if a prior row had none
-            # (e.g. written before the column existed); safe under the
-            # concurrent-sync races the thread lock already guards against.
-            await session.execute(
-                insert(ThreadAttachment)
-                .values(
-                    gmail_thread_id=parent_msg.thread_id,
-                    content_sha1=content_sha1,
-                    first_filename=(d.attachment.filename or "")[:255],
-                    drive_links=att_links,
-                )
-                .on_conflict_do_update(
-                    index_elements=["gmail_thread_id", "content_sha1"],
-                    set_={"drive_links": att_links},
-                )
-            )
     return uploaded
 
 

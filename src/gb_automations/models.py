@@ -1,5 +1,4 @@
 from datetime import datetime
-from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -12,7 +11,6 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from gb_automations.db import Base
@@ -144,70 +142,35 @@ class CompanyCache(Base):
     )
 
 
-class AttachmentFingerprint(Base):
-    """Tracks (sender, content-hash) repetition counts for signature detection.
+class AttachmentBlob(Base):
+    """Drive link for a (content_sha1, drive_folder_path) pair — cross-thread durable.
 
-    The signal: an image bytes-hash that has appeared 2+ times from the same
-    sender is almost certainly a signature decoration (company logo, etc.).
-    Real attachments are unique-per-email; signatures repeat.
+    Replaces the older `thread_attachments` (thread-scoped) and the never-wired
+    `attachment_fingerprints` (statistical sender-repeat) tables. Both were
+    weaker shapes for the same problem: keep the same bytes from uploading
+    twice into the same Drive folder, no matter which thread they arrive in.
 
-    On each attachment we compute sha1(content), look up the row, and skip
-    upload to Drive if `seen_count >= 2`. First sighting always uploads.
+    Key shape:
+      - `content_sha1` identifies the bytes (sender-independent).
+      - `drive_folder_path` identifies the destination ("Notion Email
+        Attachments/Prosjekt/2026/Acme"). Different folder = separate row, so
+        each project's Drive folder stays self-contained — a teammate browsing
+        a project's attachments sees a complete picture.
 
-    Content hash makes this robust to Gmail's per-email auto-numbering of
-    inline image filenames (`image001.png` in one email might be a totally
-    different image than `image001.png` in the next).
+    Read at the start of each thread sync to seed the in-memory tracker;
+    written once per successful Drive upload. A re-sync of the same bytes to
+    the same folder finds the row, reuses `drive_url`, and skips the upload.
     """
 
-    __tablename__ = "attachment_fingerprints"
+    __tablename__ = "attachment_blobs"
 
-    sender_email: Mapped[str] = mapped_column(String(254), primary_key=True)
     content_sha1: Mapped[str] = mapped_column(String(40), primary_key=True)
-    seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    # First filename we saw this image under — purely for debugging when
-    # browsing the table. Names may vary across emails ("image001.png" vs
-    # "image004.png") even when the bytes are identical, so this is hint-only.
-    first_filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
-    )
-
-
-class ThreadAttachment(Base):
-    """Content hashes already uploaded to Drive for a thread — durable across syncs.
-
-    `ThreadAttachmentTracker` dedups attachments within a single sync, but a new
-    reply re-carries the whole quoted MIME tree, so without a persisted record
-    every reply re-uploads the same bytes to Drive under the new replier's name.
-    Keyed by (thread, content_sha1): identical bytes are the same image no matter
-    which message now carries them, so an exact-hash hit anywhere in the thread
-    means "already on Drive, skip". Seeded into the per-sync tracker at sync start
-    and written back on every successful upload.
-
-    `drive_links` carries the Drive `{name, url}` entries the bytes uploaded to
-    (one per matched project subfolder). It exists so a re-sync — which skips the
-    *upload* because the sha1 is already known — can still set the Notion row's
-    Files property: "already on Drive" must not mean "can't re-link". Without it
-    the upload-dedup silently doubled as a link-suppressor, leaving rows file-less
-    while the bytes sat in Drive.
-    """
-
-    __tablename__ = "thread_attachments"
-
-    gmail_thread_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    content_sha1: Mapped[str] = mapped_column(String(40), primary_key=True)
+    drive_folder_path: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    drive_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    drive_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     # First filename we saw these bytes under — debugging hint only; Gmail
     # renumbers inline image names across messages even for identical bytes.
     first_filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    # List of {"name", "url"} dicts — the Drive links this content uploaded to,
-    # one per matched project subfolder. Nullable for rows written before the
-    # column existed; treated as "no known links" when absent.
-    drive_links: Mapped[list[dict[str, Any]] | None] = mapped_column(
-        JSONB, nullable=True
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

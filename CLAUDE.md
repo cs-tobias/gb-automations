@@ -193,6 +193,54 @@ docker compose exec api python -m gb_automations.scripts.reset_thread --thread T
 curl 'http://localhost:8000/debug/llm?prompt=Hei,%20kan%20dere%20sende%20et%20tilbud?'
 ```
 
+## Running commands on the Windows dev box (PowerShell gotchas)
+
+The user's primary dev shell is PowerShell on Windows. Two parser quirks bite
+*every* time and have already burned multiple turns:
+
+- **`curl` is aliased to `Invoke-WebRequest`** — `-X POST` errors with "A
+  parameter cannot be found that matches parameter name 'X'." Use
+  `Invoke-RestMethod` (native, prints JSON nicely) or call `curl.exe`
+  explicitly:
+
+  ```powershell
+  Invoke-RestMethod -Method Post http://localhost:8000/debug/toggl/sync-hours
+  # or:
+  curl.exe -X POST http://localhost:8000/debug/toggl/sync-hours
+  ```
+
+- **`docker compose exec api python -c "…"` with a heredoc-style multi-line
+  string fails** with "ScriptBlock should only be specified as a value of the
+  Command parameter." PowerShell parses the `"` continuation differently from
+  bash. Two fixes that work:
+
+  1. **Use a here-string** (preferred for >2 lines). The closing `'@` MUST be
+     at column 0 (no indent — that's a parse error):
+
+     ```powershell
+     $py = @'
+     import asyncio
+     from gb_automations.clients import toggl
+     from gb_automations.config import settings
+     projects = asyncio.run(toggl.list_projects(settings.toggl_workspace_id))
+     for p in projects:
+         print(f"  {p['id']}  active={p.get('active')}  {p.get('name')}")
+     '@
+     docker compose exec api python -c $py
+     ```
+
+  2. **One-liner with `;`** (for short snippets, no f-string escaping pain):
+
+     ```powershell
+     docker compose exec api python -c "import asyncio; from gb_automations.clients import toggl; from gb_automations.config import settings; print(asyncio.run(toggl.list_projects(settings.toggl_workspace_id)))"
+     ```
+
+- **Other shorthand traps**: `2>/dev/null` → `2>$null`; `$VAR` → `$env:VAR`;
+  command chaining `&&` / `||` are parser errors in PowerShell 5.1 — use
+  `; if ($?) { … }`.
+
+When proposing a command, default to the PowerShell-safe form for this user.
+
 ## Where to look when…
 
 | Question | File |

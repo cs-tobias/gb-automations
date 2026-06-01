@@ -1,13 +1,21 @@
 """Tests for sync_thread._partition_attachments — the byte-free filter that
 decides which attachments are worth downloading + uploading to Drive.
 
-Exactly ONE signal survives: tiny-image (< 1 KB image/*), which only catches
-Office-generated signature thumbnails / tracking pixels and drops zero real
-files. Every other heuristic (inline-repeated, fuzzy ±size same-name,
-repeating-signature) was removed because it could drop a real distinct file —
-the operating rule is now "if a file is sent, it must appear in Notion".
-Byte-identical re-carries are still de-duplicated for upload by content sha1 in
-the upload loop, but that re-links the row instead of dropping the file.
+Two structural skip rules, both safe against false positives on real files:
+  - tiny-image (< 1 KB image/*) — Office-generated signature thumbnails and
+    tracking pixels, never real content.
+  - inline-signature-image (image/* + Content-ID + `<img src=cid:>` referenced
+    in HTML body + disposition != "attachment") — the structural shape every
+    MUA-rendered signature decoration produces. A user-attached file is never
+    `cid:`-referenced (it wasn't dropped into the HTML editor), so this skip
+    is safe on first sighting. The disposition guard preserves the rare case
+    where a sender BOTH attached and inline-referenced the same image.
+
+All other earlier heuristics (statistical sender-repeat, fuzzy ±size same-name,
+position-based signature-region) were removed because they could drop real
+distinct files. Byte-identical re-carries are still de-duplicated for upload
+by content sha1 in the upload loop, but that re-links the row instead of
+dropping the file.
 
 Also covers `_attribute_attachments`, which assigns forwarded-thread
 attachments to whichever extracted historical email's body actually mentions
@@ -77,21 +85,96 @@ def test_partition_small_but_real_image_still_uploads():
     assert decisions[0].upload is True
 
 
-def test_partition_inline_repeated_image_now_uploads():
-    """The old inline-repeated heuristic (inline_ref_count >= 2 ⇒ signature
-    logo) was removed: it could drop a real image a sender embedded twice.
-    A >1KB image now always uploads regardless of inline_ref_count; the
-    byte-identical re-carry is de-duped (and re-linked) later by sha1."""
+def test_partition_inline_signature_image_skipped():
+    """An image with a Content-ID, referenced by `<img src=cid:>` in the HTML
+    body (inline_ref_count >= 1), and disposition=inline is structurally a
+    signature decoration. The sender's MUA inserted it as inline content —
+    a user-attached file is never `cid:`-referenced."""
     att = GmailAttachment(
         filename="image001.png",
         mime_type="image/png",
         size=4_761,
         attachment_id="abc",
         content_id="ii_x@host",
-        inline_ref_count=3,
+        inline_ref_count=2,
+        content_disposition="inline",
     )
     decisions = _partition_attachments([att])
     assert len(decisions) == 1
+    assert decisions[0].upload is False
+    assert decisions[0].skip_reason == "inline-signature-image"
+
+
+def test_partition_inline_signature_no_disposition_still_skipped():
+    """Outlook inline parts frequently omit Content-Disposition entirely.
+    A missing disposition is treated as "not attachment" so the structural
+    skip still fires."""
+    att = GmailAttachment(
+        filename="image001.png",
+        mime_type="image/png",
+        size=4_761,
+        attachment_id="abc",
+        content_id="ii_x@host",
+        inline_ref_count=1,
+        content_disposition=None,
+    )
+    decisions = _partition_attachments([att])
+    assert decisions[0].upload is False
+    assert decisions[0].skip_reason == "inline-signature-image"
+
+
+def test_partition_attached_and_inline_referenced_uploads():
+    """Rare dual-mark case: sender BOTH attached a file AND embedded it inline
+    (preview-in-body) with a single MIME part. An explicit
+    `Content-Disposition: attachment` overrides the inline-signature skip so
+    the real attachment isn't dropped."""
+    att = GmailAttachment(
+        filename="floorplan.png",
+        mime_type="image/png",
+        size=120_000,
+        attachment_id="abc",
+        content_id="ii_x@host",
+        inline_ref_count=1,
+        content_disposition="attachment",
+    )
+    decisions = _partition_attachments([att])
+    assert decisions[0].upload is True
+    assert decisions[0].skip_reason == ""
+
+
+def test_partition_inline_image_not_html_referenced_uploads():
+    """An attachment that has a Content-ID but is NOT actually referenced by
+    `<img src=cid:>` in the HTML (inline_ref_count == 0) is a real attached
+    image the MUA happened to label. Don't skip — only HTML-referenced parts
+    are structurally signatures."""
+    att = GmailAttachment(
+        filename="photo.png",
+        mime_type="image/png",
+        size=80_000,
+        attachment_id="abc",
+        content_id="ii_x@host",
+        inline_ref_count=0,
+        content_disposition="inline",
+    )
+    decisions = _partition_attachments([att])
+    assert decisions[0].upload is True
+    assert decisions[0].skip_reason == ""
+
+
+def test_partition_inline_pdf_with_cid_uploads():
+    """The skip is gated on image/* — a PDF (or any non-image) that happens
+    to have a Content-ID + cid reference is unusual but always uploads. We
+    will not drop a real document on the rare structural quirk."""
+    att = GmailAttachment(
+        filename="Tilbud.pdf",
+        mime_type="application/pdf",
+        size=200_000,
+        attachment_id="abc",
+        content_id="ii_x@host",
+        inline_ref_count=1,
+        content_disposition="inline",
+    )
+    decisions = _partition_attachments([att])
     assert decisions[0].upload is True
     assert decisions[0].skip_reason == ""
 

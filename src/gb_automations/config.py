@@ -296,13 +296,14 @@ class Settings(BaseSettings):
     sync_toggl: bool = False
 
     # Phase 2 — daily hours aggregation. Independent of sync_toggl so the
-    # project mirror can run without the hours sync (e.g. while you're
-    # still populating the Ansatte DB). When true:
+    # project mirror can run without the hours sync. When true:
     #   - the APScheduler job `toggl_hours_daily` runs at 02:00 Europe/Oslo
     #     and enqueues a `toggl_hours_sync` task
     #   - the worker pulls the last 14 days from Toggl Reports v3, aggregates
     #     per (user, project, day) in Europe/Oslo time, and upserts rows
     #     into the year-partitioned `Timer YYYY` Notion DB
+    # The Toggl→Notion user attribution is by email match: each Toggl user's
+    # email must equal a Notion workspace user's email. No manual mapping.
     sync_toggl_hours: bool = False
     # Parent page under which yearly `Timer YYYY` databases live (same
     # pattern as emails_parent_page_id). The hours engine auto-creates
@@ -315,6 +316,35 @@ class Settings(BaseSettings):
     # comfortably covers the "fix last week" / "fix the day before pay" use
     # cases without thrashing the rate limit.
     toggl_hours_window_days: int = 14
+    # DEV-ONLY: rewrite Toggl user emails before the Notion match. Format is a
+    # comma-separated list of `toggl_email=notion_email` pairs. Set when your
+    # personal Toggl + Notion accounts don't share an email (production
+    # Goldbox accounts do, so this is left blank there). Example:
+    #   TOGGL_DEV_EMAIL_OVERRIDES=tobias@cinesuit.com=tobias@my-notion.com
+    # An override only swaps the email used for the Notion-user lookup — the
+    # Toggl side (TogglUserCache, time-entry attribution, user-name display)
+    # is untouched.
+    toggl_dev_email_overrides: str = ""
+
+    @property
+    def toggl_dev_email_overrides_map(self) -> dict[str, str]:
+        """Parse TOGGL_DEV_EMAIL_OVERRIDES into a lowercased {toggl: notion} dict.
+
+        Silently drops malformed entries (missing '=' or empty side); the
+        engine logs the parsed result once at sync start so misconfiguration
+        is visible without crashing the run.
+        """
+        out: dict[str, str] = {}
+        for pair in self.toggl_dev_email_overrides.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            left, right = pair.split("=", 1)
+            left = left.strip().lower()
+            right = right.strip().lower()
+            if left and right:
+                out[left] = right
+        return out
 
 
 settings = Settings()

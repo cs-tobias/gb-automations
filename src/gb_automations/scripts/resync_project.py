@@ -29,10 +29,6 @@ Flags:
                  mutate nothing.
   --no-archive   Repair-only: re-run the sync over existing rows WITHOUT taking
                  them down first. Won't fix structural row changes, but is cheap.
-  --hard         Also clear the attachment dedup cache, forcing every attachment
-                 to RE-UPLOAD to Drive. This DUPLICATES every file in Drive — only
-                 use it if the Drive files themselves are wrong. Default reuses
-                 existing Drive files (re-links, no duplication).
   --user EMAIL   Restrict to one mailbox's copy of the project label.
 
 The project page id is the Notion page UUID — copy it from the project page URL
@@ -90,14 +86,6 @@ def _parse_args() -> argparse.Namespace:
         help="Repair-only: re-sync existing rows without taking them down first.",
     )
     parser.add_argument(
-        "--hard",
-        action="store_true",
-        help=(
-            "Also clear the attachment dedup cache — RE-UPLOADS every attachment "
-            "to Drive (duplicates files). Default reuses existing Drive files."
-        ),
-    )
-    parser.add_argument(
         "--user",
         default=None,
         help="Restrict to one mailbox's copy of the project label.",
@@ -128,10 +116,6 @@ def _summarize(r: ResyncResult, *, dry_run: bool, no_archive: bool) -> None:
         parts.insert(0, f"archived {r.pages_archived}")
         if r.pages_archive_failed:
             parts.append(f"{r.pages_archive_failed} archive-failure(s)")
-        if r.thread_attachments_deleted:
-            parts.append(
-                f"cleared {r.thread_attachments_deleted} attachment(s) [Drive re-uploaded]"
-            )
     if r.errors:
         parts.append(f"{len(r.errors)} error(s)")
     logger.info("Resync %r complete: %s.", name, ", ".join(parts))
@@ -175,7 +159,6 @@ async def _run(args: argparse.Namespace) -> int:
         target.page_id,
         dry_run=args.dry_run,
         archive=not args.no_archive,
-        hard=args.hard,
         only_user=args.user,
     )
     # The engine couldn't read the title pre-resolution; show the label name.
@@ -186,8 +169,6 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main() -> None:
     args = _parse_args()
-    if args.hard and args.no_archive:
-        logger.warning("--hard has no effect with --no-archive (no cache is cleared).")
     raise SystemExit(asyncio.run(_run(args)))
 
 

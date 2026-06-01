@@ -474,6 +474,35 @@ async def _sync_frame_impl(request: Request) -> Response:
     )
 
 
+async def _sync_toggl_impl(request: Request) -> Response:
+    page_id, title = await _resolve_project_button_click(request)
+    if not settings.sync_toggl:
+        logger.info("↳ Toggl sync click for %r ignored — SYNC_TOGGL=false", title)
+        return _json(
+            {
+                "page_id": page_id,
+                "kind": "toggl_project_sync",
+                "action": "skipped",
+                "reason": "SYNC_TOGGL=false",
+            }
+        )
+    inserted = await enqueue_toggl_project_sync(page_id)
+    queue_worker.wake()
+    logger.info(
+        "⏱  toggl-only sync requested for %r (page %s) — %s",
+        title,
+        page_id,
+        "enqueued" if inserted else "already queued",
+    )
+    return _json(
+        {
+            "page_id": page_id,
+            "kind": "toggl_project_sync",
+            "action": "queued" if inserted else "already_queued",
+        }
+    )
+
+
 @router.post("/notion/sync-gmail")
 async def notion_sync_gmail(request: Request) -> Response:
     """Per-system "Sync Gmail labels" button receiver (on the Projects DB).
@@ -511,6 +540,19 @@ async def notion_sync_frame(request: Request) -> Response:
     """
     with request_scope("sync-frame"):
         return await _sync_frame_impl(request)
+
+
+@router.post("/notion/sync-toggl")
+async def notion_sync_toggl(request: Request) -> Response:
+    """Per-system "Sync Toggl" button receiver (on the Projects DB).
+
+    Enqueues a single `toggl_project_sync` task for the clicked project — no
+    Gmail, no NAS, no Frame fan-out. Idempotent. Returns `skipped` when the
+    Toggl integration is off (SYNC_TOGGL=false), so a click on a misconfigured
+    deploy fails visibly instead of silently doing nothing.
+    """
+    with request_scope("sync-toggl"):
+        return await _sync_toggl_impl(request)
 
 
 @router.post("/notion/oppgave-done")

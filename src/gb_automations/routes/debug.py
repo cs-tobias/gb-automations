@@ -636,6 +636,60 @@ async def debug_toggl_sync_hours() -> dict[str, Any]:
     }
 
 
+@router.post("/toggl/backfill")
+async def debug_toggl_backfill(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = Query(None),
+) -> dict[str, Any]:
+    """One-shot historical backfill — pull Toggl entries over an EXPLICIT
+    date range (default: Jan 1 of current year → today, Oslo) and write
+    every aggregated cell to Notion.
+
+    Use this on first turn-on (or after any extended downtime) when the
+    nightly 14-day window won't catch up. The engine's reconciliation is
+    identical to the nightly path, so a wider window just means more rows
+    created — re-running the same range is idempotent.
+
+    Runs INLINE (not via the queue) because a backfill is a known one-shot
+    operator action with no risk of duplicate concurrent firing. Returns
+    the full result for immediate visibility in the curl response, not
+    just the log.
+
+    Query params (both optional, ISO YYYY-MM-DD):
+      from — window start (default: Jan 1 of current Oslo year)
+      to   — window end   (default: today, Oslo)
+    """
+    from datetime import date as _date
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    from gb_automations.sync.sync_toggl_hours import sync_toggl_hours
+
+    _oslo = ZoneInfo("Europe/Oslo")
+    today = _dt.now(_oslo).date()
+    start = _date.fromisoformat(from_) if from_ else _date(today.year, 1, 1)
+    end = _date.fromisoformat(to) if to else today
+
+    result = await sync_toggl_hours(window_start=start, window_end=end)
+    return {
+        "action": result.action,
+        "note": result.note,
+        "window": {"start": result.window_start, "end": result.window_end},
+        "entries_fetched": result.entries_fetched,
+        "cells_aggregated": result.cells_aggregated,
+        "rows_created": result.rows_created,
+        "rows_updated": result.rows_updated,
+        "rows_archived": result.rows_archived,
+        "skipped": {
+            "running": result.skipped_running,
+            "unmatched": result.skipped_unmatched,
+            "unknown_project": result.skipped_unknown_project,
+            "no_project": result.skipped_no_project,
+        },
+        "errors": result.errors,
+    }
+
+
 @router.post("/toggl/refresh-users")
 async def debug_toggl_refresh_users() -> dict[str, Any]:
     """Refresh both halves of the Toggl→Notion user map without running a sync.

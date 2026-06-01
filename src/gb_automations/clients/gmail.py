@@ -66,6 +66,12 @@ class GmailAttachment:
     # Gmail returns with the data inline (in body.data) and NO attachmentId.
     # When set, the upload path decodes these directly instead of calling
     # messages.attachments.get (which needs an attachmentId we don't have).
+    content_disposition: str | None = None  # leading token of the
+    # Content-Disposition header, lowercased ("attachment", "inline"), or None
+    # when the header is absent. The partition rule uses this to keep a part
+    # that's BOTH inline-referenced AND explicitly marked `attachment` (rare
+    # dual-mark case where a sender attached + embedded the same image): the
+    # explicit `attachment` token overrides the inline-signature skip.
 
 
 @dataclass
@@ -477,15 +483,25 @@ def _extract_body_and_attachments(
         part_headers = _headers_dict(part.get("headers", []))
         raw_cid = part_headers.get("Content-ID") or part_headers.get("Content-Id") or ""
         content_id = _normalize_content_id(raw_cid)
+        raw_disp = (
+            part_headers.get("Content-Disposition")
+            or part_headers.get("Content-disposition")
+            or ""
+        )
+        # Disposition syntax: `inline; filename="x"` or `attachment; …`. We
+        # only need the leading token to decide attachment-vs-inline; the
+        # filename is already read from the part's own `filename` field.
+        disposition = raw_disp.split(";", 1)[0].strip().lower() or None
         attachment_id = body.get("attachmentId")
         data = body.get("data")
 
         logger.debug(
-            "MIME part: mime=%s filename=%r content_id=%r size=%s "
+            "MIME part: mime=%s filename=%r content_id=%r disposition=%r size=%s "
             "has_attachment_id=%s has_inline_data=%s",
             mime,
             filename,
             content_id,
+            disposition,
             body.get("size"),
             bool(attachment_id),
             bool(data),
@@ -524,6 +540,7 @@ def _extract_body_and_attachments(
                     # Keep the inline bytes when Gmail didn't give us a separate
                     # attachmentId to fetch them with (small inline parts).
                     inline_data=data if (data and not attachment_id) else None,
+                    content_disposition=disposition,
                 )
             )
 
@@ -551,6 +568,7 @@ def _extract_body_and_attachments(
                 a.inline_data is not None,
                 a.content_id,
                 a.inline_ref_count,
+                a.content_disposition,
             )
             for a in attachments
         ],

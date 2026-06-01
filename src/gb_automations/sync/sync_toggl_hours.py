@@ -106,15 +106,27 @@ class TogglHoursResult:
 # ============================================================
 
 
-async def sync_toggl_hours() -> TogglHoursResult:
-    """Run one nightly hours sync. Called by the queue worker for a
-    `toggl_hours_sync` task.
+async def sync_toggl_hours(
+    *,
+    window_start: date | None = None,
+    window_end: date | None = None,
+) -> TogglHoursResult:
+    """Run one hours sync. Default mode (no args) is the nightly window:
+    last `settings.toggl_hours_window_days` days ending today (Oslo) —
+    used by the queue worker for a `toggl_hours_sync` task.
+
+    `window_start` and `window_end` override the date range for one-shot
+    backfills (e.g. "everything since Jan 1"). Both inclusive, Oslo-local
+    dates. The engine's reconciliation logic doesn't care how wide the
+    range is — it diffs Notion against Toggl within whatever window it's
+    given, so a 6-month backfill and a 14-day nightly use the exact same
+    code path.
 
     Returns a populated TogglHoursResult so the worker (and the
-    /debug/toggl/sync-hours route) can log a single-line summary.
-    Non-fatal per-entry / per-cell problems are counted into the result
-    counters and listed in `errors`; only a top-level crash flips
-    `action` to "failed".
+    /debug/toggl/sync-hours / /debug/toggl/backfill routes) can log a
+    single-line summary. Non-fatal per-entry / per-cell problems are
+    counted into the result counters and listed in `errors`; only a
+    top-level crash flips `action` to "failed".
     """
     result = TogglHoursResult()
 
@@ -142,11 +154,20 @@ async def sync_toggl_hours() -> TogglHoursResult:
         # Continue with whatever's in the cache — better to write rows for
         # known users than to fail the whole sync.
 
-    window_days = max(1, settings.toggl_hours_window_days)
     today_oslo = datetime.now(_OSLO).date()
-    window_start = today_oslo - timedelta(days=window_days - 1)
+    if window_end is None:
+        window_end = today_oslo
+    if window_start is None:
+        window_days = max(1, settings.toggl_hours_window_days)
+        window_start = window_end - timedelta(days=window_days - 1)
+    if window_start > window_end:
+        result.action = "failed"
+        result.note = (
+            f"window_start ({window_start}) is after window_end ({window_end})"
+        )
+        return result
     result.window_start = window_start.isoformat()
-    result.window_end = today_oslo.isoformat()
+    result.window_end = window_end.isoformat()
 
     # Fetch entries from Toggl. Reports v3 expects YYYY-MM-DD and treats
     # the range inclusively. We pass Oslo-local dates: Toggl filters by
@@ -159,16 +180,22 @@ async def sync_toggl_hours() -> TogglHoursResult:
         entries = await toggl_client.search_time_entries(
             settings.toggl_workspace_id,
             start_date=window_start.isoformat(),
-            end_date=today_oslo.isoformat(),
+            end_date=window_end.isoformat(),
         )
     except Exception as err:
         logger.exception("toggl hours: Reports v3 fetch failed")
         result.action = "failed"
         result.note = f"Reports v3 fetch failed: {err}"
         return result
-    result.entries_fetched = len(entries)
+    # Reports v3 returns grouped records (one per user×project) with a
+    # nested time_entries array — count the flat entries for an accurate
+    # log line, since "17 entries" reading "17 groups" was a real source
+    # of confusion the first time this code ran.
+    individual_count = sum(len(g.get("time_entries") or []) for g in entries)
+    result.entries_fetched = individual_count
     logger.info(
-        "toggl hours: fetched %d entries for window %s … %s",
+        "toggl hours: fetched %d entries (in %d groups) for window %s … %s",
+        individual_count,
         len(entries),
         result.window_start,
         result.window_end,
@@ -187,6 +214,22 @@ async def sync_toggl_hours() -> TogglHoursResult:
     # the engine forgiving of new Toggl members not yet on Notion, or a
     # Toggl project not yet mirrored to a Notion project.
     toggl_user_emails = await _load_toggl_user_emails()
+    # Dev-only email rewrite: when a developer's Toggl email differs from
+    # their Notion email (production Goldbox accounts match, so this is a
+    # no-op there), rewrite the lookup-side email before the Notion match
+    # so the engine attributes hours to the right Notion user. Leaves the
+    # Toggl side (display name, cache key) untouched.
+    overrides = settings.toggl_dev_email_overrides_map
+    if overrides:
+        logger.info(
+            "toggl hours: applying %d dev email override(s): %s",
+            len(overrides),
+            ", ".join(f"{k}→{v}" for k, v in overrides.items()),
+        )
+        for user_id, info in toggl_user_emails.items():
+            mapped = overrides.get(info["email"].lower())
+            if mapped:
+                info["email"] = mapped
     try:
         notion_user_by_email = await _build_notion_user_index()
     except Exception as err:
@@ -240,7 +283,7 @@ async def sync_toggl_hours() -> TogglHoursResult:
                 year,
                 year_cells,
                 window_start=window_start,
-                window_end=today_oslo,
+                window_end=window_end,
                 user_uuid_lookup=user_uuid_lookup,
                 user_name_lookup=user_name_lookup,
                 project_map=known_project_map,
@@ -280,18 +323,23 @@ def _aggregate(
 
     Returns the aggregate plus a small stats dict for the engine's counters.
 
-    Toggl Reports v3 entries that we care about look roughly like:
+    Toggl Reports v3's `search/time_entries` returns GROUPED records — one
+    per (user, project), with a nested `time_entries` array of the actual
+    individual entries. Shape verified live (May 2026):
         {
             "user_id": 13166188,
             "project_id": 198765432,
-            "seconds": 5400,
-            "start": "2026-05-26T08:30:00+00:00",
-            "stop":  "2026-05-26T10:00:00+00:00",
+            "time_entries": [
+                {"id": ..., "seconds": 5400,
+                 "start": "2026-05-26T08:30:00+02:00",
+                 "stop":  "2026-05-26T10:00:00+02:00"},
+                ...
+            ],
             ...
         }
 
-    `seconds` is straightforward when stop is set. If `stop` is null the
-    entry is still running — we skip and pick it up tomorrow.
+    A nested entry with `stop is None` is still running — skip just that
+    one; the other entries in the same group still flow through.
 
     Entries without a project_id (someone tracked time with no project
     selected) are skipped — there's no way to attribute them to a Notion
@@ -300,34 +348,38 @@ def _aggregate(
     out: dict[tuple[str, str, date], int] = defaultdict(int)
     stats = {"skipped_running": 0, "skipped_no_project": 0}
 
-    for e in entries:
-        if e.get("stop") is None:
-            stats["skipped_running"] += 1
-            continue
-        project_id = e.get("project_id")
+    for group in entries:
+        project_id = group.get("project_id")
         if project_id is None:
-            stats["skipped_no_project"] += 1
+            # The grouping is per (user, project), so a missing project
+            # kills the whole group, not one entry inside it.
+            stats["skipped_no_project"] += len(group.get("time_entries") or [])
             continue
-        seconds = e.get("seconds")
-        if not isinstance(seconds, (int, float)) or seconds <= 0:
-            continue
-        user_id = str(e.get("user_id", ""))
+        user_id = str(group.get("user_id", ""))
         if not user_id:
             continue
 
-        start_raw = e.get("start") or ""
-        try:
-            start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        # If Toggl omits the tz (unlikely on Reports v3 but defensive),
-        # assume UTC — that's what their docs claim everywhere.
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=timezone.utc)
-        oslo_date = start_dt.astimezone(_OSLO).date()
+        for entry in group.get("time_entries") or []:
+            if entry.get("stop") is None:
+                stats["skipped_running"] += 1
+                continue
+            seconds = entry.get("seconds")
+            if not isinstance(seconds, (int, float)) or seconds <= 0:
+                continue
 
-        key = (user_id, str(project_id), oslo_date)
-        out[key] += int(seconds)
+            start_raw = entry.get("start") or ""
+            try:
+                start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            # If Toggl omits the tz (unlikely on Reports v3 but defensive),
+            # assume UTC — that's what their docs claim everywhere.
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            oslo_date = start_dt.astimezone(_OSLO).date()
+
+            key = (user_id, str(project_id), oslo_date)
+            out[key] += int(seconds)
 
     return out, stats
 

@@ -13,10 +13,12 @@ Sequence for one project (see `resync_project`):
      the next sync recreates them fresh.
   5. re-run sync_thread once per thread.
 
-Drive files are REUSED, not duplicated: ThreadAttachment is kept by default, so
-sync_thread re-links existing Drive files via their stored `drive_links` instead
-of re-uploading. `hard=True` clears ThreadAttachment too, forcing fresh uploads
-(this duplicates every attachment in Drive — opt-in only).
+Drive files are REUSED, not duplicated: `AttachmentBlob` rows are kept across
+re-syncs, so sync_thread re-links existing Drive files via their stored URLs
+instead of re-uploading. Blobs are now cross-thread / cross-sync durable on
+purpose (any project folder that already holds the bytes reuses the link), and
+there is no per-thread "force re-upload" mode — the old `hard=True` flag was a
+holdover from when dedup was thread-scoped and is now a no-op.
 
 A failed page-archive is counted, not fatal: the row stays live and the re-sync
 re-links it instead of recreating it — degraded but not data-losing.
@@ -34,7 +36,7 @@ from sqlalchemy import delete, select
 from gb_automations.clients import gmail as gmail_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.db import SessionLocal
-from gb_automations.models import EmailRow, ProjectLabel, ThreadAttachment, User
+from gb_automations.models import EmailRow, ProjectLabel, User
 from gb_automations.sync.queue import enqueue_threads
 from gb_automations.sync.sync_thread import SyncResult, sync_thread
 
@@ -111,7 +113,6 @@ class ResyncResult:
     pages_archived: int = 0
     pages_archive_failed: int = 0
     email_rows_deleted: int = 0
-    thread_attachments_deleted: int = 0
     rows_created: int = 0
     rows_already_present: int = 0
     errors: list[str] = field(default_factory=list)
@@ -229,29 +230,22 @@ async def _archive_pages(page_ids: list[str]) -> tuple[int, int]:
     return ok, failed
 
 
-async def _clear_local_cache(thread_ids: list[str], hard: bool) -> tuple[int, int]:
-    """Delete EmailRow (always) and ThreadAttachment (hard only) for the threads.
+async def _clear_local_cache(thread_ids: list[str]) -> int:
+    """Delete the local EmailRow cache for the threads. Returns rows deleted.
 
-    Returns (email_rows_deleted, thread_attachments_deleted). Keeping
-    ThreadAttachment is what lets the re-sync re-link existing Drive files
-    instead of re-uploading them.
+    AttachmentBlob rows are NOT cleared: they represent Drive files that still
+    exist and that the re-sync should re-link rather than re-upload (which would
+    duplicate every attachment in Drive). Blob durability is the whole point of
+    the cross-thread dedup table.
     """
     if not thread_ids:
-        return (0, 0)
+        return 0
     async with SessionLocal() as session:
         er = await session.execute(
             delete(EmailRow).where(EmailRow.gmail_thread_id.in_(thread_ids))
         )
-        ta_deleted = 0
-        if hard:
-            ta = await session.execute(
-                delete(ThreadAttachment).where(
-                    ThreadAttachment.gmail_thread_id.in_(thread_ids)
-                )
-            )
-            ta_deleted = ta.rowcount or 0
         await session.commit()
-        return (er.rowcount or 0, ta_deleted)
+        return er.rowcount or 0
 
 
 async def resync_project(
@@ -259,7 +253,6 @@ async def resync_project(
     *,
     dry_run: bool = False,
     archive: bool = True,
-    hard: bool = False,
     only_user: str | None = None,
 ) -> ResyncResult:
     """Rebuild every email row for one Notion project. See module docstring.
@@ -267,8 +260,6 @@ async def resync_project(
     - dry_run: enumerate + report what WOULD be archived/synced; mutate nothing.
     - archive: take down (trash) the existing Notion rows before recreating.
       `archive=False` is a repair-only pass — re-run sync on the existing rows.
-    - hard: also clear ThreadAttachment, forcing fresh Drive uploads (DUPLICATES
-      every attachment in Drive). Default keeps them so files are reused.
     - only_user: restrict to one mailbox's copy of the label.
     """
     result = ResyncResult(project_page_id=project_page_id, dry_run=dry_run)
@@ -319,16 +310,9 @@ async def resync_project(
             logger.info("  ⌫ archived %d Notion row(s) (%d failed)", ok, failed)
 
         if archive:
-            er, ta = await _clear_local_cache(result.thread_ids, hard)
+            er = await _clear_local_cache(result.thread_ids)
             result.email_rows_deleted = er
-            result.thread_attachments_deleted = ta
-            logger.info(
-                "  🧹 cleared %d email_row(s)%s",
-                er,
-                f" + {ta} thread_attachment(s) [HARD — Drive will be re-uploaded]"
-                if hard
-                else "",
-            )
+            logger.info("  🧹 cleared %d email_row(s)", er)
 
         for thread_id in result.thread_ids:
             owner = owner_by_thread[thread_id]
@@ -364,7 +348,7 @@ async def rebuild_thread(thread_id: str, owner_email: str, on_resolved=None) -> 
 
     Scope is deliberately narrow: it archives only the EMAIL rows for this
     thread and clears only the local `EmailRow` cache. Contacts and Companies
-    are NOT deleted — they're re-matched/refreshed by the sync. `ThreadAttachment`
+    are NOT deleted — they're re-matched/refreshed by the sync. `AttachmentBlob`
     is kept, so Drive files are re-linked rather than re-uploaded (no duplicates).
 
     `on_resolved` is forwarded to sync_thread (the worker uses it to backfill the
@@ -374,7 +358,7 @@ async def rebuild_thread(thread_id: str, owner_email: str, on_resolved=None) -> 
     if page_ids:
         ok, failed = await _archive_pages(page_ids)
         logger.info("🔁 rebuild %s: archived %d row(s) (%d failed)", thread_id, ok, failed)
-    await _clear_local_cache([thread_id], hard=False)
+    await _clear_local_cache([thread_id])
     # Rows + cache gone → sync_thread now recreates every row fresh.
     return await sync_thread(owner_email, thread_id, on_resolved=on_resolved)
 
