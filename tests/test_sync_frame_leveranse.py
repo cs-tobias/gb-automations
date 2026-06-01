@@ -493,7 +493,12 @@ def test_adopts_existing_placeholder_fetches_url_when_missing(monkeypatch):
     assert result.action == "adopted"
     assert result.frame_placeholder_file_id == "preExistingFile"
     assert create_file_calls == 0
-    assert get_file_calls == ["preExistingFile"]
+    # `get_file` is called twice: once by the URL-resolution fallback
+    # (the original behavior pinned by this test) and once by the
+    # stack-audit probe at the end of the engine that decides whether
+    # to enqueue a `frame_version_sync`. Both calls are against the
+    # same placeholder id.
+    assert get_file_calls == ["preExistingFile", "preExistingFile"]
     assert result.frame_url == "https://next.frame.io/project/p/view/preExistingFile"
 
 

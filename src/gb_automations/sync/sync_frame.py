@@ -175,6 +175,15 @@ class FrameLeveranseResult:
     frame_placeholder_file_id: str | None = None
     frame_url: str | None = None
     note: str | None = None
+    # Set True when the engine discovered that the placeholder is already
+    # inside a version stack (a real version was uploaded on top of V00)
+    # and enqueued a `frame_version_sync` audit to backfill any
+    # pre-existing comments. Surfaced in the worker's log line so the
+    # operator can see the chain on every Sync click.
+    audit_queued: bool = False
+    # The version_stack id the audit was enqueued for, if any. Logged
+    # alongside `audit_queued`.
+    audit_stack_id: str | None = None
 
 
 def _is_404(err: Exception) -> bool:
@@ -761,12 +770,66 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
     result.frame_folder_id = discipline_folder_id
     result.frame_placeholder_file_id = placeholder_id
     result.frame_url = url
+
+    # Self-heal hook: if a real version has already been uploaded on top
+    # of this V00 placeholder (i.e. the placeholder's parent is now a
+    # version stack instead of the bare discipline folder), enqueue a
+    # `frame_version_sync` so the stack audit picks up any pre-existing
+    # comments. This is what makes the per-project / per-deliverable
+    # "Sync" button reconcile Frame state that was created BEFORE the
+    # integration was hooked up — without it, the audit only runs on
+    # live `file.versioned` webhooks, leaving prior content invisible.
+    #
+    # Always-enqueue (per the user's intent for the manual Sync button:
+    # "self-heal whenever you press Sync"). The audit is idempotent via
+    # FrameComment ON CONFLICT DO NOTHING + the FrameKorreksjonsrunde
+    # cache + set_deliverable_status read-first; the active-dedup index
+    # on sync_tasks collapses simultaneous re-clicks to one task.
+    #
+    # Best-effort: a Frame blip here must NOT fail the leveranse sync
+    # (the placeholder write already succeeded). Lazy import the queue
+    # helper + worker wake to avoid a sync_frame ↔ queue import cycle.
+    try:
+        file_obj = await frame_client.get_file(placeholder_id)
+        parent_id = file_obj.get("parent_id") if isinstance(file_obj, dict) else None
+        if parent_id and parent_id != discipline_folder_id:
+            # The placeholder's parent is something other than the bare
+            # discipline folder → probe whether it's a version stack.
+            # `list_version_stack_children` 422s when called on a folder,
+            # so a successful response confirms a stack.
+            try:
+                stack_children = await frame_client.list_version_stack_children(parent_id)
+            except frame_client.FrameAPIError as err:
+                if getattr(err, "status_code", None) in (404, 422):
+                    stack_children = None  # parent is a folder, no stack
+                else:
+                    raise
+            if stack_children:
+                # A stack exists. Enqueue the audit — even when this is a
+                # no-op re-sync, idempotency makes that cheap.
+                from gb_automations.jobs import queue_worker
+                from gb_automations.sync.queue import enqueue_frame_version_sync
+
+                await enqueue_frame_version_sync(parent_id)
+                queue_worker.wake()
+                result.audit_queued = True
+                result.audit_stack_id = parent_id
+    except Exception:
+        logger.warning(
+            "frame: stack-audit probe failed for placeholder %s (leveranse %s) "
+            "— leveranse sync still succeeded, audit was NOT enqueued",
+            placeholder_id,
+            leveranse_page_id,
+            exc_info=True,
+        )
+
     logger.info(
-        "frame leveranse sync %s for %r (page %s, discipline %s) → file=%s",
+        "frame leveranse sync %s for %r (page %s, discipline %s) → file=%s%s",
         action,
         leveranse_name,
         leveranse_page_id,
         discipline_label,
         placeholder_id,
+        f" + audit queued for stack {result.audit_stack_id}" if result.audit_queued else "",
     )
     return result

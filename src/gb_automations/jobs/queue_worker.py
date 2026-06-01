@@ -475,6 +475,7 @@ async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> Non
 
     outcome_error: str | None = None
     project_page_id: str | None = None
+    result = None
     try:
         if not leveranse_page_id:
             raise ValueError(
@@ -504,6 +505,17 @@ async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> Non
         progress=progress,
         label=str(leveranse_page_id),
     )
+    # Visibility for the self-heal chain: if the leveranse engine
+    # discovered a pre-existing version stack on top of V00 and
+    # enqueued an audit, surface that on a separate log line so the
+    # operator can follow the chain (leveranse done → audit queued →
+    # audit runs → status recheck).
+    if result is not None and result.audit_queued and result.audit_stack_id:
+        logger.info(
+            "↳ audit queued for stack %s (leveranse %s)",
+            result.audit_stack_id,
+            leveranse_page_id,
+        )
     if project_page_id:
         await queue_mirror.refresh_project_dot(
             project_page_id, progress=progress, subject="Frame.io deliverable"
