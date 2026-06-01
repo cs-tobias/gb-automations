@@ -49,6 +49,7 @@ from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import (
     enqueue_frame_comment_sync,
+    enqueue_frame_file_status_sync,
     enqueue_frame_leveranse_sync,
     enqueue_frame_project_sync,
     enqueue_frame_version_sync,
@@ -584,6 +585,77 @@ async def _notion_oppgave_done_impl(request: Request) -> Response:
         {
             "action": "enqueued",
             "oppgave_page_id": page_id,
+            "enqueued": inserted,
+        }
+    )
+
+
+@router.post("/notion/oppgave-status")
+async def notion_oppgave_status(request: Request) -> Response:
+    """Notion automation receiver: a deliverable's Status select changed.
+
+    Auth: `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` (same secret
+    as the Ferdig automation). The automation should be set up on the
+    Oppgaver DB with trigger "Status changes" — the engine reads the
+    row's current Status at process time, so a single automation
+    covers entering AND leaving Utgår.
+
+    Payload shape mirrors /webhooks/notion/oppgave-done:
+        {"source": {...}, "data": {"object": "page", "id": "<uuid>",
+            "parent": {"database_id": "<oppgaver db id>"}, ...}}
+    """
+    with request_scope("oppgave-status"):
+        return await _notion_oppgave_status_impl(request)
+
+
+async def _notion_oppgave_status_impl(request: Request) -> Response:
+    if not _verify_bearer(request.headers.get("Authorization")):
+        logger.warning(
+            "Notion oppgave-status auth failed (NOTION_WEBHOOK_SECRET set: %s)",
+            bool(settings.notion_webhook_secret),
+        )
+        raise HTTPException(401, "Bad or missing bearer token")
+
+    raw_body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body") from None
+
+    data = payload.get("data") or {}
+    page_id = data.get("id")
+    parent = (data.get("parent") or {}).get("database_id") or ""
+    target_db = (settings.oppgaver_db_id or "").replace("-", "").lower()
+    payload_db = parent.replace("-", "").lower()
+
+    if not page_id:
+        logger.warning("oppgave-status: no page id in payload")
+        return _json({"action": "skipped", "reason": "no page id"})
+
+    # Defense: confirm the row really is in the Oppgaver DB (the
+    # automation should fire on the Oppgaver DB; a misconfigured
+    # automation pointing at another DB would silently send junk events
+    # here otherwise).
+    if target_db and payload_db != target_db:
+        logger.info(
+            "oppgave-status: page %s parent DB %s does not match OPPGAVER_DB_ID — skipping",
+            page_id,
+            parent,
+        )
+        return _json({"action": "skipped", "reason": "wrong parent DB"})
+
+    inserted = await enqueue_frame_file_status_sync(page_id, source="notion")
+    queue_worker.wake()
+    logger.info(
+        "📥 enqueued frame_file_status_sync for %s (source=notion, inserted=%d)",
+        page_id,
+        inserted,
+    )
+    return _json(
+        {
+            "action": "enqueued",
+            "leveranse_page_id": page_id,
+            "source": "notion",
             "enqueued": inserted,
         }
     )
@@ -1223,6 +1295,110 @@ async def frame_webhook(request: Request) -> Response:
                         "received": True,
                         "event": event_type,
                         "stack_id": resource_id,
+                        "enqueued": inserted,
+                    }
+                ),
+                media_type="application/json",
+            )
+
+        # Custom metadata field changed on a file (Utgår status mirror).
+        # Frame's V4 event name for "a custom field's value changed on a
+        # file" is one of `file.status_changed` / `file.metadata_value_changed`
+        # / a generic file-update; we accept both known candidates and let
+        # the engine no-op when the field is irrelevant. The payload's
+        # `resource.id` is the file id; we resolve to a deliverable via
+        # the cached placeholder file id and enqueue the reconcile engine
+        # with source="frame".
+        if event_type in ("file.status_changed", "file.metadata_value_changed"):
+            if not resource_id:
+                logger.warning(
+                    "frame: %s has no resource.id — ignoring", event_type
+                )
+                return Response(
+                    content=json.dumps({"received": True, "ignored": "no resource.id"}),
+                    media_type="application/json",
+                )
+            # Which deliverable does this file back? Two cases:
+            #   (a) Direct hit — the event fired on the cached V00
+            #       placeholder. Fast path.
+            #   (b) Stack hit — the event fired on a V01/V02 file the
+            #       team uploaded on top of V00. The placeholder still
+            #       lives in the same version stack as a sibling; we
+            #       look up by joining the event file's stack-mates
+            #       against our cached placeholder ids. Same pattern
+            #       sync_frame_stack_audit uses.
+            from gb_automations.clients import frame as _frame_client
+            from gb_automations.db import SessionLocal as _SessionLocal
+            from gb_automations.models import FrameLeveranseFolder as _FLF
+            from sqlalchemy import select as _select
+
+            async with _SessionLocal() as session:
+                stmt = _select(_FLF).where(
+                    _FLF.frame_placeholder_file_id == resource_id
+                )
+                leveranse_row = (await session.execute(stmt)).scalar_one_or_none()
+
+            if leveranse_row is None:
+                # Stack fallback: ask Frame for the file's parent, list
+                # stack siblings, and see if any of them is one of our
+                # placeholder ids.
+                try:
+                    file_obj = await _frame_client.get_file(resource_id)
+                    parent_id = (
+                        file_obj.get("parent_id") if isinstance(file_obj, dict) else None
+                    )
+                except Exception:  # noqa: BLE001
+                    parent_id = None
+                sibling_ids: list[str] = []
+                if parent_id:
+                    try:
+                        children = await _frame_client.list_version_stack_children(parent_id)
+                    except _frame_client.FrameAPIError as err:
+                        if getattr(err, "status_code", None) in (404, 422):
+                            children = []
+                        else:
+                            children = []
+                    except Exception:  # noqa: BLE001
+                        children = []
+                    sibling_ids = [
+                        c.get("id") for c in children
+                        if isinstance(c, dict) and c.get("id")
+                    ]
+                if sibling_ids:
+                    async with _SessionLocal() as session:
+                        stmt = _select(_FLF).where(
+                            _FLF.frame_placeholder_file_id.in_(sibling_ids)
+                        )
+                        leveranse_row = (
+                            await session.execute(stmt)
+                        ).scalar_one_or_none()
+
+            if leveranse_row is None:
+                logger.info(
+                    "frame: %s on untracked file %s — skipping",
+                    event_type,
+                    resource_id,
+                )
+                return Response(
+                    content=json.dumps({"received": True, "ignored": "untracked file"}),
+                    media_type="application/json",
+                )
+            inserted = await enqueue_frame_file_status_sync(
+                leveranse_row.notion_page_id, source="frame"
+            )
+            queue_worker.wake()
+            logger.info(
+                "📨 enqueued frame_file_status_sync for leveranse %s (source=frame, inserted=%d)",
+                leveranse_row.notion_page_id,
+                inserted,
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "received": True,
+                        "event": event_type,
+                        "leveranse_page_id": leveranse_row.notion_page_id,
+                        "source": "frame",
                         "enqueued": inserted,
                     }
                 ),

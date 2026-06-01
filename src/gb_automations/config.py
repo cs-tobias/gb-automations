@@ -225,6 +225,12 @@ class Settings(BaseSettings):
     # created via POST /v4/.../webhooks. Empty until the webhook is created;
     # bootstrap script handles creation and stashes the secret here.
     frame_webhook_secret: str = ""
+    # Workspace-level UUID of the custom "Status" select field in Frame.io.
+    # Resolved once via `GET /v4/accounts/{aid}/metadata/field_definitions`
+    # (also surfaced at GET /debug/frame/field-definitions). Empty → the
+    # Notion ↔ Frame Status reconcile engine is disabled (returns "skipped"
+    # with a clear note rather than crashing).
+    frame_status_field_id: str = ""
     # Phase 1 fan-out toggle (mirrors sync_gmail_labels / sync_nas_folders).
     # OFF by default so a deploy can land the Frame code without flipping the
     # behavior on. Flip to true once frame_workspace_id + frame_placeholder_url
@@ -612,6 +618,12 @@ STATUS_UTGAAR = "Utgår"
 # get created, but Status stays where the team manually put it. The team has
 # to move it out manually before the automation can write again.
 MANUAL_DELIVERABLE_STATUSES = frozenset({STATUS_TRENGER_AVKLARING, STATUS_UTGAAR})
+
+# The literal string we write to Frame.io's custom "Status" select field
+# when reflecting a Notion deliverable that's at Utgår. Matches the Notion
+# option name verbatim — the Frame workspace must have an option with the
+# same spelling on its Status field for the bidirectional mirror to work.
+FRAME_STATUS_UTGAAR = "Utgår"
 
 
 # Timer YYYY DB — auto-created per year, year-partitioned the same way

@@ -36,6 +36,7 @@ from gb_automations.sync.queue import (
 )
 from gb_automations.sync.sync_frame import sync_frame_leveranse, sync_frame_project
 from gb_automations.sync.sync_frame_comments import sync_frame_comment
+from gb_automations.sync.sync_frame_file_status import sync_frame_file_status
 from gb_automations.sync.sync_frame_version import sync_frame_version
 from gb_automations.sync.sync_labels import sync_project_labels
 from gb_automations.sync.sync_leveranse_status import recheck_leveranse_status
@@ -631,6 +632,65 @@ async def _process_frame_version_sync(claimed: _Claimed, progress: str) -> None:
         )
 
 
+async def _process_frame_file_status_sync(claimed: _Claimed, progress: str) -> None:
+    """Run a frame_file_status_sync task: reconcile Notion deliverable
+    Status ↔ Frame.io custom Status field for one deliverable (Utgår
+    mirror).
+
+    `gmail_thread_id` carries the Notion deliverable page id;
+    `user_email` carries the source hint ("notion" or "frame") that
+    tells the engine which side is authoritative for THIS pass.
+    "Skipped"/"unchanged" outcomes are healthy (loop-guard caught an
+    echo, or sync disabled by env), NOT failed.
+    """
+    leveranse_page_id = claimed.gmail_thread_id
+    source = claimed.user_email or "notion"
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — reconciling Frame file Status for %s (source=%s)%s",
+        progress,
+        leveranse_page_id,
+        source,
+        retry_note,
+    )
+
+    outcome_error: str | None = None
+    project_page_id: str | None = None
+    try:
+        if not leveranse_page_id:
+            raise ValueError(
+                "frame_file_status_sync task has no leveranse page id (gmail_thread_id)"
+            )
+        result = await sync_frame_file_status(leveranse_page_id, source=source)
+        project_page_id = result.project_page_id
+        if result.action == "failed":
+            outcome_error = result.note or "frame file status sync failed"
+    except Exception as err:
+        log_api_error(
+            logger, f"frame file status sync crashed for {leveranse_page_id}", err
+        )
+        outcome_error = describe_error(err)
+
+    if project_page_id:
+        await set_task_project(claimed.id, project_page_id)
+
+    await _dot_in_progress(
+        project_page_id, progress=progress, subject="Frame status"
+    )
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(leveranse_page_id),
+    )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Frame status"
+        )
+
+
 async def _process_oppgave_done_sync(claimed: _Claimed, progress: str) -> None:
     """Run an oppgave_done_sync task: propagate a Notion Korreksjon's
     Ferdig checkbox state to its linked Frame comment.
@@ -773,6 +833,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "frame_version_sync":
         await _process_frame_version_sync(claimed, progress)
+        return
+    if claimed.task_type == "frame_file_status_sync":
+        await _process_frame_file_status_sync(claimed, progress)
         return
     if claimed.task_type == "oppgave_done_sync":
         await _process_oppgave_done_sync(claimed, progress)

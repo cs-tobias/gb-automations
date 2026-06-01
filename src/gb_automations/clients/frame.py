@@ -885,3 +885,243 @@ async def get_file_version_info(file_id: str) -> tuple[int, str | None]:
         file_id, parent_id,
     )
     return 0, parent_id
+
+
+# ============================================================
+# Custom metadata fields (V4 — "Status" custom select is the use case)
+# ============================================================
+#
+# Frame V4 stores user-defined select / multi-select / text / etc. fields
+# as workspace-level **field definitions** referenced by UUID. The
+# canonical write endpoint runs through the project (not the file):
+#
+#   POST /v4/accounts/{aid}/projects/{pid}/metadata/values
+#     body: {"data": {"file_ids": [fid], "values": [
+#       {"field_definition_id": uuid, "value": "Utgår"}
+#     ]}}
+#
+# Writing through the file endpoint directly returns 422; this is a known
+# gotcha confirmed via the Frame developer forum
+# (https://forum.frame.io/t/.../2996).
+#
+# Read shape on a File response: the custom field values come back under
+# a `metadata` array — each entry carries `field_definition_id`,
+# `field_name`, `field_type`, and `value` (or `value_id` for selects).
+# Probed against Goldbox's tenant during implementation; the helper
+# below is defensive to absorb shape drift.
+
+
+async def list_field_definitions() -> list[dict[str, Any]]:
+    """List the workspace's custom field definitions.
+
+    Operator-facing: backs `/debug/frame/field-definitions` so the
+    Status field's UUID can be discovered without curl. Each entry
+    typically carries `id`, `name`, `field_type` (e.g. "select"), and
+    for selects an `options` array with `{id, value}` per option.
+    """
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.get(
+                f"/accounts/{_account_id()}/metadata/field_definitions"
+            ),
+            op_name="list_field_definitions",
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        # V4 returns either {"data": [...]} or a bare list depending on
+        # the endpoint. Normalize.
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            return payload["data"]
+        if isinstance(payload, list):
+            return payload
+        return []
+
+
+# Cached option maps for select fields. Frame V4 select-field reads
+# and writes use option UUIDs (NOT the display name), so we need to
+# translate {"Utgår" ↔ <option-uuid>} both directions. The map only
+# changes when an admin adds/removes options in the Frame UI — process-
+# local cache is fine; a restart re-warms it. Cleared via
+# `_invalidate_select_options_cache(field_id)` if we ever need a
+# manual refresh.
+_SELECT_OPTIONS_CACHE: dict[str, dict[str, str]] = {}  # field_id → {display_name: uuid}
+
+
+async def _select_options_for_field(field_id: str) -> dict[str, str]:
+    """Return `{display_name: option_uuid}` for a select field.
+
+    Hot path called on every read AND write of a select-field value.
+    First miss costs one `GET /metadata/field_definitions` round-trip;
+    subsequent calls are O(1) in-memory.
+    """
+    cached = _SELECT_OPTIONS_CACHE.get(field_id)
+    if cached is not None:
+        return cached
+    definitions = await list_field_definitions()
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
+        if definition.get("id") != field_id:
+            continue
+        config = definition.get("field_configuration") or {}
+        options = config.get("options") or []
+        mapping: dict[str, str] = {}
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            name = opt.get("display_name")
+            uuid = opt.get("id")
+            if isinstance(name, str) and isinstance(uuid, str):
+                mapping[name] = uuid
+        _SELECT_OPTIONS_CACHE[field_id] = mapping
+        return mapping
+    # Field not found at all — cache empty mapping so we don't re-fetch
+    # every call. Operator should fix FRAME_STATUS_FIELD_ID.
+    _SELECT_OPTIONS_CACHE[field_id] = {}
+    return {}
+
+
+def _invalidate_select_options_cache(field_id: str | None = None) -> None:
+    """Clear the option-name → UUID cache. Pass a field_id to evict one
+    field, or None to evict all. Used after an admin adds a new option
+    in Frame's UI and we need to pick it up without restarting."""
+    if field_id is None:
+        _SELECT_OPTIONS_CACHE.clear()
+    else:
+        _SELECT_OPTIONS_CACHE.pop(field_id, None)
+
+
+def _extract_status_value_uuid(file_payload: dict[str, Any], field_id: str) -> str | None:
+    """Pull the current Status option UUID out of a `GET /files/{id}` payload.
+
+    Frame V4 stores select-field values as option UUIDs (NOT display
+    names). The file payload's `metadata` array entries carry `value`
+    as either a list[uuid] (the verified shape for selects) or a bare
+    string in some payload variants. Returns the FIRST option UUID, or
+    None for "field unset" / any unmatched shape.
+    """
+    if not field_id:
+        return None
+    md = file_payload.get("metadata") if isinstance(file_payload, dict) else None
+    if not isinstance(md, list):
+        return None
+    for entry in md:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("field_definition_id") != field_id:
+            continue
+        val = entry.get("value")
+        if isinstance(val, list):
+            # Select fields surface as a list of option UUIDs.
+            return val[0] if val else None
+        if isinstance(val, str):
+            return val or None
+        return None
+    return None
+
+
+async def get_file_status(file_id: str, field_id: str) -> str | None:
+    """Read the current value of the workspace's custom Status field on
+    a File, returned as a DISPLAY NAME (e.g. "Utgår", "Needs Review").
+
+    Frame stores the underlying value as an option UUID; this helper
+    resolves it back to the display name via the cached options map so
+    callers can compare against `FRAME_STATUS_UTGAAR` directly. Returns
+    None if the field is unset, the file doesn't carry the field, the
+    stored UUID doesn't match any current option (renamed/deleted), or
+    `field_id` is empty.
+    """
+    if not field_id:
+        return None
+    file_obj = await get_file(file_id)
+    uuid = _extract_status_value_uuid(file_obj, field_id)
+    if uuid is None:
+        return None
+    # Reverse-map UUID → display name.
+    options = await _select_options_for_field(field_id)
+    for name, opt_uuid in options.items():
+        if opt_uuid == uuid:
+            return name
+    return None  # stored UUID doesn't match any current option — treat as unset
+
+
+async def set_file_status(
+    *, project_id: str, file_id: str, field_id: str, value: str | None
+) -> str:
+    """Write (or clear) the workspace Status custom field on a File.
+
+    Returns the action taken: "written" | "unchanged" | "skipped".
+
+    - `value` is the option's DISPLAY NAME (e.g. "Utgår"). This helper
+      resolves it to the option UUID before writing (Frame V4 select
+      fields are wire-typed as `List of UUID`, not strings).
+    - `value=None` clears the field — sent as an empty list.
+    - `field_id` empty → returns "skipped" without an HTTP call (sync
+      disabled via FRAME_STATUS_FIELD_ID env var).
+    - Read-first: fetches the current display-name via `get_file_status`
+      and short-circuits with "unchanged" when Frame already matches.
+      This is the loop-prevention guard.
+    """
+    if not field_id:
+        return "skipped"
+    current = await get_file_status(file_id, field_id)
+    if current == value:
+        return "unchanged"
+
+    # Resolve desired display name → option UUID(s).
+    if value is None:
+        option_uuids: list[str] = []
+    else:
+        options = await _select_options_for_field(field_id)
+        if value not in options:
+            logger.warning(
+                "frame file %s status: option %r not found among %s "
+                "(check Frame field config / cache freshness)",
+                file_id,
+                value,
+                sorted(options.keys()),
+            )
+            return "skipped"
+        option_uuids = [options[value]]
+
+    body: dict[str, Any] = {
+        "data": {
+            "file_ids": [file_id],
+            "values": [
+                {
+                    "field_definition_id": field_id,
+                    # Frame V4 wants a List of UUID for select fields,
+                    # not the display-name string. Verified via the
+                    # probe endpoint's 422: "A List of UUID is expected
+                    # for select field type".
+                    "value": option_uuids,
+                }
+            ],
+        }
+    }
+    token = await frame_auth.get_access_token()
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            # Custom-fields metadata writes live under the experimental
+            # router with PATCH (not POST — POST returns 404 even with
+            # the experimental header). The endpoint is project-scoped:
+            # PATCH /v4/accounts/{aid}/projects/{pid}/metadata/values
+            lambda: client.patch(
+                f"/accounts/{_account_id()}/projects/{project_id}/metadata/values",
+                json=body,
+                headers={"api-version": "experimental"},
+            ),
+            op_name="set_file_status",
+        )
+        _raise_for_status(response)
+    logger.info(
+        "frame file %s status: %r → %r (project=%s, field=%s, option_uuids=%s)",
+        file_id,
+        current,
+        value,
+        project_id,
+        field_id,
+        option_uuids,
+    )
+    return "written"

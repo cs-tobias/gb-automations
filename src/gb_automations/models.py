@@ -636,6 +636,7 @@ SYNC_TASK_TYPES = (
     "frame_leveranse_sync",
     "frame_comment_sync",
     "frame_version_sync",
+    "frame_file_status_sync",
     "oppgave_done_sync",
     "leveranse_status_recheck",
     "toggl_project_sync",
@@ -718,7 +719,8 @@ class SyncTask(Base):
         CheckConstraint(
             "task_type IN ('thread','label_sync','nas_folder_sync',"
             "'task_folder_sync','frame_project_sync','frame_leveranse_sync',"
-            "'frame_comment_sync','frame_version_sync','oppgave_done_sync',"
+            "'frame_comment_sync','frame_version_sync',"
+            "'frame_file_status_sync','oppgave_done_sync',"
             "'leveranse_status_recheck','toggl_project_sync',"
             "'toggl_hours_sync')",
             name="ck_sync_tasks_task_type",
@@ -813,6 +815,19 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'frame_version_sync'"
+            ),
+        ),
+        # Utgår reconcile — at most one ACTIVE frame_file_status_sync per
+        # Leveranse. gmail_thread_id carries the Notion deliverable page
+        # id (the reconcile engine reads both Notion + Frame at process
+        # time, so collapsing simultaneous Notion-side + Frame-side
+        # nudges to one task is correct).
+        Index(
+            "uq_sync_tasks_active_frame_file_status",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'frame_file_status_sync'"
             ),
         ),
         # Phase 2.5 — At most one ACTIVE oppgave_done_sync per Oppgave

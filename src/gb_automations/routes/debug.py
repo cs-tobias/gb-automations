@@ -295,6 +295,203 @@ async def debug_frame_comments(file_id: str) -> dict[str, Any]:
     }
 
 
+@router.get("/frame/field-definitions")
+async def debug_frame_field_definitions() -> dict[str, Any]:
+    """Surface the workspace's custom field definitions for operator discovery.
+
+    Used once during setup of the Notion ↔ Frame Utgår status sync: hit
+    this endpoint, locate the entry whose name is "Status" (or whatever
+    the workspace's review-status custom field is named), copy its `id`
+    into `.env` as `FRAME_STATUS_FIELD_ID`, restart the API.
+    """
+    from gb_automations.config import settings
+
+    try:
+        definitions = await frame_client.list_field_definitions()
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    return {
+        "ok": True,
+        "count": len(definitions),
+        "configured_status_field_id": settings.frame_status_field_id or None,
+        "field_definitions": definitions,
+    }
+
+
+@router.get("/frame/file-metadata/{file_id}")
+async def debug_frame_file_metadata(file_id: str) -> dict[str, Any]:
+    """[PROBE] Dump a Frame File's full payload — useful for inspecting
+    where custom field values live (`metadata` array? `field_values`?
+    `custom_fields`?) before wiring up the write side.
+
+    Probe-only: returns the raw, unwrapped file payload. Operator-driven —
+    not in any normal sync path.
+    """
+    try:
+        file_obj = await frame_client.get_file(file_id)
+    except frame_auth.FrameAuthError as err:
+        raise HTTPException(401, str(err)) from err
+    except frame_client.FrameAPIError as err:
+        raise HTTPException(502, str(err)) from err
+    return {"ok": True, "file_id": file_id, "file": file_obj}
+
+
+@router.post("/frame/probe-set-status/{leveranse_page_id}/{value}")
+async def debug_frame_probe_set_status(
+    leveranse_page_id: str, value: str
+) -> dict[str, Any]:
+    """[PROBE] Try MULTIPLE candidate Frame V4 endpoints for writing a
+    custom Status field value, and report the result of each attempt.
+
+    Goal: discover the right URL shape + method without doing N round-
+    trips through Claude. Each variant is tried with `api-version:
+    experimental` header. `value` is the literal string to set (e.g.
+    "Utgår"). Pass the LEVERANSE page id; the helper resolves the
+    Frame file id + project id via the cache.
+
+    NOT used by normal sync — purely a one-shot operator-driven probe.
+    """
+    from sqlalchemy import select as _select
+
+    from gb_automations.clients import frame_auth as _fa
+    from gb_automations.config import settings as _settings
+    from gb_automations.db import SessionLocal as _Session
+    from gb_automations.models import (
+        FrameLeveranseFolder as _FLF,
+        FrameProjectFolder as _FPF,
+    )
+
+    if not _settings.frame_status_field_id:
+        raise HTTPException(400, "FRAME_STATUS_FIELD_ID is not configured")
+
+    async with _Session() as session:
+        leveranse_row = await session.get(_FLF, leveranse_page_id)
+        if leveranse_row is None:
+            raise HTTPException(404, "no FrameLeveranseFolder for this page")
+        project_row = await session.get(_FPF, leveranse_row.project_page_id)
+        if project_row is None:
+            raise HTTPException(404, "no FrameProjectFolder for parent project")
+
+    file_id = leveranse_row.frame_placeholder_file_id
+    project_id = project_row.frame_project_id
+    field_id = _settings.frame_status_field_id
+
+    # Candidate endpoints to try. Each tuple: (method, url, body, note).
+    aid = frame_client._account_id()  # noqa: SLF001
+    base = frame_client.FRAME_API_BASE
+    candidates: list[tuple[str, str, dict[str, Any], str]] = [
+        # Current implementation (already failing) — included as the
+        # baseline so the report is comparable.
+        (
+            "POST",
+            f"{base}/accounts/{aid}/projects/{project_id}/metadata/values",
+            {
+                "data": {
+                    "file_ids": [file_id],
+                    "values": [{"field_definition_id": field_id, "value": value}],
+                }
+            },
+            "current impl — POST project metadata/values",
+        ),
+        # PATCH instead of POST on the same URL — the search results
+        # suggested "PATCH Update metadata across multiple files".
+        (
+            "PATCH",
+            f"{base}/accounts/{aid}/projects/{project_id}/metadata/values",
+            {
+                "data": {
+                    "file_ids": [file_id],
+                    "values": [{"field_definition_id": field_id, "value": value}],
+                }
+            },
+            "PATCH on project metadata/values",
+        ),
+        # PATCH on file directly — Adobe Developer pattern.
+        (
+            "PATCH",
+            f"{base}/accounts/{aid}/files/{file_id}/metadata/values",
+            {
+                "data": {
+                    "values": [{"field_definition_id": field_id, "value": value}],
+                }
+            },
+            "PATCH on file metadata/values",
+        ),
+        # PATCH on the file with `metadata` as the top-level key (the
+        # 422-thread mentioned this was what users tried before being
+        # redirected to the project endpoint).
+        (
+            "PATCH",
+            f"{base}/accounts/{aid}/files/{file_id}",
+            {
+                "data": {
+                    "metadata": [
+                        {"field_definition_id": field_id, "value": value}
+                    ]
+                }
+            },
+            "PATCH on file with `metadata` array",
+        ),
+        # POST a single field-value resource — REST-y collection write.
+        (
+            "POST",
+            f"{base}/accounts/{aid}/files/{file_id}/metadata_values",
+            {
+                "data": {
+                    "field_definition_id": field_id,
+                    "value": value,
+                }
+            },
+            "POST single file metadata_values",
+        ),
+    ]
+
+    token = await _fa.get_access_token()
+    results: list[dict[str, Any]] = []
+    async with await frame_client._client(access_token=token) as client:  # noqa: SLF001
+        for method, url, body, note in candidates:
+            try:
+                response = await client.request(
+                    method,
+                    url,
+                    json=body,
+                    headers={"api-version": "experimental"},
+                )
+                snippet = response.text[:500]
+                results.append(
+                    {
+                        "method": method,
+                        "url": url,
+                        "note": note,
+                        "status": response.status_code,
+                        "body_snippet": snippet,
+                    }
+                )
+            except Exception as err:  # noqa: BLE001
+                results.append(
+                    {
+                        "method": method,
+                        "url": url,
+                        "note": note,
+                        "status": "exception",
+                        "body_snippet": str(err)[:500],
+                    }
+                )
+
+    return {
+        "ok": True,
+        "leveranse_page_id": leveranse_page_id,
+        "file_id": file_id,
+        "project_id": project_id,
+        "field_id": field_id,
+        "value": value,
+        "candidates_tried": len(candidates),
+        "results": results,
+    }
+
+
 @router.get("/frame/comment-raw/{comment_id}")
 async def debug_frame_comment_raw_variants(comment_id: str) -> dict[str, Any]:
     """[PROBE] Fetch one comment trying include= variants (probe-only).

@@ -189,3 +189,54 @@ The rollup engine runs after every Korreksjon state change. It reads the active 
 - **V00 comments are dropped.** The placeholder image isn't a real deliverable; comments on it are pre-delivery noise and get logged + skipped.
 - **Pre-restructure rounds stay as historical debris.** Korreksjonsrunde/Korreksjon rows created before the Oppgaver+Korreksjoner restructure remain in the (renamed) Korreksjoner DB. They aren't migrated. The status rollup looks for the active round as a sub-row in the Oppgaver DB, so a deliverable mid-correction-cycle at cutover shows `skipped_no_round` until the next NEW comment creates a fresh round in Oppgaver and the rollup resumes — expected, not a bug.
 - **Comments on Frame files we don't track are skipped.** The engine only acts on files whose id is cached as a `FrameLeveranseFolder.frame_placeholder_file_id` (or whose version stack contains such a file).
+
+## Notion ↔ Frame Utgår status mirror
+
+Bidirectional sync for the `Utgår` deliverable status. When a deliverable in Notion's Oppgaver DB is set to `Utgår`, the same value is written to Frame.io's custom Status field on the matching file — and vice versa. Other Notion deliverable statuses (Klar til oppstart / Under arbeid / Oppgaver ferdig / Ferdig / Trenger avklaring) do NOT propagate; only Utgår is mirrored in this iteration.
+
+### Prerequisites
+
+1. The Frame.io workspace has a custom `select` field on the project metadata schema (typically named `Status`) with an option whose **exact string** is `Utgår`. Confirm by opening a file in Frame and checking that the Status dropdown lists `Utgår`.
+
+### Operator setup
+
+1. **Resolve the field UUID.** With the API running, hit `GET /debug/frame/field-definitions` on the tunnel. Find the entry whose `name` is `Status` (or whatever the workspace's review-status custom field is named). Copy its `id` UUID.
+
+2. **Set the env var.** Add to `.env`:
+
+   ```env
+   FRAME_STATUS_FIELD_ID=<the uuid from step 1>
+   ```
+
+   Restart: `docker compose up -d --force-recreate api`.
+
+3. **Add the Notion automation.** On the Oppgaver DB, create a new automation:
+
+   - Trigger: `Status` property changes (any value).
+   - Action: Send webhook to `https://hub.<domain>/webhooks/notion/oppgave-status`.
+   - Headers: `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` (same secret as the Ferdig automation).
+
+   The engine reads the row's current Status at process time, so a single automation covers entering AND leaving Utgår.
+
+4. **Subscribe to Frame metadata-change webhooks.** Add the event names `file.status_changed` and `file.metadata_value_changed` to the Frame webhook subscription (`scripts/frame_register_webhook.py`). Either event fires → reconcile engine runs with `source="frame"`.
+
+### End-to-end test (Utgår mirror)
+
+| Action | Expected |
+|---|---|
+| Notion deliverable Status → `Utgår` | `📥 enqueued frame_file_status_sync ... source=notion` → Frame UI shows the file's Status = `Utgår`. |
+| Notion → any other status | Frame Status clears (field becomes empty in the Frame UI). |
+| Frame UI: file Status → `Utgår` | `📨 enqueued frame_file_status_sync ... source=frame` → Notion deliverable Status = `Utgår`. |
+| Frame UI: file Status cleared | Notion deliverable Status clears (back to empty). |
+| Both sides already aligned (echo from our own write) | `frame_file_status: ... already matches ... (loop guard)`. No second write. |
+
+### Loop-prevention model (Utgår mirror)
+
+Same shape as the Ferdig ↔ Frame `completed` sync: read-first on both sides + `source` hint resolves the two-state ambiguity. When our own write echoes back via the other side's webhook, the reconcile engine reads both sides, sees they already match, returns `unchanged`. No oscillation.
+
+### Things to know (Utgår mirror)
+
+- **`FRAME_STATUS_FIELD_ID` unset disables the mirror gracefully.** The engine returns `skipped` with note `"FRAME_STATUS_FIELD_ID unset"`. Safe to deploy the code without configuring the field — nothing breaks.
+- **`force_set_oppgave_status` bypasses the manual-status guard.** Because `Utgår` is in `MANUAL_DELIVERABLE_STATUSES`, the normal `set_oppgave_status` would refuse to clear it. The reconcile engine uses the `force_` variant on the Frame → Notion path; this is intentional and matches the user's stated mental model ("the Frame UI is an explicit manual move").
+- **Race tie-break.** If Notion and Frame are nudged near-simultaneously with conflicting intents, the first webhook to land sets the `source` for that processing pass via the active-dedup index on `gmail_thread_id`. The second is dropped. The "loser" can re-click.
+- **Untracked Frame files skip silently.** A `file.status_changed` event on a file with no matching `FrameLeveranseFolder` is logged + skipped (same pattern as the comment path).

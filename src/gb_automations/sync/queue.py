@@ -375,6 +375,9 @@ _ACTIVE_OPPGAVE_DONE_PREDICATE = text(
 _ACTIVE_LEVERANSE_STATUS_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'leveranse_status_recheck'"
 )
+_ACTIVE_FRAME_FILE_STATUS_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_file_status_sync'"
+)
 
 
 async def enqueue_frame_version_sync(stack_id: str) -> int:
@@ -458,6 +461,47 @@ async def enqueue_leveranse_status_recheck(leveranse_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["gmail_thread_id"],
             index_where=_ACTIVE_LEVERANSE_STATUS_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_frame_file_status_sync(
+    leveranse_page_id: str, *, source: str = "notion"
+) -> int:
+    """Enqueue a bidirectional reconcile of the Notion deliverable Status
+    ↔ Frame.io custom Status field for one deliverable.
+
+    Fired from BOTH directions:
+      - Notion automation on the Oppgaver DB (Status changed) →
+        /webhooks/notion/oppgave-status → enqueue here with source="notion".
+      - Frame webhook (file Status custom field changed) →
+        /webhooks/frame → enqueue here with source="frame".
+
+    The same reconcile engine drains the task and uses `source` to
+    decide which side is authoritative (the side that just changed).
+    The source string is stashed in `user_email` (a NOT NULL slot that
+    this task type doesn't otherwise use). `gmail_thread_id` carries
+    the Notion deliverable page id, and the active-dedup index keys
+    only on that — a Notion + Frame double-nudge for the same
+    deliverable collapses to one task, processed with whichever source
+    fired first.
+    """
+    if not leveranse_page_id:
+        return 0
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="frame_file_status_sync",
+            user_email=source,
+            gmail_thread_id=leveranse_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_FRAME_FILE_STATUS_PREDICATE,
         )
     )
     async with SessionLocal() as own:

@@ -1082,6 +1082,47 @@ async def set_oppgave_status(page_id: str, status_name: str) -> str:
     return "written"
 
 
+async def force_set_oppgave_status(
+    page_id: str, status_name: str | None
+) -> str:
+    """Set (or CLEAR with `status_name=None`) the Status select on an
+    Oppgaver row, bypassing the manual-override guard.
+
+    Used by the Utgår reconcile engine (sync/sync_frame_file_status.py)
+    when Frame.io is the source of truth — the Frame UI cleared its
+    Status, so Notion's Utgår needs to clear too. The normal
+    `set_oppgave_status` refuses to overwrite manual states, which is
+    correct for ROLLUP-driven writes but wrong for an explicit Frame ↔
+    Notion mirror where the team's intent is to move the manual state.
+
+    Returns "written" | "unchanged". No "skipped_manual" branch by
+    design — caller has already decided this is an explicit move.
+    `status_name=None` clears the property (Notion's PATCH accepts
+    `{"select": null}`).
+    """
+    current = await get_oppgave_status(page_id)
+    if current == status_name:
+        return "unchanged"
+    props: dict[str, Any] = {
+        OPPGAVER_PROPS["status"]: {"select": {"name": status_name} if status_name else None}
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{page_id} status (force)",
+        )
+        _raise_for_status(response)
+    logger.info(
+        "oppgave_status: FORCE %s → %r on %s",
+        current or "(empty)",
+        status_name,
+        page_id,
+    )
+    return "written"
+
+
 # Back-compat aliases: every existing call site in the codebase uses
 # these names. The generalized helpers above do exactly what the
 # deliverable-specific versions did; the rename is purely semantic so
