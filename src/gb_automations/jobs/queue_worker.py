@@ -24,6 +24,7 @@ import logging
 from dataclasses import dataclass
 
 from gb_automations.db import SessionLocal
+from gb_automations.models import FrameLeveranseFolder
 from gb_automations.obs import describe_error, log_api_error
 from gb_automations.sync import queue_mirror
 from gb_automations.sync.queue import (
@@ -79,6 +80,60 @@ class _Claimed:
     project_page_id: str | None
     attempts: int
     rebuild: bool
+
+
+async def _resolve_project_from_leveranse(
+    leveranse_page_id: str | None,
+) -> str | None:
+    """Look up the Frame leveranse → project mapping in Postgres.
+
+    Used by the Frame engines whose result dataclasses don't carry
+    `project_page_id` (`oppgave_done_sync`, `leveranse_status_recheck`)
+    so they can still light the Projects-DB dot + write the "Sync
+    progress" subject. Returns None silently on cache miss / DB error —
+    `refresh_project_dot(None, ...)` is already a safe no-op, so a miss
+    just means the field doesn't get updated for this task. The mapping
+    is owned by `sync_frame_leveranse`, so a cache miss only happens if
+    a Frame engine fired on a Notion page that wasn't provisioned by
+    this codebase (legitimate edge — we just stay quiet).
+    """
+    if not leveranse_page_id:
+        return None
+    try:
+        async with SessionLocal() as session:
+            row = await session.get(FrameLeveranseFolder, leveranse_page_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return row.project_page_id
+
+
+async def _dot_in_progress(
+    project_page_id: str | None, *, progress: str, subject: str
+) -> None:
+    """Write the project's "Sync progress" subject WHILE the task is still
+    in_progress.
+
+    Why this and not the post-completion `refresh_project_dot`: the dot
+    writer reads `project_sync_state` straight from sync_tasks. By the
+    time `_record_outcome` flips the row to `done`, a single-task batch
+    has nothing else in flight for the project — state goes `idle` and
+    the writer's idle-clear branch overrides whatever `progress=` we
+    pass, blanking the field instantly. Calling here, BEFORE
+    `_record_outcome`, the row is still `in_progress` → state is
+    `active` → the subject sticks until the next task overwrites it
+    (or the post-completion call clears it once the queue is truly
+    drained).
+
+    Best-effort: `refresh_project_dot` already swallows its own
+    exceptions, so callers don't need a try/except.
+    """
+    if not project_page_id:
+        return
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject=subject
+    )
 
 
 async def _claim() -> _Claimed | None:
@@ -187,7 +242,9 @@ async def _process_label_sync(claimed: _Claimed, progress: str) -> None:
     await _record_outcome(
         claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(project_page_id)
     )
-    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Gmail labels"
+    )
 
 
 async def _process_nas_folder_sync(claimed: _Claimed, progress: str) -> None:
@@ -227,7 +284,9 @@ async def _process_nas_folder_sync(claimed: _Claimed, progress: str) -> None:
         progress=progress,
         label=str(project_page_id),
     )
-    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="NAS folder"
+    )
 
 
 async def _process_task_folder_sync(claimed: _Claimed, progress: str) -> None:
@@ -257,11 +316,19 @@ async def _process_task_folder_sync(claimed: _Claimed, progress: str) -> None:
         log_api_error(logger, f"task folder sync crashed for task {task_page_id}", err)
         outcome_error = describe_error(err)
 
+    # Mid-task subject write — `_record_outcome` below flips the task to
+    # done, after which a single-task batch reads as idle and the post-
+    # completion call clears the field. We want the subject visible
+    # while the task is still in flight.
+    await _dot_in_progress(project_page_id, progress=progress, subject="Task folder")
+
     await _record_outcome(
         claimed.id, claimed.attempts, outcome_error, progress=progress, label=str(task_page_id)
     )
     if project_page_id:
-        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Task folder"
+        )
 
 
 async def _process_frame_project_sync(claimed: _Claimed, progress: str) -> None:
@@ -302,7 +369,9 @@ async def _process_frame_project_sync(claimed: _Claimed, progress: str) -> None:
         progress=progress,
         label=str(project_page_id),
     )
-    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Frame.io folder"
+    )
 
 
 async def _process_toggl_hours_sync(claimed: _Claimed, progress: str) -> None:
@@ -381,7 +450,9 @@ async def _process_toggl_project_sync(claimed: _Claimed, progress: str) -> None:
         progress=progress,
         label=str(project_page_id),
     )
-    await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Toggl project"
+    )
 
 
 async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> None:
@@ -422,6 +493,10 @@ async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> Non
         # rollup finds this task even if a transient failure parks it as failed.
         await set_task_project(claimed.id, project_page_id)
 
+    await _dot_in_progress(
+        project_page_id, progress=progress, subject="Frame.io deliverable"
+    )
+
     await _record_outcome(
         claimed.id,
         claimed.attempts,
@@ -430,7 +505,9 @@ async def _process_frame_leveranse_sync(claimed: _Claimed, progress: str) -> Non
         label=str(leveranse_page_id),
     )
     if project_page_id:
-        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Frame.io deliverable"
+        )
 
 
 async def _process_frame_comment_sync(claimed: _Claimed, progress: str) -> None:
@@ -471,6 +548,10 @@ async def _process_frame_comment_sync(claimed: _Claimed, progress: str) -> None:
     if project_page_id:
         await set_task_project(claimed.id, project_page_id)
 
+    await _dot_in_progress(
+        project_page_id, progress=progress, subject="Frame comment"
+    )
+
     await _record_outcome(
         claimed.id,
         claimed.attempts,
@@ -479,7 +560,9 @@ async def _process_frame_comment_sync(claimed: _Claimed, progress: str) -> None:
         label=str(comment_id),
     )
     if project_page_id:
-        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Frame comment"
+        )
 
 
 async def _process_frame_version_sync(claimed: _Claimed, progress: str) -> None:
@@ -519,6 +602,10 @@ async def _process_frame_version_sync(claimed: _Claimed, progress: str) -> None:
     if project_page_id:
         await set_task_project(claimed.id, project_page_id)
 
+    await _dot_in_progress(
+        project_page_id, progress=progress, subject="Frame version"
+    )
+
     await _record_outcome(
         claimed.id,
         claimed.attempts,
@@ -527,7 +614,9 @@ async def _process_frame_version_sync(claimed: _Claimed, progress: str) -> None:
         label=str(stack_id),
     )
     if project_page_id:
-        await queue_mirror.refresh_project_dot(project_page_id, progress=progress)
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Frame version"
+        )
 
 
 async def _process_oppgave_done_sync(claimed: _Claimed, progress: str) -> None:
@@ -536,9 +625,9 @@ async def _process_oppgave_done_sync(claimed: _Claimed, progress: str) -> None:
 
     Most loop-iteration outcomes are 'skipped_loop' (Frame already
     matches Notion — we're seeing our own write bouncing back). Those
-    are healthy no-ops. project_page_id isn't reliably set here (the
-    engine resolves leveranse but not project), so we skip the
-    Projects-DB dot update.
+    are healthy no-ops. The engine result carries `leveranse_page_id`,
+    so we can walk one step further (FrameLeveranseFolder → project)
+    to light the Projects-DB dot + write the "Sync progress" subject.
     """
     oppgave_id = claimed.gmail_thread_id
     retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
@@ -550,17 +639,27 @@ async def _process_oppgave_done_sync(claimed: _Claimed, progress: str) -> None:
     )
 
     outcome_error: str | None = None
+    leveranse_page_id: str | None = None
     try:
         if not oppgave_id:
             raise ValueError(
                 "oppgave_done_sync task has no Oppgave page id (gmail_thread_id)"
             )
         result = await sync_oppgave_done(oppgave_id)
+        leveranse_page_id = result.leveranse_page_id
         if result.action == "failed":
             outcome_error = result.note or "oppgave done sync failed"
     except Exception as err:
         log_api_error(logger, f"oppgave done sync crashed for {oppgave_id}", err)
         outcome_error = describe_error(err)
+
+    project_page_id = await _resolve_project_from_leveranse(leveranse_page_id)
+    if project_page_id:
+        await set_task_project(claimed.id, project_page_id)
+
+    await _dot_in_progress(
+        project_page_id, progress=progress, subject="Oppgave done"
+    )
 
     await _record_outcome(
         claimed.id,
@@ -569,6 +668,10 @@ async def _process_oppgave_done_sync(claimed: _Claimed, progress: str) -> None:
         progress=progress,
         label=str(oppgave_id),
     )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Oppgave done"
+        )
 
 
 async def _process_leveranse_status_recheck(claimed: _Claimed, progress: str) -> None:
@@ -602,6 +705,16 @@ async def _process_leveranse_status_recheck(claimed: _Claimed, progress: str) ->
         )
         outcome_error = describe_error(err)
 
+    # The task's `gmail_thread_id` IS the leveranse page id, so we go
+    # straight to the FrameLeveranseFolder lookup to light the dot.
+    project_page_id = await _resolve_project_from_leveranse(leveranse_id)
+    if project_page_id:
+        await set_task_project(claimed.id, project_page_id)
+
+    await _dot_in_progress(
+        project_page_id, progress=progress, subject="Status recheck"
+    )
+
     await _record_outcome(
         claimed.id,
         claimed.attempts,
@@ -609,6 +722,10 @@ async def _process_leveranse_status_recheck(claimed: _Claimed, progress: str) ->
         progress=progress,
         label=str(leveranse_id),
     )
+    if project_page_id:
+        await queue_mirror.refresh_project_dot(
+            project_page_id, progress=progress, subject="Status recheck"
+        )
 
 
 async def _process(claimed: _Claimed, progress: str) -> None:
