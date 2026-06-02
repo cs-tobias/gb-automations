@@ -395,6 +395,145 @@ async def _fetch_entries_multi_year(
 
 
 # ============================================================
+# Reconciliation — verify Notion matches Toggl after a backfill
+# ============================================================
+
+
+# Hours-diff band below which we treat the two sides as "matching." Notion
+# stores hours rounded to 2 decimals; Toggl stores seconds. Across thousands
+# of rows the rounding accumulates to ~tenths of an hour. 1.0h is a generous
+# floor that catches real data loss without flagging rounding drift.
+_VERIFY_HOURS_TOLERANCE = 1.0
+
+
+async def reconcile_toggl_notion_hours(
+    *,
+    window_start: date,
+    window_end: date,
+) -> dict[str, Any]:
+    """Compare Toggl's truth against the Notion Timer DBs for a window.
+
+    Read-only on both sides. Returns three Toggl numbers so the aggregation
+    behavior is explicit and can't be misread:
+      - total_hours         (sum of all non-running entry seconds → hours)
+      - raw_entry_count     (every individual session)
+      - expected_aggregated_cells (unique (user, project, oslo_day) — what
+                                   we EXPECT Notion to hold; same key the
+                                   sync engine aggregates on)
+
+    Plus Notion totals (hours, rows, with/without relation, by-year), and
+    a diff block flagging out-of-tolerance discrepancies.
+    """
+    if not settings.toggl_workspace_id:
+        return {"action": "skipped", "note": "TOGGL_WORKSPACE_ID not set"}
+
+    # --- Toggl side ---
+    entries = await _fetch_entries_multi_year(
+        settings.toggl_workspace_id, window_start, window_end
+    )
+
+    toggl_seconds = 0
+    raw_entry_count = 0
+    running_excluded = 0
+    expected_cells: set[tuple[str, str, date]] = set()
+    for group in entries:
+        project_id_raw = group.get("project_id")
+        project_id = str(project_id_raw) if project_id_raw is not None else ""
+        user_id = str(group.get("user_id", ""))
+        if not user_id:
+            continue
+        for entry in group.get("time_entries") or []:
+            if entry.get("stop") is None:
+                running_excluded += 1
+                continue
+            seconds = entry.get("seconds")
+            if not isinstance(seconds, (int, float)) or seconds <= 0:
+                continue
+            raw_entry_count += 1
+            toggl_seconds += int(seconds)
+            start_raw = entry.get("start") or ""
+            try:
+                start_dt = datetime.fromisoformat(
+                    start_raw.replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            oslo_date = start_dt.astimezone(_OSLO).date()
+            expected_cells.add((user_id, project_id, oslo_date))
+
+    toggl_total_hours = round(toggl_seconds / 3600.0, 2)
+
+    # --- Notion side ---
+    notion_total_hours = 0.0
+    notion_total_rows = 0
+    rows_with_relation = 0
+    rows_without_relation = 0
+    by_year: dict[str, dict[str, float | int]] = {}
+
+    for year in range(window_start.year, window_end.year + 1):
+        try:
+            db_id = await notion_timer_db.get_timer_db_for_year(year)
+        except Exception as err:
+            logger.warning(
+                "verify: could not resolve Timer DB for year %d: %s", year, err
+            )
+            continue
+        year_start = max(window_start, date(year, 1, 1))
+        year_end = min(window_end, date(year, 12, 31))
+        rows = await _query_timer_rows_in_window(db_id, year_start, year_end)
+
+        year_hours = 0.0
+        year_rows = 0
+        for row in rows:
+            hours = _read_number_prop(row, TIMER_PROPS["hours"]) or 0.0
+            year_hours += hours
+            year_rows += 1
+            relation_ids = _read_relation_ids(
+                row.get("properties") or {}, TIMER_PROPS["project"]
+            )
+            if relation_ids:
+                rows_with_relation += 1
+            else:
+                rows_without_relation += 1
+        notion_total_hours += year_hours
+        notion_total_rows += year_rows
+        by_year[str(year)] = {
+            "hours": round(year_hours, 2),
+            "rows": year_rows,
+        }
+
+    notion_total_hours = round(notion_total_hours, 2)
+
+    diff_hours = round(toggl_total_hours - notion_total_hours, 2)
+    return {
+        "window": {
+            "from": window_start.isoformat(),
+            "to": window_end.isoformat(),
+        },
+        "toggl": {
+            "total_hours": toggl_total_hours,
+            "raw_entry_count": raw_entry_count,
+            "expected_aggregated_cells": len(expected_cells),
+            "running_excluded": running_excluded,
+        },
+        "notion": {
+            "total_hours": notion_total_hours,
+            "total_rows": notion_total_rows,
+            "rows_with_relation": rows_with_relation,
+            "rows_without_relation": rows_without_relation,
+            "by_year": by_year,
+        },
+        "diff": {
+            "hours": diff_hours,
+            "hours_within_tolerance": abs(diff_hours) <= _VERIFY_HOURS_TOLERANCE,
+            "row_count_match": notion_total_rows == len(expected_cells),
+        },
+    }
+
+
+# ============================================================
 # Aggregation
 # ============================================================
 
@@ -690,14 +829,14 @@ def _resolve_toggl_project_label(
 
 
 def _join_descriptions(descs: set[str]) -> str:
-    """Join unique descriptions with '; ', truncate to fit Notion's rich_text limit.
+    """Join unique descriptions with ', ', truncate to fit Notion's rich_text limit.
 
     Notion's rich_text caps a single text segment at 2000 chars; we leave
     headroom for safety and an ellipsis tail when truncated.
     """
     if not descs:
         return ""
-    joined = "; ".join(sorted(descs))
+    joined = ", ".join(sorted(descs))
     if len(joined) > 1900:
         return joined[:1897] + "..."
     return joined

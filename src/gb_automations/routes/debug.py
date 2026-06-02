@@ -962,6 +962,43 @@ async def debug_toggl_backfill(
     }
 
 
+@router.get("/toggl/verify")
+async def debug_toggl_verify(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = Query(None),
+) -> dict[str, Any]:
+    """Reconcile Toggl truth against the Notion Timer DBs for a window.
+
+    Read-only: pulls Toggl entries + Notion rows, sums on both sides,
+    reports total hours, raw entry count, expected aggregated cells
+    (= what Notion should hold given the engine's one-row-per-(user,
+    project, day) rule), and the diff with a tolerance flag.
+
+    Run after a backfill, or before payroll, to confirm nothing was lost.
+    Same Toggl API cost as a backfill on the fetch side (no caching), so
+    don't run a 6-year verify casually if rate limits are a concern.
+
+    Query params (both optional, ISO YYYY-MM-DD):
+      from — window start (default: Jan 1 of current Oslo year)
+      to   — window end   (default: today, Oslo)
+    """
+    from datetime import date as _date
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    from gb_automations.sync.sync_toggl_hours import reconcile_toggl_notion_hours
+
+    _oslo = ZoneInfo("Europe/Oslo")
+    today = _dt.now(_oslo).date()
+    start = _date.fromisoformat(from_) if from_ else _date(today.year, 1, 1)
+    end = _date.fromisoformat(to) if to else today
+
+    return await reconcile_toggl_notion_hours(
+        window_start=start,
+        window_end=end,
+    )
+
+
 @router.post("/toggl/refresh-users")
 async def debug_toggl_refresh_users() -> dict[str, Any]:
     """Refresh both halves of the Toggl→Notion user map without running a sync.
