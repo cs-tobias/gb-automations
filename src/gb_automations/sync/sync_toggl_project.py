@@ -105,10 +105,16 @@ async def _find_workspace_project_by_name(
     pre-created in Toggl's UI (or left behind by a cache wipe) would
     silently get a sibling. Used only at first-create time; once the
     mapping row exists, lookup is by id and never by name.
+
+    Match is case-insensitive: Goldbox has many projects where Notion and
+    Toggl differ only by casing (e.g. `Akershus eiendom` vs `Akershus
+    Eiendom`). Treating those as the same project avoids creating
+    duplicates that would silently fragment their time tracking.
     """
     projects = await toggl_client.list_projects(workspace_id)
+    target = name.casefold()
     for project in projects:
-        if project.get("name") == name:
+        if (project.get("name") or "").casefold() == target:
             return project
     return None
 

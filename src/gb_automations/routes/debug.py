@@ -702,9 +702,10 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
     notion_projects = await notion_client.get_project_pages()
     toggl_projects = await toggl_client.list_projects(settings.toggl_workspace_id)
 
+    # Case-insensitive match — keeps in sync with _find_workspace_project_by_name.
     toggl_by_name: dict[str, dict] = {}
     for p in toggl_projects:
-        name = p.get("name", "")
+        name = (p.get("name") or "").casefold()
         if name and name not in toggl_by_name:
             toggl_by_name[name] = p
 
@@ -735,7 +736,7 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
             already_cached.append(entry)
             continue
 
-        toggl_hit = toggl_by_name.get(leaf)
+        toggl_hit = toggl_by_name.get(leaf.casefold())
         if toggl_hit:
             matched.append({
                 **entry,
