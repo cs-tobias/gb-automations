@@ -217,7 +217,12 @@ async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
 
     Toggl's projects endpoint pages with `page` + `per_page` query params.
     Default `per_page` is 151 (silently truncating larger workspaces);
-    max is 200. We page through until a short page comes back.
+    max is 200. We page through and dedupe by id.
+
+    Each project carries a `total_count` field — Toggl's true count of
+    projects in the workspace matching the filter — which we use as the
+    authoritative target so we don't stop short on a partial page (Toggl
+    occasionally returns a short page mid-stream).
 
     `active=both` returns active + archived; without it, archived projects
     are silently hidden — which makes the adopt-by-name check in
@@ -225,9 +230,12 @@ async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
     "already exists" 400.
     """
     all_projects: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    expected_total: int | None = None
     page = 1
+    max_pages = 50  # 50 * 200 = 10k, well above any plausible workspace size
     async with await _client() as client:
-        while True:
+        while page <= max_pages:
             response = await _with_retries(
                 lambda p=page: client.get(
                     f"/api/v9/workspaces/{workspace_id}/projects",
@@ -237,15 +245,37 @@ async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
             )
             _raise_for_status(response)
             data = response.json() or []
-            # Toggl returns a flat array on this endpoint, but some
-            # documentation shows {items: [...]} — handle both defensively.
             projects = data if isinstance(data, list) else data.get("items", [])
             if not projects:
                 break
-            all_projects.extend(projects)
-            if len(projects) < 200:
+
+            new_in_page = 0
+            for p in projects:
+                pid = p.get("id")
+                if pid is None or pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                all_projects.append(p)
+                new_in_page += 1
+                if expected_total is None and isinstance(p.get("total_count"), int):
+                    expected_total = p["total_count"]
+
+            # Stop when we've covered Toggl's stated total, OR when a page
+            # adds nothing new (full overlap → we've wrapped around).
+            if expected_total is not None and len(all_projects) >= expected_total:
+                break
+            if new_in_page == 0:
                 break
             page += 1
+
+    if expected_total is not None and len(all_projects) < expected_total:
+        logger.warning(
+            "list_projects: Toggl claims %d projects but only fetched %d "
+            "after %d pages — pagination may be unstable",
+            expected_total,
+            len(all_projects),
+            page,
+        )
     return all_projects
 
 
