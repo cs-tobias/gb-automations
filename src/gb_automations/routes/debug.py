@@ -807,10 +807,10 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
 async def debug_toggl_sync_all_projects() -> dict[str, Any]:
     """Enqueue a toggl_project_sync for every project in the Notion Projects DB.
 
-    Use once at first turn-on to populate the TogglProject cache before
-    running /toggl/backfill — the hours engine silently drops entries for
-    projects that haven't been mirrored yet (skipped_unknown_project), so
-    project sync must complete before backfill for hours to land correctly.
+    Use this to populate the TogglProject cache so backfilled / nightly
+    Timer rows get the Notion Prosjekt relation set. Hours sync no longer
+    REQUIRES this (entries land regardless, with empty relation on
+    unmatched projects) — but running it once links what can be linked.
 
     Safe to re-run: already-active tasks are deduplicated (returns
     already_queued count). Returns immediately; actual sync work happens in
@@ -894,10 +894,18 @@ async def debug_toggl_backfill(
         "rows_updated": result.rows_updated,
         "rows_archived": result.rows_archived,
         "skipped": {
+            # In-flight Toggl entries (stop=null) — picked up on next run.
             "running": result.skipped_running,
-            "unmatched": result.skipped_unmatched,
-            "unknown_project": result.skipped_unknown_project,
-            "no_project": result.skipped_no_project,
+            # Toggl user has no matching Notion workspace user (by email).
+            # Their hours don't land — fix by matching emails or inviting.
+            "unmatched_user": result.skipped_unmatched,
+        },
+        "kept_without_relation": {
+            # Rows landed in Notion but with an empty Prosjekt relation —
+            # informational. Either the Toggl project isn't mirrored to a
+            # Notion page yet, or the entry had no project at all.
+            "unmatched_project": result.unmatched_project_kept,
+            "no_project": result.no_project_kept,
         },
         "errors": result.errors,
     }

@@ -681,8 +681,16 @@ TIMER_PROPS = {
     # Notion's workspace members. Lets each employee filter "Show my
     # hours" with Notion's built-in `current user` filter on this column.
     "employee": "Ansatt",
-    "project": "Prosjekt",           # relation → Projects
+    "project": "Prosjekt",           # relation → Projects (empty when no Notion match)
     "hours": "Timer",                # number — decimal hours (e.g. 7.5)
+    # Aggregated unique entry descriptions for this (user, project, day) cell.
+    # Joined with "; " and truncated to ~1900 chars so the row stays under
+    # Notion's 2000-char rich_text limit.
+    "description": "Beskrivelse",
+    # Toggl's raw project name. Filled even when the relation is empty (so
+    # unmatched entries are still attributable). Set to "Uten prosjekt" when
+    # the Toggl entry had no project at all.
+    "toggl_project_name": "Toggl Prosjekt navn",
     # Hidden technical columns — used by the engine to upsert / delete
     # without scanning the people property (which a user could edit). The
     # two ids together are the dedup key.
@@ -816,8 +824,8 @@ def build_timer_db_schema(
         )
     # Insertion order = column order in Notion. Title first (Notion
     # requirement), then the human-readable columns left-to-right (Dato,
-    # Ansatt, Prosjekt, Timer), then the two hidden id columns at the end
-    # where they stay out of the way.
+    # Ansatt, Prosjekt, Timer, Beskrivelse, Toggl Prosjekt navn), then the
+    # two hidden id columns at the end where they stay out of the way.
     return {
         TIMER_PROPS["name"]: {"title": {}},
         TIMER_PROPS["date"]: {"date": {}},
@@ -829,6 +837,8 @@ def build_timer_db_schema(
             },
         },
         TIMER_PROPS["hours"]: {"number": {"format": "number"}},
+        TIMER_PROPS["description"]: {"rich_text": {}},
+        TIMER_PROPS["toggl_project_name"]: {"rich_text": {}},
         TIMER_PROPS["toggl_user_id"]: {"rich_text": {}},
         TIMER_PROPS["toggl_project_id"]: {"rich_text": {}},
     }

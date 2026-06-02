@@ -121,7 +121,7 @@ Invoke-RestMethod -Method Post http://localhost:8000/debug/toggl/sync-all-projec
 
 The response shows how many were enqueued. The worker then processes them in the background — each project gets either created in Toggl or adopted if a same-name project already exists, and the Toggl URL is written back to the Notion row.
 
-**This step must complete before running the backfill in step 8.** The hours engine silently skips entries for projects not yet in the cache (`skipped_unknown_project` in the response). If you run backfill first, those hours are dropped and won't appear until you re-run backfill after the projects are synced.
+**Order matters but isn't strict:** the hours engine writes every Toggl entry to Notion regardless — for entries whose Toggl project isn't in the cache yet, the row lands with an empty `Prosjekt` relation (and the Toggl project name stored in `Toggl Prosjekt navn`). Running this step before backfill means more rows will have the relation set on first creation. If you skip this step, those rows still exist; the relation just gets filled in on the next sync once the cache catches up.
 
 Watch the logs to confirm it drains:
 

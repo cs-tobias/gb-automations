@@ -1,9 +1,16 @@
-"""Nightly Toggl Track hours aggregator → Notion `Timer YYYY` DB.
+"""Toggl Track hours aggregator → Notion `Timer YYYY` DB (the time-bank).
 
-Pulls the last N days (settings.toggl_hours_window_days, default 14) from
-Toggl Reports v3, aggregates per (user, project, calendar_day_oslo), and
-reconciles the Notion year-DB rows so they exactly match the Toggl
+Pulls the configured window (settings.toggl_hours_window_days, default 32)
+from Toggl Reports v3, aggregates per (user, project, calendar_day_oslo),
+and reconciles the Notion year-DB rows so they exactly match the Toggl
 source-of-truth for the window.
+
+Goldbox uses Notion as the SOURCE OF TRUTH for the company's complete
+time-bank, so this engine writes EVERY Toggl entry (including ones with
+no project, with a project not yet mirrored, or on a template/internal
+project). The Notion `Prosjekt` relation is set when a TogglProject
+mapping exists; otherwise the row lands with an empty relation and the
+Toggl project name stored in the `Toggl Prosjekt navn` column.
 
 Reconciliation model — replace, not merge. For each (user, project, day)
 cell in the window:
@@ -94,8 +101,15 @@ class TogglHoursResult:
     # in production (logged at sync end); operator decides if a fix is
     # needed.
     skipped_unmatched: int = 0
-    skipped_unknown_project: int = 0
-    skipped_no_project: int = 0
+    # Informational: cells where the Toggl project_id has no Notion
+    # relation mapped. These are NOT skipped — they still land in Notion
+    # with an empty relation and Toggl Prosjekt navn populated. Counter
+    # exists so the team can see how many rows are unlinked.
+    unmatched_project_kept: int = 0
+    # Informational: cells where Toggl reported no project at all
+    # (project_id=null). Also kept — written with relation empty and
+    # Toggl Prosjekt navn = "Uten prosjekt".
+    no_project_kept: int = 0
     errors: list[str] = field(default_factory=list)
     action: str = "ok"  # ok | skipped | failed
     note: str | None = None
@@ -176,11 +190,12 @@ async def sync_toggl_hours(
     # Jan 1) will be returned for an end_date of Dec 31. The local-day
     # bucketing happens below in _aggregate, so this is fine — we'd
     # rather see slightly too many entries and filter than miss some.
+    #
+    # Toggl Reports v3 enforces a 1-year max range per call. For multi-
+    # year backfills, fetch year-by-year and concatenate before aggregation.
     try:
-        entries = await toggl_client.search_time_entries(
-            settings.toggl_workspace_id,
-            start_date=window_start.isoformat(),
-            end_date=window_end.isoformat(),
+        entries = await _fetch_entries_multi_year(
+            settings.toggl_workspace_id, window_start, window_end
         )
     except Exception as err:
         logger.exception("toggl hours: Reports v3 fetch failed")
@@ -202,10 +217,11 @@ async def sync_toggl_hours(
     )
 
     # Aggregate to (toggl_user_id, toggl_project_id, oslo_date) → seconds.
-    aggregate, agg_stats = _aggregate(entries)
+    # Empty-string project_id = "tracked without a project" — kept, not skipped.
+    aggregate, descriptions, agg_stats = _aggregate(entries)
     result.cells_aggregated = len(aggregate)
     result.skipped_running = agg_stats["skipped_running"]
-    result.skipped_no_project = agg_stats["skipped_no_project"]
+    result.no_project_kept = agg_stats["no_project_cells"]
 
     # Resolve user + project ids once, up front. The user resolution is
     # two-hop: TogglUserCache gives us the toggl email, then the Notion
@@ -239,6 +255,28 @@ async def sync_toggl_hours(
         return result
     known_project_map = await _load_toggl_project_map()
 
+    # Build toggl_project_id → name lookup for the `Toggl Prosjekt navn`
+    # column. We always write the Toggl name so unmatched rows are still
+    # attributable (and matched rows show what Toggl had vs Notion).
+    # Fetch failures are non-fatal — the column just gets the project id
+    # as fallback, which is still useful for debugging.
+    toggl_project_names: dict[str, str] = {}
+    try:
+        toggl_projects = await toggl_client.list_projects(
+            settings.toggl_workspace_id
+        )
+        for p in toggl_projects:
+            pid = p.get("id")
+            name = p.get("name") or ""
+            if pid is not None and name:
+                toggl_project_names[str(pid)] = name
+    except Exception as err:
+        logger.warning(
+            "toggl hours: list_projects failed (%s) — rows will use "
+            "project_id as fallback for Toggl Prosjekt navn",
+            err,
+        )
+
     # Pre-resolve toggl_user_id → notion_user_uuid for every user that
     # actually appears in this window's entries. One pass; cells whose
     # user can't be resolved get logged once at debug here and counted
@@ -261,17 +299,20 @@ async def sync_toggl_hours(
             )
 
     # Group cells by year so we can resolve the correct Timer YYYY DB
-    # (the window may straddle Jan 1). Cells with no matching Notion
-    # user or with an unmirrored Toggl project are skipped here.
+    # (the window may straddle Jan 1). Only cells whose user can't be
+    # matched to a Notion workspace member are dropped — everything else
+    # flows through (no project / unmatched project = still written,
+    # relation just stays empty).
     cells_by_year: dict[int, dict[tuple[str, str, date], int]] = defaultdict(dict)
     for key, seconds in aggregate.items():
         user_id, project_id, oslo_date = key
         if user_id not in user_uuid_lookup:
             result.skipped_unmatched += 1
             continue
-        if project_id not in known_project_map:
-            result.skipped_unknown_project += 1
-            continue
+        if project_id and project_id not in known_project_map:
+            # Not skipped — just counted so the operator can see how many
+            # rows landed without a Notion-project relation.
+            result.unmatched_project_kept += 1
         cells_by_year[oslo_date.year][key] = seconds
 
     # Process each year independently. A year boundary is rare (once a
@@ -287,6 +328,8 @@ async def sync_toggl_hours(
                 user_uuid_lookup=user_uuid_lookup,
                 user_name_lookup=user_name_lookup,
                 project_map=known_project_map,
+                toggl_project_names=toggl_project_names,
+                descriptions=descriptions,
                 result=result,
             )
         except Exception as err:
@@ -297,18 +340,58 @@ async def sync_toggl_hours(
 
     logger.info(
         "toggl hours sync done: created=%d updated=%d archived=%d "
-        "(skipped: running=%d unmatched=%d unknown_project=%d "
-        "no_project=%d) errors=%d",
+        "(skipped running=%d skipped unmatched_user=%d "
+        "unmatched_project_kept=%d no_project_kept=%d) errors=%d",
         result.rows_created,
         result.rows_updated,
         result.rows_archived,
         result.skipped_running,
         result.skipped_unmatched,
-        result.skipped_unknown_project,
-        result.skipped_no_project,
+        result.unmatched_project_kept,
+        result.no_project_kept,
         len(result.errors),
     )
     return result
+
+
+# ============================================================
+# Toggl fetch — multi-year safe
+# ============================================================
+
+
+async def _fetch_entries_multi_year(
+    workspace_id: str, window_start: date, window_end: date
+) -> list[dict[str, Any]]:
+    """Fetch Toggl Reports v3 entries across an arbitrary window.
+
+    Reports v3 caps a single call at a 1-year range. For multi-year
+    backfills we slice the window into per-calendar-year chunks and
+    concatenate the grouped records. Same-day single-year calls (the
+    normal nightly case) take exactly one underlying call.
+    """
+    if window_start.year == window_end.year:
+        return await toggl_client.search_time_entries(
+            workspace_id,
+            start_date=window_start.isoformat(),
+            end_date=window_end.isoformat(),
+        )
+
+    all_entries: list[dict[str, Any]] = []
+    for year in range(window_start.year, window_end.year + 1):
+        slice_start = max(window_start, date(year, 1, 1))
+        slice_end = min(window_end, date(year, 12, 31))
+        logger.info(
+            "toggl hours: multi-year fetch %s … %s",
+            slice_start.isoformat(),
+            slice_end.isoformat(),
+        )
+        chunk = await toggl_client.search_time_entries(
+            workspace_id,
+            start_date=slice_start.isoformat(),
+            end_date=slice_end.isoformat(),
+        )
+        all_entries.extend(chunk)
+    return all_entries
 
 
 # ============================================================
@@ -318,19 +401,30 @@ async def sync_toggl_hours(
 
 def _aggregate(
     entries: list[dict[str, Any]],
-) -> tuple[dict[tuple[str, str, date], int], dict[str, int]]:
-    """Aggregate Toggl Reports v3 entries to (user, project, oslo_day) → seconds.
+) -> tuple[
+    dict[tuple[str, str, date], int],
+    dict[tuple[str, str, date], set[str]],
+    dict[str, int],
+]:
+    """Aggregate Toggl Reports v3 entries to (user, project, oslo_day) cells.
 
-    Returns the aggregate plus a small stats dict for the engine's counters.
+    Returns:
+        - seconds_by_key: cell → total seconds
+        - descriptions_by_key: cell → set of unique non-empty descriptions
+        - stats: per-run counters
+
+    The project_id slot in the key is `""` when the Toggl entry has no
+    project (project_id=null). Empty-project cells still flow through the
+    pipeline; only the Notion relation is left empty downstream.
 
     Toggl Reports v3's `search/time_entries` returns GROUPED records — one
     per (user, project), with a nested `time_entries` array of the actual
-    individual entries. Shape verified live (May 2026):
+    individual entries:
         {
             "user_id": 13166188,
-            "project_id": 198765432,
+            "project_id": 198765432 | null,
             "time_entries": [
-                {"id": ..., "seconds": 5400,
+                {"id": ..., "seconds": 5400, "description": "..." ,
                  "start": "2026-05-26T08:30:00+02:00",
                  "stop":  "2026-05-26T10:00:00+02:00"},
                 ...
@@ -340,21 +434,17 @@ def _aggregate(
 
     A nested entry with `stop is None` is still running — skip just that
     one; the other entries in the same group still flow through.
-
-    Entries without a project_id (someone tracked time with no project
-    selected) are skipped — there's no way to attribute them to a Notion
-    row, and the team's intent in that case is "not for billing."
     """
-    out: dict[tuple[str, str, date], int] = defaultdict(int)
-    stats = {"skipped_running": 0, "skipped_no_project": 0}
+    seconds_by_key: dict[tuple[str, str, date], int] = defaultdict(int)
+    descriptions_by_key: dict[tuple[str, str, date], set[str]] = defaultdict(set)
+    stats = {"skipped_running": 0, "no_project_cells": 0}
 
     for group in entries:
-        project_id = group.get("project_id")
-        if project_id is None:
-            # The grouping is per (user, project), so a missing project
-            # kills the whole group, not one entry inside it.
-            stats["skipped_no_project"] += len(group.get("time_entries") or [])
-            continue
+        # project_id=null means "tracked with no project". We keep these
+        # — they're still real hours that need to land in the time-bank.
+        project_id_raw = group.get("project_id")
+        project_id = str(project_id_raw) if project_id_raw is not None else ""
+
         user_id = str(group.get("user_id", ""))
         if not user_id:
             continue
@@ -378,10 +468,19 @@ def _aggregate(
                 start_dt = start_dt.replace(tzinfo=timezone.utc)
             oslo_date = start_dt.astimezone(_OSLO).date()
 
-            key = (user_id, str(project_id), oslo_date)
-            out[key] += int(seconds)
+            key = (user_id, project_id, oslo_date)
+            seconds_by_key[key] += int(seconds)
 
-    return out, stats
+            description = (entry.get("description") or "").strip()
+            if description:
+                descriptions_by_key[key].add(description)
+
+    # Track no-project cells for the result summary.
+    stats["no_project_cells"] = sum(
+        1 for key in seconds_by_key if key[1] == ""
+    )
+
+    return seconds_by_key, descriptions_by_key, stats
 
 
 # ============================================================
@@ -447,6 +546,8 @@ async def _reconcile_year(
     user_uuid_lookup: dict[str, str],
     user_name_lookup: dict[str, str],
     project_map: dict[str, str],
+    toggl_project_names: dict[str, str],
+    descriptions: dict[tuple[str, str, date], set[str]],
     result: TogglHoursResult,
 ) -> None:
     """Reconcile one year's window: query existing Notion rows in [window_start,
@@ -498,6 +599,10 @@ async def _reconcile_year(
     for key in all_keys:
         seconds = cells.get(key, 0)
         row = existing_by_key.get(key)
+        cell_descriptions = _join_descriptions(descriptions.get(key, set()))
+        toggl_project_label = _resolve_toggl_project_label(
+            key[1], toggl_project_names
+        )
         try:
             if seconds <= 0 and row is not None:
                 await archive_page(row["id"])
@@ -511,21 +616,86 @@ async def _reconcile_year(
                     db_id=db_id,
                     key=key,
                     hours=hours,
+                    description=cell_descriptions,
+                    toggl_project_label=toggl_project_label,
                     user_uuid_lookup=user_uuid_lookup,
                     user_name_lookup=user_name_lookup,
                     project_map=project_map,
                 )
                 result.rows_created += 1
             else:
-                current = _read_number_prop(row, TIMER_PROPS["hours"]) or 0.0
-                if abs(current - hours) > _HOURS_EPSILON:
-                    await _patch_timer_hours(row["id"], hours)
+                # Check whether any of the four "writable" fields drifted:
+                # hours, description, toggl_project_name, or the project
+                # relation (the latter when a previously-unmatched project
+                # has since been mirrored).
+                current_hours = _read_number_prop(row, TIMER_PROPS["hours"]) or 0.0
+                current_description = _read_rich_text(
+                    row.get("properties") or {}, TIMER_PROPS["description"]
+                )
+                current_project_name = _read_rich_text(
+                    row.get("properties") or {}, TIMER_PROPS["toggl_project_name"]
+                )
+                hours_changed = abs(current_hours - hours) > _HOURS_EPSILON
+                description_changed = current_description != cell_descriptions
+                project_name_changed = current_project_name != toggl_project_label
+                notion_project_page = (
+                    project_map.get(key[1]) if key[1] else None
+                )
+                current_relation_ids = _read_relation_ids(
+                    row.get("properties") or {}, TIMER_PROPS["project"]
+                )
+                relation_changed = (
+                    [notion_project_page] if notion_project_page else []
+                ) != current_relation_ids
+
+                if (
+                    hours_changed
+                    or description_changed
+                    or project_name_changed
+                    or relation_changed
+                ):
+                    await _patch_timer_row(
+                        row["id"],
+                        hours=hours,
+                        description=cell_descriptions,
+                        toggl_project_label=toggl_project_label,
+                        notion_project_page=notion_project_page,
+                    )
                     result.rows_updated += 1
         except Exception as err:
             logger.exception(
                 "toggl hours: cell %s failed", key
             )
             result.errors.append(f"cell {key}: {err}")
+
+
+def _resolve_toggl_project_label(
+    project_id: str, toggl_project_names: dict[str, str]
+) -> str:
+    """Human-readable Toggl project name for the row's Toggl Prosjekt navn column.
+
+    - Empty project_id (no Toggl project on the entry) → "Uten prosjekt"
+    - project_id resolvable → its Toggl name
+    - project_id present but unknown (Toggl API failed or stale) → the id itself
+      as a fallback so the row still carries something attributable
+    """
+    if not project_id:
+        return "Uten prosjekt"
+    return toggl_project_names.get(project_id) or project_id
+
+
+def _join_descriptions(descs: set[str]) -> str:
+    """Join unique descriptions with '; ', truncate to fit Notion's rich_text limit.
+
+    Notion's rich_text caps a single text segment at 2000 chars; we leave
+    headroom for safety and an ellipsis tail when truncated.
+    """
+    if not descs:
+        return ""
+    joined = "; ".join(sorted(descs))
+    if len(joined) > 1900:
+        return joined[:1897] + "..."
+    return joined
 
 
 # ============================================================
@@ -574,14 +744,15 @@ async def _query_timer_rows_in_window(
 def _row_key(row: dict[str, Any]) -> tuple[str, str, date] | None:
     """Extract (toggl_user_id, toggl_project_id, dato) from a Timer row.
 
-    Returns None if any of the three is missing/malformed — those rows
-    are treated as user-managed (not ours) and ignored by the engine.
+    Returns None if user_id or date is missing/malformed. project_id can
+    be empty string — that marks a "no-project" Toggl entry, which is a
+    valid distinct cell from a row with a project.
     """
     props = row.get("properties") or {}
     user_id = _read_rich_text(props, TIMER_PROPS["toggl_user_id"])
     project_id = _read_rich_text(props, TIMER_PROPS["toggl_project_id"])
     date_str = _read_date_prop(props, TIMER_PROPS["date"])
-    if not user_id or not project_id or not date_str:
+    if not user_id or not date_str:
         return None
     try:
         d = date.fromisoformat(date_str[:10])
@@ -607,21 +778,34 @@ def _read_number_prop(row: dict[str, Any], name: str) -> float | None:
     return prop.get("number")
 
 
+def _read_relation_ids(props: dict[str, Any], name: str) -> list[str]:
+    prop = props.get(name) or {}
+    items = prop.get("relation") or []
+    return [i["id"] for i in items if "id" in i]
+
+
 async def _create_timer_row(
     *,
     db_id: str,
     key: tuple[str, str, date],
     hours: float,
+    description: str,
+    toggl_project_label: str,
     user_uuid_lookup: dict[str, str],
     user_name_lookup: dict[str, str],
     project_map: dict[str, str],
 ) -> None:
-    """Create one Timer row. Caller has already verified user + project
-    are resolvable via the lookups."""
+    """Create one Timer row.
+
+    Caller has already verified the user is resolvable. The project
+    relation is set only when project_map has a Notion page for this
+    Toggl project_id — otherwise the relation property is omitted so
+    the row lands with an empty relation cell (which Notion accepts).
+    """
     user_id, project_id, dato = key
     notion_user_uuid = user_uuid_lookup[user_id]
     user_name = user_name_lookup.get(user_id, "")
-    notion_project_page = project_map[project_id]
+    notion_project_page = project_map.get(project_id) if project_id else None
     title = f"{user_name or user_id} — {dato.isoformat()}"
 
     properties: dict[str, Any] = {
@@ -632,17 +816,24 @@ async def _create_timer_row(
         TIMER_PROPS["employee"]: {
             "people": [{"object": "user", "id": notion_user_uuid}]
         },
-        TIMER_PROPS["project"]: {
-            "relation": [{"id": notion_project_page}]
-        },
         TIMER_PROPS["hours"]: {"number": hours},
+        TIMER_PROPS["description"]: {
+            "rich_text": [{"text": {"content": description}}] if description else []
+        },
+        TIMER_PROPS["toggl_project_name"]: {
+            "rich_text": [{"text": {"content": toggl_project_label}}]
+        },
         TIMER_PROPS["toggl_user_id"]: {
             "rich_text": [{"text": {"content": user_id}}]
         },
         TIMER_PROPS["toggl_project_id"]: {
-            "rich_text": [{"text": {"content": project_id}}]
+            "rich_text": [{"text": {"content": project_id}}] if project_id else []
         },
     }
+    if notion_project_page:
+        properties[TIMER_PROPS["project"]] = {
+            "relation": [{"id": notion_project_page}]
+        }
 
     async with _notion_client() as client:
         response = await _with_retries(
@@ -658,18 +849,40 @@ async def _create_timer_row(
         _raise_for_status(response)
 
 
-async def _patch_timer_hours(page_id: str, hours: float) -> None:
-    """Patch only the Timer hours — leaves relations / ids untouched."""
+async def _patch_timer_row(
+    page_id: str,
+    *,
+    hours: float,
+    description: str,
+    toggl_project_label: str,
+    notion_project_page: str | None,
+) -> None:
+    """Patch the writable fields of an existing Timer row.
+
+    Always updates hours, description, and Toggl Prosjekt navn (these can
+    all drift on retroactive edits). The project relation is set when
+    `notion_project_page` is provided; otherwise it's explicitly cleared
+    (an unmatched project that gets mirrored later will populate; one
+    that gets removed clears).
+    """
+    properties: dict[str, Any] = {
+        TIMER_PROPS["hours"]: {"number": hours},
+        TIMER_PROPS["description"]: {
+            "rich_text": [{"text": {"content": description}}] if description else []
+        },
+        TIMER_PROPS["toggl_project_name"]: {
+            "rich_text": [{"text": {"content": toggl_project_label}}]
+        },
+        TIMER_PROPS["project"]: {
+            "relation": [{"id": notion_project_page}] if notion_project_page else []
+        },
+    }
     async with _notion_client() as client:
         response = await _with_retries(
             lambda: client.patch(
                 f"/pages/{page_id}",
-                json={
-                    "properties": {
-                        TIMER_PROPS["hours"]: {"number": hours},
-                    }
-                },
+                json={"properties": properties},
             ),
-            op_name=f"PATCH /pages/{page_id} timer-hours",
+            op_name=f"PATCH /pages/{page_id} timer-row",
         )
         _raise_for_status(response)
