@@ -213,28 +213,40 @@ async def list_workspace_users(workspace_id: str) -> list[dict[str, Any]]:
 
 
 async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
-    """`GET /api/v9/workspaces/{id}/projects` — projects in the workspace.
+    """`GET /api/v9/workspaces/{id}/projects` — all projects in the workspace.
 
-    Non-paginated variant; fine for the bootstrap preview and for the
-    adopt-by-name lookup in sync_toggl_project (a workspace with >200
-    projects is very rare for a 5-person studio). If we ever need to
-    scale, swap to the `/projects/paginated` endpoint.
+    Toggl's projects endpoint pages with `page` + `per_page` query params.
+    Default `per_page` is 151 (silently truncating larger workspaces);
+    max is 200. We page through until a short page comes back.
 
-    Fetches ALL projects (active=both) so the adopt-by-name check in
-    sync_toggl_project finds pre-existing inactive projects too — the
-    default active-only filter caused 400 "already exists" errors when
-    trying to create projects that existed but were archived in Toggl.
+    `active=both` returns active + archived; without it, archived projects
+    are silently hidden — which makes the adopt-by-name check in
+    sync_toggl_project miss them and try to recreate them, hitting Toggl's
+    "already exists" 400.
     """
+    all_projects: list[dict[str, Any]] = []
+    page = 1
     async with await _client() as client:
-        response = await _with_retries(
-            lambda: client.get(
-                f"/api/v9/workspaces/{workspace_id}/projects",
-                params={"active": "both"},
-            ),
-            op_name="list_projects",
-        )
-        _raise_for_status(response)
-        return response.json() or []
+        while True:
+            response = await _with_retries(
+                lambda p=page: client.get(
+                    f"/api/v9/workspaces/{workspace_id}/projects",
+                    params={"active": "both", "per_page": 200, "page": p},
+                ),
+                op_name="list_projects",
+            )
+            _raise_for_status(response)
+            data = response.json() or []
+            # Toggl returns a flat array on this endpoint, but some
+            # documentation shows {items: [...]} — handle both defensively.
+            projects = data if isinstance(data, list) else data.get("items", [])
+            if not projects:
+                break
+            all_projects.extend(projects)
+            if len(projects) < 200:
+                break
+            page += 1
+    return all_projects
 
 
 # ============================================================
