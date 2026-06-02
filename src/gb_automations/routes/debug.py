@@ -693,6 +693,7 @@ async def debug_toggl_sync_all_projects() -> dict[str, Any]:
     the background queue.
     """
     from gb_automations.clients import notion as notion_client
+    from gb_automations.config import settings
     from gb_automations.jobs import queue_worker
     from gb_automations.sync.queue import enqueue_toggl_project_sync
 
