@@ -170,6 +170,14 @@ class Settings(BaseSettings):
     # "anyone with link can view" permission so Notion-rendered links work.
     attachments_folder_name: str = "Notion Email Attachments"
 
+    # Per-contact byte-exact signature-image learning (contact_signature_images
+    # table). After the same image sha1 from the same sender appears in this
+    # many DISTINCT Gmail threads, future emails from them skip those bytes.
+    # Conservative default — a real recurring photo with distinct bytes per
+    # send never accumulates. Raise (e.g. SIGNATURE_LEARN_THRESHOLD=5) only
+    # if a sender's logo got wrongly learned before we add a UI to un-learn.
+    signature_learn_threshold: int = 3
+
     # Project-provisioning fan-out toggles. One Notion button → one webhook
     # (/webhooks/notion) provisions a project across every relevant target;
     # each target is independently switchable so we can decouple while building.
@@ -312,10 +320,11 @@ class Settings(BaseSettings):
     # How many days back to re-pull on every nightly run. Toggl Reports v3
     # has no reliable updated_since for cross-user queries, so the engine
     # re-reads the window and overwrites the corresponding Notion rows —
-    # retroactive timesheet edits within this window propagate. 14 days
-    # comfortably covers the "fix last week" / "fix the day before pay" use
-    # cases without thrashing the rate limit.
-    toggl_hours_window_days: int = 14
+    # retroactive timesheet edits within this window propagate. 32 days
+    # covers the full calendar month so every nightly run rechecks the
+    # entire current month — payroll totals are always up-to-date regardless
+    # of when in the month the run happens.
+    toggl_hours_window_days: int = 32
     # DEV-ONLY: rewrite Toggl user emails before the Notion match. Format is a
     # comma-separated list of `toggl_email=notion_email` pairs. Set when your
     # personal Toggl + Notion accounts don't share an email (production

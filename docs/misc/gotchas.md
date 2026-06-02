@@ -320,6 +320,39 @@ Note this is NOT a Gmail rate-limit problem — per-mailbox errors were always c
 
 ---
 
+## 18. A sender's signature logo keeps re-uploading on every new thread
+
+**Symptom:** the same client logo / headshot / corporate banner appears as a separate "attachment" on every thread from a particular sender, cluttering both Drive and Notion `Vedlegg`. The structural inline-signature rule (`Content-ID` + `<img src="cid:...">`) doesn't catch it because that sender's MUA attached the logo as plain `Content-Disposition: attachment` with no cid reference.
+
+**Why (by design):** structural shape alone can't tell a no-cid logo from a real attached image without false positives. The system instead learns per-contact: `contact_signature_images` keys `(sender_email, content_sha1)` and bumps a counter once per distinct Gmail thread that carries those exact bytes. Past `settings.signature_learn_threshold` (default 3) the row flips to `status='signature'` and future emails skip those bytes. Re-carries within the same thread don't inflate the count (`last_thread_id` is the dedup guard). So the first 3 threads from a new sender still carry their logo; from the 4th onward it's gone.
+
+**Inspect:**
+```
+Invoke-RestMethod 'http://localhost:8000/debug/signatures?status=signature'
+Invoke-RestMethod 'http://localhost:8000/debug/signatures?sender=anne@example.com'
+```
+
+**Force-mark something as a signature immediately** (e.g. a known logo seen in only 2 threads, but you don't want to wait for the 3rd):
+```
+docker compose exec db psql -U gb -d gb -c \
+  "UPDATE contact_signature_images SET status='signature' WHERE sender_email='anne@example.com' AND content_sha1='<sha1-from-/debug/signatures>';"
+```
+
+**Un-learn a wrongly-marked file** (e.g. an actual recurring deliverable byte-identical across threads):
+```
+docker compose exec db psql -U gb -d gb -c \
+  "UPDATE contact_signature_images SET status='allowlisted' WHERE content_sha1='<sha1>';"
+```
+`allowlisted` never skips and never bumps; the bytes upload normally going forward.
+
+**Cosmetic caveat:** the email body keeps its `[image: logo.png]` text reference even when the image is skipped — the body cleaning runs before the upload loop knows it's a signature. Functionally fine, just visually a stub. A future refactor could pre-hash images before row build to strip the marker too; out of scope for now.
+
+**The threshold is per-image-bytes, not per-sender:** a sender who switches logos starts a new counter on the new bytes. A real recurring photo (different bytes each send) never accumulates and never gets dropped. A truly byte-identical recurring real attachment across 3+ threads is rare enough to allowlist by hand.
+
+**Per-thread, not per-message:** 8 replies in one thread carrying the same logo = +1, not +8. The signal is "appeared in N independent conversations", not "seen N times".
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.

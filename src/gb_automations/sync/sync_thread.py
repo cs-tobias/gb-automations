@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,7 @@ from gb_automations.models import (
     AttachmentBlob,
     CompanyCache,
     ContactCache,
+    ContactSignatureImage,
     EmailContentDedup,
     EmailRow,
     ProjectFolder,
@@ -2204,6 +2205,12 @@ def _body_mentions_filename(body: str, filename: str) -> bool:
     return filename.lower() in body.lower()
 
 
+_SIGNATURE_LEARN_MIME_PREFIX = "image/"  # only image/* eligible for the
+# per-contact signature-learning counter. PDFs/DOCX/DWG always upload — those
+# are real deliverables, never auto-signatures, and dropping a recurring real
+# document would lose information the team needs.
+
+
 _TINY_IMAGE_BYTES = 1024  # 1 KB — Word's `~WRDxxxx.jpg` thumbnails and other
 # Office-generated signature artifacts always fall below this. Real photos,
 # logos sent as project assets, and even small JPEGs sit comfortably above
@@ -2506,6 +2513,92 @@ class ThreadAttachmentTracker:
         return known, missing
 
 
+async def _check_or_record_signature_image(
+    *,
+    session: AsyncSession,
+    sender_email: str,
+    content_sha1: str,
+    thread_id: str,
+    mime_type: str,
+    filename: str,
+) -> bool:
+    """Return True if these bytes should be SKIPPED as a learned signature.
+
+    Maintains the `contact_signature_images` counter per (sender, sha1):
+      - status="signature"   → skip (return True). At/past threshold.
+      - status="allowlisted" → never skip, don't bump (return False).
+      - status="learning"    → bump count IF thread_id differs from
+                               `last_thread_id` (per-thread idempotent: a
+                               re-carry on a later reply in the same thread
+                               doesn't inflate); flip to "signature" if the
+                               bump crosses `signature_learn_threshold`.
+                               THIS sighting still uploads — we never
+                               retroactively yank a file mid-row.
+      - no row yet           → insert at count=1; upload as normal.
+
+    Out of scope (return False, no DB activity):
+      - non-image mime types — real deliverables, never auto-signatures.
+      - empty `sender_email` — forwarder lookup miss; can't attribute the
+        bytes to a specific contact, so we don't learn.
+    """
+    if not mime_type.startswith(_SIGNATURE_LEARN_MIME_PREFIX):
+        return False
+    if not sender_email:
+        return False
+    sender = sender_email.lower()
+
+    row = await session.get(ContactSignatureImage, (sender, content_sha1))
+    if row is None:
+        # First sighting from this sender. `on_conflict_do_nothing` covers the
+        # rare race where two threads in flight for the same sender both miss
+        # the row and try to insert — the second insert is a no-op rather
+        # than a constraint violation.
+        await session.execute(
+            insert(ContactSignatureImage)
+            .values(
+                sender_email=sender,
+                content_sha1=content_sha1,
+                thread_seen_count=1,
+                last_thread_id=thread_id,
+                first_filename=(filename or "")[:255],
+                status="learning",
+            )
+            .on_conflict_do_nothing(
+                index_elements=["sender_email", "content_sha1"]
+            )
+        )
+        return False
+
+    if row.status == "allowlisted":
+        return False
+    if row.status == "signature":
+        return True
+
+    # status == "learning". Same thread as last sighting → re-carry within the
+    # thread → don't bump.
+    if row.last_thread_id == thread_id:
+        return False
+    new_count = row.thread_seen_count + 1
+    new_status = (
+        "signature"
+        if new_count >= settings.signature_learn_threshold
+        else "learning"
+    )
+    await session.execute(
+        update(ContactSignatureImage)
+        .where(
+            ContactSignatureImage.sender_email == sender,
+            ContactSignatureImage.content_sha1 == content_sha1,
+        )
+        .values(
+            thread_seen_count=new_count,
+            last_thread_id=thread_id,
+            status=new_status,
+        )
+    )
+    return False
+
+
 async def _upload_attachments(
     *,
     parent_msg: gmail_client.GmailMessage,
@@ -2677,12 +2770,49 @@ async def _upload_attachments(
         # per-pass set, not links_by_sha1_folder, so a re-sync still attaches
         # the first message's files — links_by_sha1_folder is pre-seeded
         # across syncs and threads.)
+        #
+        # CRITICAL: this check MUST run before the learned-signature helper.
+        # Otherwise an in-thread re-carry that misses the (filename,size)
+        # shortcut (rare but possible — different `filename` field on the
+        # quoted MIME part, or a zero-size attachment that bypasses the
+        # shortcut entirely) would falsely attribute the bytes to the replier
+        # and bump THEIR signature counter for someone else's file. With this
+        # check first, the learner only ever sees the message that originally
+        # carried the bytes — exactly the attribution we want.
         if content_sha1 in thread_tracker.attached_this_pass:
             logger.info(
                 "    ⏏  skip attachment %r: already attached to an earlier message "
                 "in this thread (re-carried quote)",
                 d.attachment.filename,
             )
+            continue
+
+        # Learned-signature gate, per (sender, sha1, thread). Lives here
+        # rather than in `_partition_attachments` because sha1 isn't known
+        # until we've downloaded the bytes. Runs AFTER the re-carry check so
+        # the only sighting the learner ever sees is the original sender's
+        # message — not a quoter re-carrying it. Safe whether `content` is
+        # real bytes (download path) or None (shortcut path): the helper only
+        # reads sha1 + mime + filename, all known either way.
+        if await _check_or_record_signature_image(
+            session=session,
+            sender_email=attributed_sender,
+            content_sha1=content_sha1,
+            thread_id=parent_msg.thread_id,
+            mime_type=d.attachment.mime_type,
+            filename=d.attachment.filename,
+        ):
+            logger.info(
+                "    ⏏  skip attachment %r: learned signature for %s (sha1=%s)",
+                d.attachment.filename,
+                sender,
+                content_sha1[:8],
+            )
+            # Mark attached_this_pass so later re-carries of these same
+            # bytes within the thread don't re-process. The body's
+            # `[image: filename]` marker stays — by design, no
+            # row-build-time refactor for cosmetics.
+            thread_tracker.attached_this_pass.add(content_sha1)
             continue
 
         # Upload-dedup, per-folder: for each project folder the row wants this

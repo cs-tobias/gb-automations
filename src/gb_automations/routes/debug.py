@@ -14,7 +14,7 @@ from gb_automations.clients import llm as llm_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import EMAIL_TAGS
 from gb_automations.db import SessionLocal
-from gb_automations.models import User
+from gb_automations.models import ContactSignatureImage, User
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 
@@ -613,6 +613,49 @@ async def queue_retry_failed(thread_id: str | None = Query(default=None)) -> dic
     if requeued:
         queue_worker.wake()
     return {"requeued": requeued, "thread_id": thread_id}
+
+
+@router.get("/signatures")
+async def debug_signatures(
+    status: str | None = Query(default=None),
+    sender: str | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """Per-contact learned signature-image state, sorted by most-recently updated.
+
+    Filter with `?status=signature` to see only active skips (the interesting
+    case for "why isn't this logo uploading?"). Filter with `?sender=x@y.no`
+    to scope to one contact when debugging un-learn / re-learn decisions.
+
+    Recovery recipes (not endpoints — direct DB tweaks, see gotchas.md):
+      UPDATE contact_signature_images SET status='allowlisted'
+        WHERE content_sha1='<sha1>';
+      UPDATE contact_signature_images SET status='signature'
+        WHERE sender_email='x@y.no' AND content_sha1='<sha1>';
+    """
+    async with SessionLocal() as session:
+        stmt = (
+            select(ContactSignatureImage)
+            .order_by(ContactSignatureImage.updated_at.desc())
+            .limit(500)
+        )
+        if status:
+            stmt = stmt.where(ContactSignatureImage.status == status)
+        if sender:
+            stmt = stmt.where(ContactSignatureImage.sender_email == sender.lower())
+        rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {
+            "sender_email": r.sender_email,
+            "content_sha1": r.content_sha1,
+            "status": r.status,
+            "thread_seen_count": r.thread_seen_count,
+            "first_filename": r.first_filename,
+            "last_thread_id": r.last_thread_id,
+            "first_seen_at": r.first_seen_at.isoformat(),
+            "updated_at": r.updated_at.isoformat(),
+        }
+        for r in rows
+    ]
 
 
 @router.post("/toggl/sync-hours")

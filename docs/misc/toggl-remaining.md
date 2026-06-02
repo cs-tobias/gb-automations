@@ -15,7 +15,7 @@ The brief lives in [docs/reference/client-brief.md](../reference/client-brief.md
 | Aggregate hours per (user, project, day) | ✅ done | `_aggregate` in [sync/sync_toggl_hours.py](../../src/gb_automations/sync/sync_toggl_hours.py) — verified: 17 Toggl entries → 10 day-rows |
 | Year-partitioned `Timer YYYY` DB, auto-created | ✅ done | [clients/notion_timer_db.py](../../src/gb_automations/clients/notion_timer_db.py) |
 | Toggl→Notion user attribution by email | ✅ done | `_build_notion_user_index` + email match in `sync_toggl_hours`. Dev override available via `TOGGL_DEV_EMAIL_OVERRIDES` |
-| Handle retroactive Toggl edits / deletions | ✅ done (14-day window) | replace-not-merge reconciliation in `_reconcile_year`. Edits >14 days back don't propagate — documented trade-off |
+| Handle retroactive Toggl edits / deletions | ✅ done (32-day window) | replace-not-merge reconciliation in `_reconcile_year`. Edits >32 days back don't propagate — documented trade-off |
 | Historical backfill on first turn-on | ✅ done | `POST /debug/toggl/backfill?from=YYYY-MM-DD&to=YYYY-MM-DD`, defaults to Jan 1 → today |
 
 ## Gaps
@@ -57,20 +57,9 @@ The brief explicitly marks this as "ting som hadde vært nice", not required. Th
 
 **Recommendation:** skip in code. After Goldbox is live with the daily rows, ask the team how they want to view monthly totals (a Notion view with month-grouping? a separate `Lønnsperiode` DB rolled up from `Timer YYYY`?). Their answer will be specific to whatever their payroll workflow needs, and we shouldn't pre-build the wrong thing.
 
-## Goldbox first-turn-on checklist (separate from gaps above)
+## Goldbox first-turn-on
 
-These aren't gaps in code, but things to remember when flipping Toggl on against Goldbox prod:
-
-1. Get Goldbox's Toggl workspace admin token, drop into Goldbox `.env` as `TOGGL_API_TOKEN`.
-2. Run `docker compose exec api python -m gb_automations.scripts.toggl_bootstrap` against Goldbox to print `TOGGL_WORKSPACE_ID`. Paste to `.env`.
-3. Pick a Notion page in Goldbox's workspace for hour DBs → set `TOGGL_TIMER_PARENT_PAGE_ID`. Share the page with the Notion integration.
-4. Confirm `SYNC_TOGGL=true` and `SYNC_TOGGL_HOURS=true` in `.env`.
-5. Leave `TOGGL_DEV_EMAIL_OVERRIDES` blank — Goldbox's Toggl and Notion emails match natively.
-6. `docker compose up -d --build api`.
-7. `POST /debug/toggl/refresh-users` — confirm `toggl_users_cached` and `notion_users_indexed_by_email` are both ≥ Goldbox headcount.
-8. For each active Goldbox Notion project: press the Sync-Toggl button (or the Initialize button) to mirror it. The adopt-by-name path will pick up pre-existing Goldbox Toggl projects.
-9. `POST /debug/toggl/backfill` — pulls every Toggl entry from Jan 1 → today, creates the `Timer 2026` DB and all rows.
-10. Let the 02:00 nightly cron take over from there.
+See [docs/misc/toggl-setup.md](toggl-setup.md) for the full step-by-step guide.
 
 ## Memory pointers
 

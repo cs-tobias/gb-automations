@@ -111,8 +111,9 @@ class _RecordingSession:
     """Collects every `session.execute(...)` call so persistence is observable.
 
     `session.get(...)` returns None (NAS folder lookup misses → NAS write
-    skipped). `session.execute(...)` records the statement object and returns
-    None — the upload loop does not read the result.
+    skipped; ContactSignatureImage lookup misses → helper inserts a new
+    learning row each call). `session.execute(...)` records the statement
+    object and returns None — the upload loop does not read the result.
     """
 
     def __init__(self) -> None:
@@ -124,6 +125,20 @@ class _RecordingSession:
     async def execute(self, statement, *a, **k):
         self.executed.append(statement)
         return None
+
+    def blob_inserts(self) -> list:
+        """Subset of executed statements that target attachment_blobs.
+
+        Inserts into contact_signature_images (from the signature-learning
+        helper that runs on every image attachment) are filtered out — those
+        are tested in test_signature_learning.py.
+        """
+        out = []
+        for stmt in self.executed:
+            table_name = getattr(getattr(stmt, "table", None), "name", "")
+            if table_name == "attachment_blobs":
+                out.append(stmt)
+        return out
 
 
 def _run_upload(
@@ -172,7 +187,7 @@ def _run_upload(
             tags=[],
         )
     )
-    return fetched, uploaded_calls, session.executed, result
+    return fetched, uploaded_calls, session.blob_inserts(), result
 
 
 def test_same_bytes_same_folder_different_thread_reuses_link(monkeypatch):

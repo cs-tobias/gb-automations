@@ -176,6 +176,47 @@ class AttachmentBlob(Base):
     )
 
 
+class ContactSignatureImage(Base):
+    """Per-contact byte-exact image signatures, learned by repetition across threads.
+
+    Catches the long-tail of signature images that the structural rule in
+    `_partition_attachments` misses: a sender's MUA attached the logo as plain
+    `Content-Disposition: attachment` with no `cid:` reference, so it's
+    indistinguishable from a real attachment until we notice it keeps appearing.
+
+    Counter shape: increments by ONE per distinct (sender_email, content_sha1,
+    gmail_thread_id). A re-carry within the same thread doesn't bump (Outlook
+    re-quotes the bytes on every reply — `last_thread_id == current` is the
+    guard). Past `settings.signature_learn_threshold` the upload loop starts
+    skipping the bytes for that sender forever. Keyed on sha1 (not filename),
+    so a real screenshot named the same as a logo is byte-different and never
+    collides.
+
+    `status` lifecycle:
+      - "learning"   counting; uploads as normal.
+      - "signature"  at/past threshold; future emails skip these bytes.
+      - "allowlisted" user-marked "always upload"; never skipped, never bumped.
+    """
+
+    __tablename__ = "contact_signature_images"
+
+    sender_email: Mapped[str] = mapped_column(String(254), primary_key=True)
+    content_sha1: Mapped[str] = mapped_column(String(40), primary_key=True)
+    thread_seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    last_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    first_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="learning")
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class ProjectLabel(Base):
     """Notion project page ↔ Gmail label, one row per (project, user).
 
