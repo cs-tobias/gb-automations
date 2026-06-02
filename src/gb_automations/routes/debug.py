@@ -724,21 +724,32 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
         created_time = info.get("created_time")
         _year, leaf = project_path_parts(title, created_time)
 
+        entry = {
+            "notion_id": page_id,
+            "notion_title": title,
+            "leaf": leaf,
+            "created_time": created_time,
+        }
+
         if page_id in cached_ids:
-            already_cached.append({"notion_id": page_id, "notion_title": title, "leaf": leaf})
+            already_cached.append(entry)
             continue
 
         toggl_hit = toggl_by_name.get(leaf)
         if toggl_hit:
             matched.append({
-                "notion_id": page_id,
-                "notion_title": title,
-                "leaf": leaf,
+                **entry,
                 "toggl_id": toggl_hit.get("id"),
                 "toggl_active": toggl_hit.get("active"),
             })
         else:
-            unmatched.append({"notion_id": page_id, "notion_title": title, "leaf": leaf})
+            unmatched.append(entry)
+
+    # Sort unmatched by created_time descending (newest first) — old/archived
+    # projects in "would_create" are usually expected; recent ones are the
+    # interesting cases (real name mismatches that need attention).
+    unmatched.sort(key=lambda x: x.get("created_time") or "", reverse=True)
+    matched.sort(key=lambda x: x.get("created_time") or "", reverse=True)
 
     return {
         "summary": {
@@ -748,6 +759,7 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
             "total_notion_projects": len(notion_projects),
             "total_toggl_projects": len(toggl_projects),
         },
+        "would_create_recent_20": unmatched[:20],
         "would_adopt": matched,
         "would_create": unmatched,
         "already_cached": already_cached,
