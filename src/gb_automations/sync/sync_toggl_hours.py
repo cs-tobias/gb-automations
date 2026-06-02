@@ -418,13 +418,14 @@ def _aggregate(
     pipeline; only the Notion relation is left empty downstream.
 
     Toggl Reports v3's `search/time_entries` returns GROUPED records — one
-    per (user, project), with a nested `time_entries` array of the actual
-    individual entries:
+    per (user, project, description), with a nested `time_entries` array
+    of the actual individual sessions sharing that description:
         {
             "user_id": 13166188,
             "project_id": 198765432 | null,
+            "description": "design review",     # at GROUP level, not nested
             "time_entries": [
-                {"id": ..., "seconds": 5400, "description": "..." ,
+                {"id": ..., "seconds": 5400,
                  "start": "2026-05-26T08:30:00+02:00",
                  "stop":  "2026-05-26T10:00:00+02:00"},
                 ...
@@ -449,6 +450,11 @@ def _aggregate(
         if not user_id:
             continue
 
+        # Description sits on the group, NOT on individual time entries.
+        # Reports v3 groups by (user, project, description), so each group's
+        # description applies to every nested session.
+        group_description = (group.get("description") or "").strip()
+
         for entry in group.get("time_entries") or []:
             if entry.get("stop") is None:
                 stats["skipped_running"] += 1
@@ -471,9 +477,8 @@ def _aggregate(
             key = (user_id, project_id, oslo_date)
             seconds_by_key[key] += int(seconds)
 
-            description = (entry.get("description") or "").strip()
-            if description:
-                descriptions_by_key[key].add(description)
+            if group_description:
+                descriptions_by_key[key].add(group_description)
 
     # Track no-project cells for the result summary.
     stats["no_project_cells"] = sum(
