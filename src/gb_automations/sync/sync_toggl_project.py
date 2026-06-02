@@ -175,15 +175,23 @@ async def sync_toggl_project(project_page_id: str) -> TogglProjectResult:
                 existing = await _find_workspace_project_by_name(
                     workspace_id, leaf
                 )
-                if existing is not None:
-                    project_id = str(existing["id"])
-                    action = "adopted"
-                else:
-                    created = await toggl_client.create_project(
-                        workspace_id, leaf
+                if existing is None:
+                    # Link-only mode: never create new Toggl projects.
+                    # Notion is the source of truth for the time-bank;
+                    # we only record mappings for projects that already
+                    # exist in Toggl. Unmatched rows land in Notion with
+                    # an empty Prosjekt relation (see sync_toggl_hours).
+                    logger.info(
+                        "toggl project sync: no Toggl match for %r (page %s) "
+                        "— skipped (link-only)",
+                        leaf,
+                        project_page_id,
                     )
-                    project_id = str(created["id"])
-                    action = "created"
+                    result.action = "skipped"
+                    result.note = "no Toggl project with this name"
+                    return result
+                project_id = str(existing["id"])
+                action = "adopted"
                 url = _project_view_url(workspace_id, project_id)
                 session.add(
                     TogglProject(
@@ -194,20 +202,15 @@ async def sync_toggl_project(project_page_id: str) -> TogglProjectResult:
                         toggl_url=url,
                     )
                 )
-            elif row.current_name != leaf:
-                await toggl_client.update_project(
-                    row.toggl_workspace_id,
-                    row.toggl_project_id,
-                    name=leaf,
-                )
-                project_id = row.toggl_project_id
-                url = row.toggl_url
-                row.current_name = leaf
-                await session.merge(row)
-                action = "renamed"
             else:
+                # Link-only mode: do not push renames back to Toggl.
+                # If the Notion title changed, just update our local
+                # cache name — Toggl keeps whatever name it has.
                 project_id = row.toggl_project_id
                 url = row.toggl_url
+                if row.current_name != leaf:
+                    row.current_name = leaf
+                    await session.merge(row)
                 action = "unchanged"
 
             await session.commit()
