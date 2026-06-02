@@ -1,5 +1,6 @@
 """Smoke-test routes for Stage 2 — prove the auth chain works for both Gmail and Notion."""
 
+import re
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any
@@ -679,10 +680,29 @@ async def debug_toggl_sync_hours() -> dict[str, Any]:
     }
 
 
+_PROJECT_NUMBER_PREFIX = re.compile(r"^(\d+)_")
+
+
+def _qualifies_for_sync(name: str) -> bool:
+    """A project name qualifies for Toggl sync if it starts with digits
+    followed by an underscore, and those digits are >= 1.
+
+    Goldbox's convention: `1238_...`, `657_...`, `003_...` = real billable
+    projects. `000_...` = templates, tests, drafts (NOT for time tracking).
+    Names without a numeric prefix are also non-billable.
+    """
+    m = _PROJECT_NUMBER_PREFIX.match(name or "")
+    return bool(m) and int(m.group(1)) >= 1
+
+
 @router.get("/toggl/match-projects")
 async def debug_toggl_match_projects() -> dict[str, Any]:
-    """Dry-run diagnostic: compare every Notion project against existing Toggl
-    projects by name — no writes, no queue tasks.
+    """Dry-run diagnostic: compare every QUALIFYING Notion project against
+    QUALIFYING Toggl projects by name — no writes, no queue tasks.
+
+    A project qualifies when its name starts with a numeric prefix >= 1
+    (e.g. `1238_...`, `657_...`, `003_...`). `000_...` and non-numeric
+    names are excluded from both sides before matching.
 
     Returns matched (would adopt), unmatched (would create), and already_cached
     (already linked in the TogglProject table) counts, plus the full lists so
@@ -702,9 +722,13 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
     notion_projects = await notion_client.get_project_pages()
     toggl_projects = await toggl_client.list_projects(settings.toggl_workspace_id)
 
-    # Case-insensitive match — keeps in sync with _find_workspace_project_by_name.
+    # Filter Toggl side to qualifying names only. Case-insensitive map —
+    # keeps in sync with _find_workspace_project_by_name.
+    toggl_qualifying: list[dict] = [
+        p for p in toggl_projects if _qualifies_for_sync(p.get("name") or "")
+    ]
     toggl_by_name: dict[str, dict] = {}
-    for p in toggl_projects:
+    for p in toggl_qualifying:
         name = (p.get("name") or "").casefold()
         if name and name not in toggl_by_name:
             toggl_by_name[name] = p
@@ -718,12 +742,17 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
     already_cached: list[dict] = []
     matched: list[dict] = []
     unmatched: list[dict] = []
+    notion_filtered_out = 0
 
     for info in notion_projects.values():
         page_id = info.get("id", "")
         title = info.get("title", "")
         created_time = info.get("created_time")
         _year, leaf = project_path_parts(title, created_time)
+
+        if not _qualifies_for_sync(leaf):
+            notion_filtered_out += 1
+            continue
 
         entry = {
             "notion_id": page_id,
@@ -752,13 +781,20 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
     unmatched.sort(key=lambda x: x.get("created_time") or "", reverse=True)
     matched.sort(key=lambda x: x.get("created_time") or "", reverse=True)
 
+    notion_qualifying_count = len(notion_projects) - notion_filtered_out
+
     return {
         "summary": {
+            "filter": "name starts with digits >= 1 followed by '_'",
+            "notion_total": len(notion_projects),
+            "notion_qualifying": notion_qualifying_count,
+            "notion_filtered_out": notion_filtered_out,
+            "toggl_total": len(toggl_projects),
+            "toggl_qualifying": len(toggl_qualifying),
+            "toggl_filtered_out": len(toggl_projects) - len(toggl_qualifying),
             "already_cached": len(already_cached),
             "would_adopt": len(matched),
             "would_create": len(unmatched),
-            "total_notion_projects": len(notion_projects),
-            "total_toggl_projects": len(toggl_projects),
         },
         "would_create_recent_20": unmatched[:20],
         "would_adopt": matched,
