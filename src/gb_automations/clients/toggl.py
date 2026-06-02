@@ -213,33 +213,27 @@ async def list_workspace_users(workspace_id: str) -> list[dict[str, Any]]:
 
 
 async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
-    """`GET /api/v9/workspaces/{id}/projects` — all projects in the workspace.
+    """`GET /api/v9/workspaces/{id}/projects` — every project in the workspace.
 
-    Toggl's projects endpoint pages with `page` + `per_page` query params.
-    Default `per_page` is 151 (silently truncating larger workspaces);
-    max is 200. We page through and dedupe by id.
-
-    Each project carries a `total_count` field — Toggl's true count of
-    projects in the workspace matching the filter — which we use as the
-    authoritative target so we don't stop short on a partial page (Toggl
-    occasionally returns a short page mid-stream).
-
-    `active=both` returns active + archived; without it, archived projects
-    are silently hidden — which makes the adopt-by-name check in
-    sync_toggl_project miss them and try to recreate them, hitting Toggl's
-    "already exists" 400.
+    Pages through with `per_page=200`, sorted by id (stable across requests
+    so pagination doesn't skip/duplicate). `active=both` includes archived.
+    Dedupes by id and stops on the first empty page.
     """
     all_projects: list[dict[str, Any]] = []
     seen_ids: set[int] = set()
-    expected_total: int | None = None
     page = 1
-    max_pages = 50  # 50 * 200 = 10k, well above any plausible workspace size
     async with await _client() as client:
-        while page <= max_pages:
+        while True:
             response = await _with_retries(
                 lambda p=page: client.get(
                     f"/api/v9/workspaces/{workspace_id}/projects",
-                    params={"active": "both", "per_page": 200, "page": p},
+                    params={
+                        "active": "both",
+                        "per_page": 200,
+                        "page": p,
+                        "sort_field": "id",
+                        "sort_order": "ASC",
+                    },
                 ),
                 op_name="list_projects",
             )
@@ -248,34 +242,13 @@ async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
             projects = data if isinstance(data, list) else data.get("items", [])
             if not projects:
                 break
-
-            new_in_page = 0
             for p in projects:
                 pid = p.get("id")
                 if pid is None or pid in seen_ids:
                     continue
                 seen_ids.add(pid)
                 all_projects.append(p)
-                new_in_page += 1
-                if expected_total is None and isinstance(p.get("total_count"), int):
-                    expected_total = p["total_count"]
-
-            # Stop when we've covered Toggl's stated total, OR when a page
-            # adds nothing new (full overlap → we've wrapped around).
-            if expected_total is not None and len(all_projects) >= expected_total:
-                break
-            if new_in_page == 0:
-                break
             page += 1
-
-    if expected_total is not None and len(all_projects) < expected_total:
-        logger.warning(
-            "list_projects: Toggl claims %d projects but only fetched %d "
-            "after %d pages — pagination may be unstable",
-            expected_total,
-            len(all_projects),
-            page,
-        )
     return all_projects
 
 
