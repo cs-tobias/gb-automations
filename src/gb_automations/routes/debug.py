@@ -805,47 +805,98 @@ async def debug_toggl_match_projects() -> dict[str, Any]:
 
 @router.post("/toggl/sync-all-projects")
 async def debug_toggl_sync_all_projects() -> dict[str, Any]:
-    """Enqueue a toggl_project_sync for every project in the Notion Projects DB.
+    """Bulk-link every Notion project to its same-name Toggl project — INLINE.
 
-    Use this to populate the TogglProject cache so backfilled / nightly
-    Timer rows get the Notion Prosjekt relation set. Hours sync no longer
-    REQUIRES this (entries land regardless, with empty relation on
-    unmatched projects) — but running it once links what can be linked.
+    Single-pass, link-only:
+      1. Fetch every Notion project (one paginated call)
+      2. Fetch every Toggl project (one paginated `list_projects` — ~7 calls)
+      3. Match by name (case-insensitive) in memory
+      4. Upsert TogglProject cache rows in a single DB transaction
+      5. Never create, rename, or modify anything in Toggl
 
-    Safe to re-run: already-active tasks are deduplicated (returns
-    already_queued count). Returns immediately; actual sync work happens in
-    the background queue.
+    This replaces the old per-project queue task design that re-fetched
+    the entire Toggl project list for every single project (1400 tasks ×
+    7 calls = 10k calls = instant rate-limit). Now it's ~7 Toggl calls
+    total no matter how many Notion projects exist.
+
+    Safe to re-run: already-cached rows are updated in place; never
+    duplicated.
     """
     from gb_automations.clients import notion as notion_client
+    from gb_automations.clients import toggl as toggl_client
     from gb_automations.config import settings
-    from gb_automations.jobs import queue_worker
-    from gb_automations.sync.queue import enqueue_toggl_project_sync
+    from gb_automations.db import SessionLocal
+    from gb_automations.models import TogglProject
+    from gb_automations.utils.labels import project_path_parts
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-    if not settings.sync_toggl:
-        return {"action": "skipped", "note": "SYNC_TOGGL=false"}
+    if not settings.toggl_workspace_id:
+        return {"action": "skipped", "note": "TOGGL_WORKSPACE_ID not set"}
 
-    projects = await notion_client.get_project_pages()
-    enqueued = 0
-    already_queued = 0
-    for info in projects.values():
+    notion_projects = await notion_client.get_project_pages()
+    toggl_projects = await toggl_client.list_projects(settings.toggl_workspace_id)
+
+    # Case-insensitive name → Toggl project lookup (collision = first wins).
+    toggl_by_name: dict[str, dict[str, Any]] = {}
+    for p in toggl_projects:
+        name = (p.get("name") or "").casefold()
+        if name and name not in toggl_by_name:
+            toggl_by_name[name] = p
+
+    workspace_id = settings.toggl_workspace_id
+    rows_to_upsert: list[dict[str, Any]] = []
+    matched = 0
+    unmatched = 0
+    unmatched_samples: list[str] = []
+
+    for info in notion_projects.values():
         page_id = info.get("id", "")
-        if not page_id:
+        title = info.get("title", "")
+        created_time = info.get("created_time")
+        if not page_id or not title:
             continue
-        n = await enqueue_toggl_project_sync(page_id)
-        if n:
-            enqueued += 1
-        else:
-            already_queued += 1
+        _year, leaf = project_path_parts(title, created_time)
+        hit = toggl_by_name.get(leaf.casefold())
+        if hit is None:
+            unmatched += 1
+            if len(unmatched_samples) < 20:
+                unmatched_samples.append(leaf)
+            continue
+        toggl_project_id = str(hit.get("id"))
+        rows_to_upsert.append({
+            "notion_page_id": page_id,
+            "toggl_project_id": toggl_project_id,
+            "toggl_workspace_id": workspace_id,
+            "current_name": leaf,
+            "toggl_url": f"https://track.toggl.com/projects/{toggl_project_id}",
+        })
+        matched += 1
 
-    if enqueued:
-        queue_worker.wake()
+    # One transaction, upsert all rows. ON CONFLICT updates the mapped
+    # fields so a re-run picks up any Toggl-side rename or workspace move.
+    if rows_to_upsert:
+        async with SessionLocal() as session:
+            stmt = pg_insert(TogglProject).values(rows_to_upsert)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["notion_page_id"],
+                set_={
+                    "toggl_project_id": stmt.excluded.toggl_project_id,
+                    "toggl_workspace_id": stmt.excluded.toggl_workspace_id,
+                    "current_name": stmt.excluded.current_name,
+                    "toggl_url": stmt.excluded.toggl_url,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
 
     return {
         "action": "ok",
-        "enqueued": enqueued,
-        "already_queued": already_queued,
-        "total": enqueued + already_queued,
-        "note": "watch the api logs for toggl-project sync completions",
+        "notion_total": len(notion_projects),
+        "toggl_total": len(toggl_projects),
+        "matched_and_cached": matched,
+        "unmatched": unmatched,
+        "unmatched_samples": unmatched_samples,
+        "note": "link-only: nothing was created or modified in Toggl",
     }
 
 
