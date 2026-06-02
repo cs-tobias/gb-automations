@@ -679,6 +679,51 @@ async def debug_toggl_sync_hours() -> dict[str, Any]:
     }
 
 
+@router.post("/toggl/sync-all-projects")
+async def debug_toggl_sync_all_projects() -> dict[str, Any]:
+    """Enqueue a toggl_project_sync for every project in the Notion Projects DB.
+
+    Use once at first turn-on to populate the TogglProject cache before
+    running /toggl/backfill — the hours engine silently drops entries for
+    projects that haven't been mirrored yet (skipped_unknown_project), so
+    project sync must complete before backfill for hours to land correctly.
+
+    Safe to re-run: already-active tasks are deduplicated (returns
+    already_queued count). Returns immediately; actual sync work happens in
+    the background queue.
+    """
+    from gb_automations.clients import notion as notion_client
+    from gb_automations.jobs import queue_worker
+    from gb_automations.sync.queue import enqueue_toggl_project_sync
+
+    if not settings.sync_toggl:
+        return {"action": "skipped", "note": "SYNC_TOGGL=false"}
+
+    projects = await notion_client.get_project_pages()
+    enqueued = 0
+    already_queued = 0
+    for info in projects.values():
+        page_id = info.get("id", "")
+        if not page_id:
+            continue
+        n = await enqueue_toggl_project_sync(page_id)
+        if n:
+            enqueued += 1
+        else:
+            already_queued += 1
+
+    if enqueued:
+        queue_worker.wake()
+
+    return {
+        "action": "ok",
+        "enqueued": enqueued,
+        "already_queued": already_queued,
+        "total": enqueued + already_queued,
+        "note": "watch the api logs for toggl-project sync completions",
+    }
+
+
 @router.post("/toggl/backfill")
 async def debug_toggl_backfill(
     from_: str | None = Query(None, alias="from"),
@@ -689,7 +734,7 @@ async def debug_toggl_backfill(
     every aggregated cell to Notion.
 
     Use this on first turn-on (or after any extended downtime) when the
-    nightly 14-day window won't catch up. The engine's reconciliation is
+    nightly 32-day window won't catch up. The engine's reconciliation is
     identical to the nightly path, so a wider window just means more rows
     created — re-running the same range is idempotent.
 

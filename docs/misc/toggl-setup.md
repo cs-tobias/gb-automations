@@ -111,16 +111,25 @@ If the counts match, every person's hours will be attributed correctly. If `togg
 
 ---
 
-## Step 7 — Mirror active projects to Toggl
+## Step 7 — Mirror all projects to Toggl
 
-For each active Notion project that should be tracked in Toggl, open the project row in Notion and press the **Sync Toggl** button (or the **Initialize** button if you haven't initialized the project yet).
+Run this once to enqueue a project sync for every row in the Notion Projects DB:
 
-The sync engine will:
-- Create a new Toggl project with the same name, OR
-- Adopt an existing Toggl project with the exact same name (no duplicate created)
-- Write the Toggl project URL back to the Notion row
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8000/debug/toggl/sync-all-projects
+```
 
-You only need to do this for projects that are currently active. New projects going forward will get a Toggl project created automatically when you press Initialize or Sync Toggl on them.
+The response shows how many were enqueued. The worker then processes them in the background — each project gets either created in Toggl or adopted if a same-name project already exists, and the Toggl URL is written back to the Notion row.
+
+**This step must complete before running the backfill in step 8.** The hours engine silently skips entries for projects not yet in the cache (`skipped_unknown_project` in the response). If you run backfill first, those hours are dropped and won't appear until you re-run backfill after the projects are synced.
+
+Watch the logs to confirm it drains:
+
+```powershell
+docker compose logs -f api | grep -v "GET /health"
+```
+
+Going forward, new projects get their Toggl mirror created automatically when you press the **Sync Toggl** or **Initialize** button on the Notion row.
 
 ---
 
