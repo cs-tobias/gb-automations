@@ -219,10 +219,18 @@ async def list_projects(workspace_id: str) -> list[dict[str, Any]]:
     adopt-by-name lookup in sync_toggl_project (a workspace with >200
     projects is very rare for a 5-person studio). If we ever need to
     scale, swap to the `/projects/paginated` endpoint.
+
+    Fetches ALL projects (active=both) so the adopt-by-name check in
+    sync_toggl_project finds pre-existing inactive projects too — the
+    default active-only filter caused 400 "already exists" errors when
+    trying to create projects that existed but were archived in Toggl.
     """
     async with await _client() as client:
         response = await _with_retries(
-            lambda: client.get(f"/api/v9/workspaces/{workspace_id}/projects"),
+            lambda: client.get(
+                f"/api/v9/workspaces/{workspace_id}/projects",
+                params={"active": "both"},
+            ),
             op_name="list_projects",
         )
         _raise_for_status(response)

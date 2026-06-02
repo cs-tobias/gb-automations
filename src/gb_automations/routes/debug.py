@@ -679,6 +679,81 @@ async def debug_toggl_sync_hours() -> dict[str, Any]:
     }
 
 
+@router.get("/toggl/match-projects")
+async def debug_toggl_match_projects() -> dict[str, Any]:
+    """Dry-run diagnostic: compare every Notion project against existing Toggl
+    projects by name — no writes, no queue tasks.
+
+    Returns matched (would adopt), unmatched (would create), and already_cached
+    (already linked in the TogglProject table) counts, plus the full lists so
+    you can spot name mismatches before running sync-all-projects.
+    """
+    from gb_automations.clients import notion as notion_client
+    from gb_automations.clients import toggl as toggl_client
+    from gb_automations.config import settings
+    from gb_automations.db import SessionLocal
+    from gb_automations.models import TogglProject
+    from gb_automations.utils.labels import project_path_parts
+    from sqlalchemy import select
+
+    if not settings.toggl_workspace_id:
+        return {"action": "skipped", "note": "TOGGL_WORKSPACE_ID not set"}
+
+    notion_projects = await notion_client.get_project_pages()
+    toggl_projects = await toggl_client.list_projects(settings.toggl_workspace_id)
+
+    toggl_by_name: dict[str, dict] = {}
+    for p in toggl_projects:
+        name = p.get("name", "")
+        if name and name not in toggl_by_name:
+            toggl_by_name[name] = p
+
+    async with SessionLocal() as session:
+        cached_ids: set[str] = {
+            row.notion_page_id
+            for row in (await session.execute(select(TogglProject))).scalars()
+        }
+
+    already_cached: list[dict] = []
+    matched: list[dict] = []
+    unmatched: list[dict] = []
+
+    for info in notion_projects.values():
+        page_id = info.get("id", "")
+        title = info.get("title", "")
+        created_time = info.get("created_time")
+        _year, leaf = project_path_parts(title, created_time)
+
+        if page_id in cached_ids:
+            already_cached.append({"notion_id": page_id, "notion_title": title, "leaf": leaf})
+            continue
+
+        toggl_hit = toggl_by_name.get(leaf)
+        if toggl_hit:
+            matched.append({
+                "notion_id": page_id,
+                "notion_title": title,
+                "leaf": leaf,
+                "toggl_id": toggl_hit.get("id"),
+                "toggl_active": toggl_hit.get("active"),
+            })
+        else:
+            unmatched.append({"notion_id": page_id, "notion_title": title, "leaf": leaf})
+
+    return {
+        "summary": {
+            "already_cached": len(already_cached),
+            "would_adopt": len(matched),
+            "would_create": len(unmatched),
+            "total_notion_projects": len(notion_projects),
+            "total_toggl_projects": len(toggl_projects),
+        },
+        "would_adopt": matched,
+        "would_create": unmatched,
+        "already_cached": already_cached,
+    }
+
+
 @router.post("/toggl/sync-all-projects")
 async def debug_toggl_sync_all_projects() -> dict[str, Any]:
     """Enqueue a toggl_project_sync for every project in the Notion Projects DB.
