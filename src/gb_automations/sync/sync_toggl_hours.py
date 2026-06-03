@@ -38,9 +38,10 @@ Engine flow:
      toggl_user_id → notion_user_uuid.
   3. Fetch Toggl entries for [today - window_days, today] in workspace tz.
   4. Aggregate to (user_id, project_id, oslo_date) → seconds.
-  5. Pre-resolve each aggregated user_id to a notion_user_uuid; cells
-     whose user can't be matched (no Notion account with that email)
-     are skipped and counted as `skipped_unmatched`.
+  5. Pre-resolve each aggregated user_id to a notion_user_uuid where
+     possible. Cells whose user can't be matched are NOT skipped —
+     they're counted under `unmatched_user_kept` and still written with
+     an empty Ansatt property + Toggl Bruker navn populated.
   6. Group target cells by year (window may straddle Jan 1).
   7. For each year: resolve `Timer YYYY` db, query existing rows in window,
      diff against fresh aggregate, perform creates / patches / archives.
@@ -96,15 +97,15 @@ class TogglHoursResult:
     rows_updated: int = 0
     rows_archived: int = 0
     skipped_running: int = 0
-    # No Notion user account found for this Toggl user's email (mismatch
-    # or freelancer without Notion access). The row is dropped silently
-    # in production (logged at sync end); operator decides if a fix is
-    # needed.
-    skipped_unmatched: int = 0
+    # Informational: cells where the Toggl user's email doesn't match any
+    # active Notion workspace member (ex-employees, freelancers without
+    # Notion access). NOT skipped — the row still lands with empty `Ansatt`
+    # and `Toggl Bruker navn` populated, so the hours appear in the
+    # time-bank but aren't attributed to a clickable Notion person.
+    unmatched_user_kept: int = 0
     # Informational: cells where the Toggl project_id has no Notion
-    # relation mapped. These are NOT skipped — they still land in Notion
-    # with an empty relation and Toggl Prosjekt navn populated. Counter
-    # exists so the team can see how many rows are unlinked.
+    # relation mapped. NOT skipped — they still land in Notion with an
+    # empty relation and Toggl Prosjekt navn populated.
     unmatched_project_kept: int = 0
     # Informational: cells where Toggl reported no project at all
     # (project_id=null). Also kept — written with relation empty and
@@ -277,41 +278,47 @@ async def sync_toggl_hours(
             err,
         )
 
-    # Pre-resolve toggl_user_id → notion_user_uuid for every user that
-    # actually appears in this window's entries. One pass; cells whose
-    # user can't be resolved get logged once at debug here and counted
-    # under skipped_unmatched in the cell loop.
+    # Pre-resolve toggl_user_id → (notion_user_uuid, name) for every user
+    # that actually appears in this window's entries. Users whose email
+    # matches an active Notion workspace member get the uuid; users
+    # without a match still get their Toggl name recorded so historical
+    # rows from ex-employees are still attributable in Notion.
     user_uuid_lookup: dict[str, str] = {}
     user_name_lookup: dict[str, str] = {}
     for user_id in {key[0] for key in aggregate}:
-        email = (toggl_user_emails.get(user_id) or {}).get("email", "")
+        info = toggl_user_emails.get(user_id) or {}
+        email = info.get("email", "")
+        name = info.get("name", "")
+        user_name_lookup[user_id] = name  # always recorded, matched or not
         notion_uuid = notion_user_by_email.get(email.lower()) if email else None
         if notion_uuid:
             user_uuid_lookup[user_id] = notion_uuid
-            user_name_lookup[user_id] = (
-                toggl_user_emails.get(user_id, {}).get("name", "")
-            )
         else:
             logger.debug(
-                "toggl hours: no Notion user for toggl_user_id=%s email=%r",
+                "toggl hours: no Notion user for toggl_user_id=%s "
+                "email=%r name=%r — row will land with empty Ansatt + "
+                "Toggl Bruker navn set",
                 user_id,
                 email,
+                name,
             )
 
     # Group cells by year so we can resolve the correct Timer YYYY DB
-    # (the window may straddle Jan 1). Only cells whose user can't be
-    # matched to a Notion workspace member are dropped — everything else
-    # flows through (no project / unmatched project = still written,
-    # relation just stays empty).
+    # (the window may straddle Jan 1). EVERY cell flows through — no user
+    # or project gate. The time-bank captures all hours regardless of
+    # whether the Toggl user / project still has a Notion counterpart.
     cells_by_year: dict[int, dict[tuple[str, str, date], int]] = defaultdict(dict)
     for key, seconds in aggregate.items():
         user_id, project_id, oslo_date = key
         if user_id not in user_uuid_lookup:
-            result.skipped_unmatched += 1
-            continue
+            # Counted but NOT skipped — the row still writes, just with an
+            # empty Ansatt property (Notion's `people` type can only hold
+            # workspace member UUIDs). The Toggl Bruker navn column carries
+            # the human-readable name so the row is still attributable.
+            result.unmatched_user_kept += 1
         if project_id and project_id not in known_project_map:
-            # Not skipped — just counted so the operator can see how many
-            # rows landed without a Notion-project relation.
+            # Same shape — counted, kept; relation empty, Toggl Prosjekt navn
+            # populated downstream.
             result.unmatched_project_kept += 1
         cells_by_year[oslo_date.year][key] = seconds
 
@@ -340,13 +347,13 @@ async def sync_toggl_hours(
 
     logger.info(
         "toggl hours sync done: created=%d updated=%d archived=%d "
-        "(skipped running=%d skipped unmatched_user=%d "
+        "(skipped running=%d unmatched_user_kept=%d "
         "unmatched_project_kept=%d no_project_kept=%d) errors=%d",
         result.rows_created,
         result.rows_updated,
         result.rows_archived,
         result.skipped_running,
-        result.skipped_unmatched,
+        result.unmatched_user_kept,
         result.unmatched_project_kept,
         result.no_project_kept,
         len(result.errors),
@@ -470,6 +477,8 @@ async def reconcile_toggl_notion_hours(
     notion_total_rows = 0
     rows_with_relation = 0
     rows_without_relation = 0
+    rows_with_ansatt = 0
+    rows_without_ansatt = 0
     by_year: dict[str, dict[str, float | int]] = {}
 
     for year in range(window_start.year, window_end.year + 1):
@@ -487,16 +496,20 @@ async def reconcile_toggl_notion_hours(
         year_hours = 0.0
         year_rows = 0
         for row in rows:
+            props = row.get("properties") or {}
             hours = _read_number_prop(row, TIMER_PROPS["hours"]) or 0.0
             year_hours += hours
             year_rows += 1
-            relation_ids = _read_relation_ids(
-                row.get("properties") or {}, TIMER_PROPS["project"]
-            )
+            relation_ids = _read_relation_ids(props, TIMER_PROPS["project"])
             if relation_ids:
                 rows_with_relation += 1
             else:
                 rows_without_relation += 1
+            people_ids = _read_people_ids(props, TIMER_PROPS["employee"])
+            if people_ids:
+                rows_with_ansatt += 1
+            else:
+                rows_without_ansatt += 1
         notion_total_hours += year_hours
         notion_total_rows += year_rows
         by_year[str(year)] = {
@@ -523,6 +536,8 @@ async def reconcile_toggl_notion_hours(
             "total_rows": notion_total_rows,
             "rows_with_relation": rows_with_relation,
             "rows_without_relation": rows_without_relation,
+            "rows_with_ansatt": rows_with_ansatt,
+            "rows_without_ansatt": rows_without_ansatt,
             "by_year": by_year,
         },
         "diff": {
@@ -755,6 +770,12 @@ async def _reconcile_year(
             if seconds <= 0:
                 continue
             hours = round(seconds / 3600.0, 2)
+            # Resolve the user label that should land on the row. Mirrors
+            # the create path so update vs create write the same value.
+            row_user_name = user_name_lookup.get(key[0], "")
+            user_label = row_user_name or f"toggl_user_{key[0]}"
+            notion_user_uuid = user_uuid_lookup.get(key[0])
+
             if row is None:
                 await _create_timer_row(
                     db_id=db_id,
@@ -768,42 +789,59 @@ async def _reconcile_year(
                 )
                 result.rows_created += 1
             else:
-                # Check whether any of the four "writable" fields drifted:
-                # hours, description, toggl_project_name, or the project
-                # relation (the latter when a previously-unmatched project
-                # has since been mirrored).
+                # Drift detection across all writable fields: hours,
+                # description, toggl_project_name, toggl_user_name, the
+                # Prosjekt relation, and the Ansatt people property. Any
+                # of these can change after the row was first written
+                # (retroactive Toggl edits; new TogglProject mapping;
+                # employee re-added to Notion).
                 current_hours = _read_number_prop(row, TIMER_PROPS["hours"]) or 0.0
+                row_props = row.get("properties") or {}
                 current_description = _read_rich_text(
-                    row.get("properties") or {}, TIMER_PROPS["description"]
+                    row_props, TIMER_PROPS["description"]
                 )
                 current_project_name = _read_rich_text(
-                    row.get("properties") or {}, TIMER_PROPS["toggl_project_name"]
+                    row_props, TIMER_PROPS["toggl_project_name"]
+                )
+                current_user_name = _read_rich_text(
+                    row_props, TIMER_PROPS["toggl_user_name"]
                 )
                 hours_changed = abs(current_hours - hours) > _HOURS_EPSILON
                 description_changed = current_description != cell_descriptions
                 project_name_changed = current_project_name != toggl_project_label
+                user_name_changed = current_user_name != user_label
                 notion_project_page = (
                     project_map.get(key[1]) if key[1] else None
                 )
                 current_relation_ids = _read_relation_ids(
-                    row.get("properties") or {}, TIMER_PROPS["project"]
+                    row_props, TIMER_PROPS["project"]
                 )
                 relation_changed = (
                     [notion_project_page] if notion_project_page else []
                 ) != current_relation_ids
+                current_people_ids = _read_people_ids(
+                    row_props, TIMER_PROPS["employee"]
+                )
+                people_changed = (
+                    [notion_user_uuid] if notion_user_uuid else []
+                ) != current_people_ids
 
                 if (
                     hours_changed
                     or description_changed
                     or project_name_changed
+                    or user_name_changed
                     or relation_changed
+                    or people_changed
                 ):
                     await _patch_timer_row(
                         row["id"],
                         hours=hours,
                         description=cell_descriptions,
                         toggl_project_label=toggl_project_label,
+                        toggl_user_label=user_label,
                         notion_project_page=notion_project_page,
+                        notion_user_uuid=notion_user_uuid,
                     )
                     result.rows_updated += 1
         except Exception as err:
@@ -928,6 +966,12 @@ def _read_relation_ids(props: dict[str, Any], name: str) -> list[str]:
     return [i["id"] for i in items if "id" in i]
 
 
+def _read_people_ids(props: dict[str, Any], name: str) -> list[str]:
+    prop = props.get(name) or {}
+    items = prop.get("people") or []
+    return [i["id"] for i in items if "id" in i]
+
+
 async def _create_timer_row(
     *,
     db_id: str,
@@ -941,31 +985,36 @@ async def _create_timer_row(
 ) -> None:
     """Create one Timer row.
 
-    Caller has already verified the user is resolvable. The project
-    relation is set only when project_map has a Notion page for this
-    Toggl project_id — otherwise the relation property is omitted so
-    the row lands with an empty relation cell (which Notion accepts).
+    All fields are best-effort:
+      - Ansatt (people) is set only when the Toggl user has a matching
+        active Notion workspace member; omitted otherwise.
+      - Prosjekt (relation) is set only when project_map has a Notion page
+        for this Toggl project_id; omitted otherwise.
+
+    Toggl Bruker navn and Toggl Prosjekt navn always carry the source-of-
+    truth labels so unmatched rows are still attributable.
     """
     user_id, project_id, dato = key
-    notion_user_uuid = user_uuid_lookup[user_id]
+    notion_user_uuid = user_uuid_lookup.get(user_id)
     user_name = user_name_lookup.get(user_id, "")
+    user_label = user_name or f"toggl_user_{user_id}"
     notion_project_page = project_map.get(project_id) if project_id else None
-    title = f"{user_name or user_id} — {dato.isoformat()}"
+    title = f"{user_label} — {dato.isoformat()}"
 
     properties: dict[str, Any] = {
         TIMER_PROPS["name"]: {
             "title": [{"text": {"content": title}}]
         },
         TIMER_PROPS["date"]: {"date": {"start": dato.isoformat()}},
-        TIMER_PROPS["employee"]: {
-            "people": [{"object": "user", "id": notion_user_uuid}]
-        },
         TIMER_PROPS["hours"]: {"number": hours},
         TIMER_PROPS["description"]: {
             "rich_text": [{"text": {"content": description}}] if description else []
         },
         TIMER_PROPS["toggl_project_name"]: {
             "rich_text": [{"text": {"content": toggl_project_label}}]
+        },
+        TIMER_PROPS["toggl_user_name"]: {
+            "rich_text": [{"text": {"content": user_label}}]
         },
         TIMER_PROPS["toggl_user_id"]: {
             "rich_text": [{"text": {"content": user_id}}]
@@ -974,6 +1023,10 @@ async def _create_timer_row(
             "rich_text": [{"text": {"content": project_id}}] if project_id else []
         },
     }
+    if notion_user_uuid:
+        properties[TIMER_PROPS["employee"]] = {
+            "people": [{"object": "user", "id": notion_user_uuid}]
+        }
     if notion_project_page:
         properties[TIMER_PROPS["project"]] = {
             "relation": [{"id": notion_project_page}]
@@ -999,15 +1052,18 @@ async def _patch_timer_row(
     hours: float,
     description: str,
     toggl_project_label: str,
+    toggl_user_label: str,
     notion_project_page: str | None,
+    notion_user_uuid: str | None,
 ) -> None:
     """Patch the writable fields of an existing Timer row.
 
-    Always updates hours, description, and Toggl Prosjekt navn (these can
-    all drift on retroactive edits). The project relation is set when
-    `notion_project_page` is provided; otherwise it's explicitly cleared
-    (an unmatched project that gets mirrored later will populate; one
-    that gets removed clears).
+    Always updates hours, description, Toggl Prosjekt navn, and
+    Toggl Bruker navn (these can all drift on retroactive edits). The
+    Prosjekt relation and Ansatt people-property are set when their
+    respective Notion match exists; otherwise both are explicitly
+    cleared so a previously-matched row that later becomes unmatched
+    (employee removed, project relinked) reflects the new state.
     """
     properties: dict[str, Any] = {
         TIMER_PROPS["hours"]: {"number": hours},
@@ -1017,8 +1073,14 @@ async def _patch_timer_row(
         TIMER_PROPS["toggl_project_name"]: {
             "rich_text": [{"text": {"content": toggl_project_label}}]
         },
+        TIMER_PROPS["toggl_user_name"]: {
+            "rich_text": [{"text": {"content": toggl_user_label}}]
+        },
         TIMER_PROPS["project"]: {
             "relation": [{"id": notion_project_page}] if notion_project_page else []
+        },
+        TIMER_PROPS["employee"]: {
+            "people": [{"object": "user", "id": notion_user_uuid}] if notion_user_uuid else []
         },
     }
     async with _notion_client() as client:

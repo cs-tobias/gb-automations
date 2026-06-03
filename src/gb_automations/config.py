@@ -691,6 +691,11 @@ TIMER_PROPS = {
     # unmatched entries are still attributable). Set to "Uten prosjekt" when
     # the Toggl entry had no project at all.
     "toggl_project_name": "Toggl Prosjekt navn",
+    # Toggl's raw user name. Always populated so historical hours from
+    # ex-employees (no longer in the Notion workspace) are still
+    # attributable. The `Ansatt` people-property is set only when the
+    # Toggl email matches an active Notion workspace member.
+    "toggl_user_name": "Toggl Bruker navn",
     # Hidden technical columns — used by the engine to upsert / delete
     # without scanning the people property (which a user could edit). The
     # two ids together are the dedup key.
@@ -839,6 +844,7 @@ def build_timer_db_schema(
         TIMER_PROPS["hours"]: {"number": {"format": "number"}},
         TIMER_PROPS["description"]: {"rich_text": {}},
         TIMER_PROPS["toggl_project_name"]: {"rich_text": {}},
+        TIMER_PROPS["toggl_user_name"]: {"rich_text": {}},
         TIMER_PROPS["toggl_user_id"]: {"rich_text": {}},
         TIMER_PROPS["toggl_project_id"]: {"rich_text": {}},
     }

@@ -947,11 +947,13 @@ async def debug_toggl_backfill(
         "skipped": {
             # In-flight Toggl entries (stop=null) — picked up on next run.
             "running": result.skipped_running,
-            # Toggl user has no matching Notion workspace user (by email).
-            # Their hours don't land — fix by matching emails or inviting.
-            "unmatched_user": result.skipped_unmatched,
         },
-        "kept_without_relation": {
+        "kept_without_attribution": {
+            # Rows landed in Notion but with an empty Ansatt people-property
+            # — informational. The Toggl email doesn't match any active
+            # Notion workspace member (ex-employees, freelancers, etc.).
+            # The Toggl Bruker navn column still shows who tracked the time.
+            "unmatched_user": result.unmatched_user_kept,
             # Rows landed in Notion but with an empty Prosjekt relation —
             # informational. Either the Toggl project isn't mirrored to a
             # Notion page yet, or the entry had no project at all.
