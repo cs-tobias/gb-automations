@@ -41,10 +41,9 @@ silently lands an empty directory (see [gotchas.md §15](gotchas.md)).
    NAS_HOST_PATH=W:\gb-automations-test                             # Windows display path for Notion writeback (cosmetic)
    # NAS_RECEIVED_SUBFOLDER=Mottatt                                 # default; override only if Goldbox renames it
    ```
-   `docker-compose.yml` declares the `nas` volume with these credentials and
-   mounts it at `/mnt/nas` on the `api` service. `NAS_HOST_PATH` is purely
-   the display path written into the Projects-DB NAS URL column — it's never
-   used as a mount source.
+   `docker-compose.yml` declares the `nas` CIFS volume with these credentials.
+   `NAS_HOST_PATH` is purely the display path written into the Projects-DB
+   NAS URL column — it's never used as a mount source.
 
    For live (after the test sub-folder is validated), switch to:
    ```
@@ -53,7 +52,23 @@ silently lands an empty directory (see [gotchas.md §15](gotchas.md)).
    # NAS_PROJECTS_ROOT stays /mnt/nas/Prosjekt
    ```
 
-3. **Recreate the volume and the api container** (a `restart` alone won't
+3. **Activate the prod overlay** by adding `COMPOSE_FILE` to `.env`. The
+   separator is OS-specific — `;` on Windows, `:` on Linux/macOS:
+   ```
+   # Windows (prod is on Windows Docker Desktop):
+   COMPOSE_FILE=docker-compose.yml;docker-compose.prod.yml
+   # Linux/macOS would be:
+   # COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+   ```
+   `docker-compose.prod.yml` is a committed overlay that adds the
+   `nas:/mnt/nas:rw` bind to the api service. Setting `COMPOSE_FILE` in
+   `.env` makes `docker compose up -d` (no flags) auto-merge both files —
+   so prod's command stays the same as everywhere else, the only
+   difference is one line in `.env`. Dev boxes leave `COMPOSE_FILE` unset
+   and get just the base file (no NAS bind), so the stack boots without
+   any NAS configuration.
+
+4. **Recreate the volume and the api container** (a `restart` alone won't
    re-mount the CIFS volume with the new options — Docker remembers the old
    options until the volume is removed):
    ```powershell

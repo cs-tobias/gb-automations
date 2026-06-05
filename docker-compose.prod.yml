@@ -1,0 +1,11 @@
+# Production overlay — adds the office NAS bind on top of docker-compose.yml.
+# Prod activates this file by setting in its .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+# After which `docker compose up -d` (no flags) auto-merges both files. See
+# docs/misc/nas-setup.md for the full setup and the CIFS volume definition
+# (which lives in docker-compose.yml so this file can reference it by name).
+
+services:
+  api:
+    volumes:
+      - nas:/mnt/nas:rw
