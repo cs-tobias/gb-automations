@@ -185,6 +185,22 @@ This is independent of the provisioning fan-out — it fires on *every* status c
 5. Change Status back to `I produksjon`. Provisioning re-fires (idempotent — no-ops on already-provisioned systems), and the Frame project flips back to `active`. No manual unarchive needed.
 6. Edit any other property on a project row (e.g. the Frame.io URL, or rename the row). Expect zero webhook hits — the trigger is property-scoped to `Status`.
 
+### 6e — If the automation pauses itself
+
+Notion auto-pauses any "Send webhook" automation that it thinks is failing. The pause indicator is an **exclamation mark next to the automation row** in the database's Automations panel. No retry, no log on Notion's side, and the published failure threshold is *undocumented* — community reports (n8n#12257, activepieces#6422) confirm even a single non-2xx response can trip it. To re-enable: open the database → top-right **🗲** → toggle the paused automation back on.
+
+**Mitigations already in place** (see receivers in [src/gb_automations/routes/webhooks.py](../../src/gb_automations/routes/webhooks.py)):
+
+- All three Notion-automation receivers (`/notion/project-status`, `/notion/oppgave-done`, `/notion/oppgave-status`) deliberately return **HTTP 200 for every code path** — auth failure, malformed JSON, missing page id, wrong parent DB. The failure stays loud in the api logs (`logger.warning(...)`), but Notion only ever sees a 200 and won't pause the automation.
+- The endpoints are queue-based: the webhook does a single DB insert and returns. The actual work runs on the queue worker. Sub-50ms response time keeps us safely under Notion's (undocumented) latency cutoff.
+
+**Diagnose a pause** (in order, fastest first):
+
+1. **Is Notion firing the automation at all?** Run `curl http://localhost:8000/debug/notion-automation-health` on the api host. Each receiver records `last_seen_utc`, `last_action`, and a per-process call counter. An empty entry (or one that hasn't ticked in hours despite Status edits in Notion) means Notion isn't reaching us — skip to step 3.
+2. **Is the secret in sync?** `last_action: auth_failed` repeatedly in the health endpoint means `NOTION_WEBHOOK_SECRET` in `.env` has drifted from the value Notion is sending. Re-paste the bearer in the Notion automation's webhook headers, or rotate the secret in `.env` + `docker compose up -d --force-recreate api`.
+3. **Cloudflare edge filtering.** Notion's webhook IPs occasionally get caught by Cloudflare's Bot Fight Mode and are silently 403'd before reaching the origin (we see nothing in api logs because the request never arrives). Check **Cloudflare dashboard → Security → Events** for the zone, filtered to host `hub.<domain>` and path `/webhooks/notion/project-status`. If you see Block / Challenge entries against Notion's IPs, **Security → Settings → Bot Fight Mode → Off** for the zone (BFM does not run on the Ruleset Engine, so WAF Skip rules cannot whitelist Notion — the only options are off, upgrade to Super Bot Fight Mode, or expose this hostname DNS-only outside the Tunnel).
+4. **Control test.** Create a free `webhook.site` URL and temporarily point the automation at it. Flip a Status; check whether (a) webhook.site receives the call, (b) the automation stays alive against webhook.site. If both, the problem is in our path (Cloudflare or origin). If the automation pauses even against webhook.site, the Notion automation itself is in a stuck state — delete and recreate it.
+
 ---
 
 Notion is done.

@@ -17,7 +17,6 @@ import asyncio
 import json
 
 import pytest
-from fastapi import HTTPException
 from starlette.requests import Request
 
 import gb_automations.routes.webhooks as webhooks
@@ -96,22 +95,31 @@ def _response_json(response) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_missing_bearer_returns_401(captured):
+def test_missing_bearer_returns_200_skipped_auth_failed(captured):
+    # CRITICAL CONTRACT: the receiver MUST NOT return non-2xx — Notion
+    # auto-pauses webhook automations on any non-2xx (threshold undocumented,
+    # single failure can trip it). Auth failure is logged loud but Notion
+    # sees a 200 with a reason in the body.
     req = _make_request({"data": {"id": "p"}}, auth=None)
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(webhooks._notion_project_status_impl(req))
-    assert exc.value.status_code == 401
+    response = asyncio.run(webhooks._notion_project_status_impl(req))
+    assert response.status_code == 200
+    body = _response_json(response)
+    assert body["action"] == "skipped"
+    assert body["reason"] == "auth failed"
     assert captured["dispatch"] == []
 
 
-def test_wrong_bearer_returns_401(captured):
+def test_wrong_bearer_returns_200_skipped_auth_failed(captured):
     req = _make_request({"data": {"id": "p"}}, auth="Bearer nope")
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(webhooks._notion_project_status_impl(req))
-    assert exc.value.status_code == 401
+    response = asyncio.run(webhooks._notion_project_status_impl(req))
+    assert response.status_code == 200
+    body = _response_json(response)
+    assert body["action"] == "skipped"
+    assert body["reason"] == "auth failed"
+    assert captured["dispatch"] == []
 
 
-def test_invalid_json_returns_400(captured):
+def test_invalid_json_returns_200_skipped_invalid_json(captured):
     scope = {
         "type": "http",
         "method": "POST",
@@ -127,9 +135,12 @@ def test_invalid_json_returns_400(captured):
         return {"type": "http.request", "body": b"not-json{", "more_body": False}
 
     req = Request(scope, receive)
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(webhooks._notion_project_status_impl(req))
-    assert exc.value.status_code == 400
+    response = asyncio.run(webhooks._notion_project_status_impl(req))
+    assert response.status_code == 200
+    body = _response_json(response)
+    assert body["action"] == "skipped"
+    assert body["reason"] == "invalid JSON"
+    assert captured["dispatch"] == []
 
 
 def test_no_page_id_skips_without_enqueue(captured):
@@ -185,6 +196,74 @@ def test_idempotent_response_when_already_queued(captured, monkeypatch):
     response = asyncio.run(webhooks._notion_project_status_impl(req))
     body = _response_json(response)
     assert body["action"] == "already_queued"
+
+
+def test_every_branch_returns_200_and_records_hit(captured, monkeypatch):
+    # The "always 200" contract is the entire reason the auth/json branches
+    # changed from HTTPException to _json. Pin it across every branch the
+    # impl has — bad auth, bad JSON, no page id, wrong DB, happy path. Each
+    # should also record a hit on _NOTION_AUTOMATION_LAST_SEEN so the
+    # /debug/notion-automation-health endpoint can surface "Notion fired
+    # this 47 times" without scanning logs.
+
+    # Reset the tracker so this test's assertions are deterministic.
+    webhooks._NOTION_AUTOMATION_LAST_SEEN.clear()
+
+    cases: list[tuple[str, Request]] = [
+        (
+            "auth_failed",
+            _make_request({"data": {"id": "p"}}, auth="Bearer nope"),
+        ),
+    ]
+
+    # Bad JSON (manual scope build because _make_request only takes dicts).
+    bad_json_scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/webhooks/notion/project-status",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer s3cret"),
+        ],
+        "query_string": b"",
+    }
+
+    async def bad_json_receive() -> dict:
+        return {"type": "http.request", "body": b"not-json{", "more_body": False}
+
+    cases.append(("invalid_json", Request(bad_json_scope, bad_json_receive)))
+    cases.append(("no_page_id", _make_request({"data": {}})))
+    cases.append(
+        (
+            "wrong_parent_db",
+            _make_request(
+                {"data": {"id": "p", "parent": {"database_id": "wrong-db-uuid"}}}
+            ),
+        )
+    )
+    cases.append(
+        (
+            "queued",
+            _make_request(
+                {"data": {"id": "p1", "parent": {"database_id": "projdb-uuid"}}}
+            ),
+        )
+    )
+
+    for expected_action, req in cases:
+        response = asyncio.run(webhooks._notion_project_status_impl(req))
+        assert response.status_code == 200, (
+            f"branch {expected_action!r} returned {response.status_code} "
+            "— must be 200 or Notion auto-pauses the automation"
+        )
+
+    # All five branches recorded against the same automation name; counter
+    # reflects every call.
+    entry = webhooks._NOTION_AUTOMATION_LAST_SEEN["project-status"]
+    assert entry["count"] == len(cases)
+    # Last call was the happy path; last_action surfaces it.
+    assert entry["last_action"] == "queued"
+    assert entry["last_seen_utc"] is not None
 
 
 def test_parent_db_check_hyphen_and_case_insensitive(captured):

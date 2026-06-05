@@ -1038,3 +1038,52 @@ async def debug_toggl_refresh_users() -> dict[str, Any]:
         "toggl_skipped_no_email": toggl_result.skipped_no_email,
         "notion_users_indexed_by_email": len(notion_emails),
     }
+
+
+@router.get("/notion-automation-health")
+async def debug_notion_automation_health() -> dict[str, Any]:
+    """Last-seen telemetry for the three Notion-automation receivers.
+
+    Notion auto-pauses webhook automations on perceived failure with no
+    publicly visible log on Notion's side — so this endpoint is the
+    operator's one-stop check for "are the automations still firing?"
+    Returns the in-memory state from routes.webhooks (resets on each
+    process restart).
+
+    Each entry shows:
+      - `last_seen_utc`: when this automation last hit the receiver (any
+         outcome — success, skip, auth fail, bad JSON).
+      - `last_action`: the receiver's last response tag (queued /
+         already_queued / auth_failed / invalid_json / no_page_id /
+         wrong_parent_db). A burst of `auth_failed` here means
+         NOTION_WEBHOOK_SECRET drifted between .env and Notion.
+      - `count`: per-process call counter so the operator can sanity-check
+         "Notion fired this 47 times in the last hour."
+
+    Cheap (one dict read), no auth: it's `/debug/*`, consistent with the
+    other debug endpoints, and only ever exposed on the cluster's internal
+    network. The information leak (count of recent automation hits) is
+    not sensitive.
+    """
+    # Late import to avoid coupling debug.py to the webhook module at
+    # module load — keeps the import graph clean and matches the
+    # existing pattern (debug endpoints reach across modules on demand).
+    from gb_automations.routes.webhooks import _NOTION_AUTOMATION_LAST_SEEN
+
+    # Return a defensive copy so a concurrent receiver-side update can't
+    # race the serialization. The dict is small (3 entries max).
+    snapshot = {
+        name: dict(entry)
+        for name, entry in _NOTION_AUTOMATION_LAST_SEEN.items()
+    }
+    return {
+        "automations": snapshot,
+        "note": (
+            "Empty dict on a fresh container = no Notion automation has "
+            "fired since the last restart. last_action='auth_failed' "
+            "repeatedly means NOTION_WEBHOOK_SECRET drift; the receivers "
+            "deliberately return 200 on auth failure so Notion doesn't "
+            "auto-pause the automation (see plan: stabilise-notion-status-"
+            "change-automation-against-auto-pause)."
+        ),
+    }

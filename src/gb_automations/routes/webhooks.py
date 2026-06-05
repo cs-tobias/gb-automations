@@ -165,6 +165,36 @@ def _json(payload: dict[str, Any], status: int = 200) -> Response:
     )
 
 
+# In-memory last-seen tracker for the three Notion-automation receivers
+# (project-status, oppgave-done, oppgave-status). Exposed via
+# GET /debug/notion-automation-health — lets the operator confirm Notion
+# is still firing each automation without having to flip a Status by hand
+# and check logs. Resets on every process restart (a 5d uptime container
+# can show 5d of history; a fresh container reads as "never seen yet").
+#
+# Each entry is {"last_seen_utc": iso8601, "last_action": str, "count": int}.
+# `count` is the per-process call counter so a sudden jump from 47 → 47 over
+# a 24h window screams "Notion paused this one." `last_action` mirrors what
+# the receiver returned (queued / already_queued / auth_failed / etc.) so a
+# spike of `auth_failed` shows up at a glance.
+_NOTION_AUTOMATION_LAST_SEEN: dict[str, dict[str, Any]] = {}
+
+
+def _record_notion_automation_hit(name: str, action: str) -> None:
+    """Best-effort record of a Notion-automation receiver call. Called from
+    every code path in the three receivers (success, skip, auth fail, bad
+    JSON) so the debug endpoint sees ALL the activity, not just the happy
+    path. Cheap — a dict update on the hot path, no I/O."""
+    from datetime import UTC, datetime
+
+    entry = _NOTION_AUTOMATION_LAST_SEEN.setdefault(
+        name, {"last_seen_utc": None, "last_action": None, "count": 0}
+    )
+    entry["last_seen_utc"] = datetime.now(UTC).isoformat()
+    entry["last_action"] = action
+    entry["count"] += 1
+
+
 @router.post("/notion")
 async def notion_webhook(request: Request) -> Response:
     """Notion "Sync to Gmail" button receiver.
@@ -601,18 +631,25 @@ async def notion_oppgave_done(request: Request) -> Response:
 
 
 async def _notion_oppgave_done_impl(request: Request) -> Response:
+    # Always 200 — same rationale as _notion_project_status_impl (Notion
+    # auto-pauses webhook automations on any non-2xx, single failure can
+    # trip it, no retry layer). Auth + JSON failures are logged loud here
+    # but never surface to Notion as errors.
     if not _verify_bearer(request.headers.get("Authorization")):
         logger.warning(
             "Notion oppgave-done auth failed (NOTION_WEBHOOK_SECRET set: %s)",
             bool(settings.notion_webhook_secret),
         )
-        raise HTTPException(401, "Bad or missing bearer token")
+        _record_notion_automation_hit("oppgave-done", "auth_failed")
+        return _json({"action": "skipped", "reason": "auth failed"})
 
     raw_body = await request.body()
     try:
         payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid JSON body") from None
+        logger.warning("oppgave-done: invalid JSON body")
+        _record_notion_automation_hit("oppgave-done", "invalid_json")
+        return _json({"action": "skipped", "reason": "invalid JSON"})
 
     # Notion automation payload puts the page object under `data` (not
     # `data.id` like buttons — same outer shape, different content).
@@ -624,6 +661,7 @@ async def _notion_oppgave_done_impl(request: Request) -> Response:
 
     if not page_id:
         logger.warning("oppgave-done: no page id in payload")
+        _record_notion_automation_hit("oppgave-done", "no_page_id")
         return _json({"action": "skipped", "reason": "no page id"})
 
     # Defense: confirm the row really is in the Korreksjoner DB (the
@@ -636,6 +674,7 @@ async def _notion_oppgave_done_impl(request: Request) -> Response:
             page_id,
             parent,
         )
+        _record_notion_automation_hit("oppgave-done", "wrong_parent_db")
         return _json({"action": "skipped", "reason": "wrong parent DB"})
 
     inserted = await enqueue_oppgave_done_sync(page_id)
@@ -644,6 +683,9 @@ async def _notion_oppgave_done_impl(request: Request) -> Response:
         "📥 enqueued oppgave_done_sync for %s (inserted=%d)",
         page_id,
         inserted,
+    )
+    _record_notion_automation_hit(
+        "oppgave-done", "enqueued" if inserted else "already_queued"
     )
     return _json(
         {
@@ -673,18 +715,22 @@ async def notion_oppgave_status(request: Request) -> Response:
 
 
 async def _notion_oppgave_status_impl(request: Request) -> Response:
+    # Always 200 — see _notion_project_status_impl rationale.
     if not _verify_bearer(request.headers.get("Authorization")):
         logger.warning(
             "Notion oppgave-status auth failed (NOTION_WEBHOOK_SECRET set: %s)",
             bool(settings.notion_webhook_secret),
         )
-        raise HTTPException(401, "Bad or missing bearer token")
+        _record_notion_automation_hit("oppgave-status", "auth_failed")
+        return _json({"action": "skipped", "reason": "auth failed"})
 
     raw_body = await request.body()
     try:
         payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid JSON body") from None
+        logger.warning("oppgave-status: invalid JSON body")
+        _record_notion_automation_hit("oppgave-status", "invalid_json")
+        return _json({"action": "skipped", "reason": "invalid JSON"})
 
     data = payload.get("data") or {}
     page_id = data.get("id")
@@ -694,6 +740,7 @@ async def _notion_oppgave_status_impl(request: Request) -> Response:
 
     if not page_id:
         logger.warning("oppgave-status: no page id in payload")
+        _record_notion_automation_hit("oppgave-status", "no_page_id")
         return _json({"action": "skipped", "reason": "no page id"})
 
     # Defense: confirm the row really is in the Oppgaver DB (the
@@ -706,6 +753,7 @@ async def _notion_oppgave_status_impl(request: Request) -> Response:
             page_id,
             parent,
         )
+        _record_notion_automation_hit("oppgave-status", "wrong_parent_db")
         return _json({"action": "skipped", "reason": "wrong parent DB"})
 
     inserted = await enqueue_frame_file_status_sync(page_id, source="notion")
@@ -714,6 +762,9 @@ async def _notion_oppgave_status_impl(request: Request) -> Response:
         "📥 enqueued frame_file_status_sync for %s (source=notion, inserted=%d)",
         page_id,
         inserted,
+    )
+    _record_notion_automation_hit(
+        "oppgave-status", "enqueued" if inserted else "already_queued"
     )
     return _json(
         {
@@ -759,23 +810,38 @@ async def notion_project_status(request: Request) -> Response:
 
 
 async def _notion_project_status_impl(request: Request) -> Response:
+    # IMPORTANT: every code path below MUST return 200, regardless of whether
+    # we did real work, skipped, or rejected the call. Notion's "Send webhook"
+    # action auto-pauses automations whose receiver responds with any non-2xx
+    # — the threshold is undocumented (see research notes in plan file
+    # `stabilise-notion-status-change-automation-against-auto-pause`), there
+    # is no retry layer, and a *single* failure can flip the pause indicator.
+    # Auth failure and bad JSON stay loud in OUR logs so a real misconfig is
+    # debuggable; Notion just sees a 200 with a reason in the body and keeps
+    # firing the automation. Visibility for the operator: GET
+    # /debug/notion-automation-health shows last_seen + last_action so a
+    # sustained auth_failed spike is one curl away.
     if not _verify_bearer(request.headers.get("Authorization")):
         logger.warning(
             "Notion project-status auth failed (NOTION_WEBHOOK_SECRET set: %s)",
             bool(settings.notion_webhook_secret),
         )
-        raise HTTPException(401, "Bad or missing bearer token")
+        _record_notion_automation_hit("project-status", "auth_failed")
+        return _json({"action": "skipped", "reason": "auth failed"})
 
     raw_body = await request.body()
     try:
         payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid JSON body") from None
+        logger.warning("project-status: invalid JSON body")
+        _record_notion_automation_hit("project-status", "invalid_json")
+        return _json({"action": "skipped", "reason": "invalid JSON"})
 
     data = payload.get("data") or {}
     page_id = (data.get("id") or "").strip()
     if not page_id:
         logger.warning("project-status: no page id in payload")
+        _record_notion_automation_hit("project-status", "no_page_id")
         return _json({"action": "skipped", "reason": "no page id"})
 
     # Defense: confirm the row really is in the Projects DB. The automation
@@ -792,6 +858,7 @@ async def _notion_project_status_impl(request: Request) -> Response:
             page_id,
             parent,
         )
+        _record_notion_automation_hit("project-status", "wrong_parent_db")
         return _json(
             {
                 "page_id": page_id,
@@ -802,16 +869,18 @@ async def _notion_project_status_impl(request: Request) -> Response:
 
     inserted = await enqueue_project_status_dispatch(page_id)
     queue_worker.wake()
+    action = "queued" if inserted else "already_queued"
     logger.info(
         "📥 project-status dispatch %s for %s",
         "enqueued" if inserted else "already_queued",
         page_id,
     )
+    _record_notion_automation_hit("project-status", action)
     return _json(
         {
             "page_id": page_id,
             "kind": "project_status_dispatch",
-            "action": "queued" if inserted else "already_queued",
+            "action": action,
         }
     )
 
