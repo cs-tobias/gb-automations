@@ -37,6 +37,7 @@ from gb_automations.sync.queue import (
 from gb_automations.sync.sync_frame import sync_frame_leveranse, sync_frame_project
 from gb_automations.sync.sync_frame_comments import sync_frame_comment
 from gb_automations.sync.sync_frame_file_status import sync_frame_file_status
+from gb_automations.sync.sync_frame_project_status import sync_frame_project_status
 from gb_automations.sync.sync_frame_version import sync_frame_version
 from gb_automations.sync.sync_labels import sync_project_labels
 from gb_automations.sync.sync_leveranse_status import recheck_leveranse_status
@@ -372,6 +373,61 @@ async def _process_frame_project_sync(claimed: _Claimed, progress: str) -> None:
     )
     await queue_mirror.refresh_project_dot(
         project_page_id, progress=progress, subject="Frame.io folder"
+    )
+
+
+async def _process_frame_project_status_sync(
+    claimed: _Claimed, progress: str
+) -> None:
+    """Run a frame_project_status_sync task: propagate the Notion Project's
+    current `Status` to the linked Frame project's V4 `status` field
+    (active ↔ inactive). Lights the same Projects-DB dot label_sync uses
+    so a Frame failure surfaces in the same place.
+
+    Separate from frame_project_sync: that task provisions the folder
+    tree + V00 placeholders, this one only flips the lifecycle flag. A
+    project whose Frame entity isn't yet provisioned (no
+    FrameProjectFolder row) is a clean skip — the engine no-ops.
+    """
+    project_page_id = claimed.project_page_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — syncing Frame project active/inactive for %s%s",
+        progress,
+        project_page_id,
+        retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Frame.io status"
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError(
+                "frame_project_status_sync task has no project_page_id"
+            )
+        result = await sync_frame_project_status(project_page_id)
+        if result.action == "failed":
+            outcome_error = result.note or "frame project status sync failed"
+    except Exception as err:
+        log_api_error(
+            logger,
+            f"frame project status sync crashed for {project_page_id}",
+            err,
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(project_page_id),
+    )
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Frame.io status"
     )
 
 
@@ -818,6 +874,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "frame_project_sync":
         await _process_frame_project_sync(claimed, progress)
+        return
+    if claimed.task_type == "frame_project_status_sync":
+        await _process_frame_project_status_sync(claimed, progress)
         return
     if claimed.task_type == "toggl_project_sync":
         await _process_toggl_project_sync(claimed, progress)

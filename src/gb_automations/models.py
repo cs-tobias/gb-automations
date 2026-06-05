@@ -724,7 +724,8 @@ class SyncTask(Base):
             "task_type IN ('thread','label_sync','nas_folder_sync',"
             "'task_folder_sync','frame_project_sync','frame_leveranse_sync',"
             "'frame_comment_sync','frame_version_sync',"
-            "'frame_file_status_sync','oppgave_done_sync',"
+            "'frame_file_status_sync','frame_project_status_sync',"
+            "'oppgave_done_sync',"
             "'leveranse_status_recheck','toggl_project_sync',"
             "'toggl_hours_sync')",
             name="ck_sync_tasks_task_type",
@@ -777,6 +778,21 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'frame_project_sync'"
+            ),
+        ),
+        # At most one ACTIVE frame_project_status_sync per project. A Notion
+        # `Status` flip from Ferdig → Tapt (or vice versa, or toggling out
+        # and back in) within the engine's run window would otherwise enqueue
+        # multiple tasks for the same project; the engine reads the live
+        # Notion status at process time, so collapsing same-id is correct.
+        # Independent of frame_project_sync — provisioning (folder + V00) and
+        # active/inactive lifecycle can both be in-flight for one project.
+        Index(
+            "uq_sync_tasks_active_frame_project_status",
+            "project_page_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'frame_project_status_sync'"
             ),
         ),
         # At most one ACTIVE frame_leveranse_sync per Leveranse (renamed

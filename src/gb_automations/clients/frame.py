@@ -367,6 +367,48 @@ async def rename_project(project_id: str, new_name: str) -> dict[str, Any]:
         return project
 
 
+async def set_project_status(
+    project_id: str, status: str
+) -> dict[str, Any]:
+    """Set the Frame.io project's lifecycle status to "active" or "inactive".
+
+    V4 endpoint: PATCH /v4/accounts/{aid}/projects/{pid} with body
+    `{"data": {"status": "active"|"inactive"}}`. The Update Project endpoint
+    accepts `name`, `restricted`, and `status` — same path as rename_project,
+    just a different body field. Reversible: a previously-inactivated project
+    flips back with `status="active"` and stays fully editable while
+    inactive (Frame's "Managing Active and Inactive Projects" replaces the
+    legacy "archive" feature in V4). Returns the updated project object so
+    the caller can log the resulting state.
+
+    Loop-prevention: the caller (`sync_frame_project_status`) reads Frame's
+    current status first and skips the PATCH when it already matches —
+    mirrors the `set_comment_completed` / Notion `set_oppgave_status`
+    pattern.
+    """
+    if status not in {"active", "inactive"}:
+        raise ValueError(
+            f"set_project_status: invalid status {status!r} "
+            "(expected 'active' or 'inactive')"
+        )
+    token = await frame_auth.get_access_token()
+    body = {"data": {"status": status}}
+    async with await _client(access_token=token) as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/accounts/{_account_id()}/projects/{project_id}",
+                json=body,
+            ),
+            op_name=f"set_project_status({status})",
+        )
+        _raise_for_status(response)
+        project = _unwrap(response.json())
+        logger.info(
+            "frame project %s status → %r", project_id, project.get("status")
+        )
+        return project
+
+
 # ============================================================
 # Writes — folder / file CRUD used by sync_frame
 # ============================================================

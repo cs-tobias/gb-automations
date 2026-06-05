@@ -159,13 +159,29 @@ The receiver guards against this: when the title is still in `PROJECTS_PLACEHOLD
 
 The list lives in [src/gb_automations/config.py](../../src/gb_automations/config.py) under `PROJECTS_PLACEHOLDER_TITLES` — edit there if the template name changes.
 
-### 6c — Test it
+### 6c — Frame.io active/inactive on terminal statuses
+
+The same `Status`-edited automation also drives the project's **Frame.io active/inactive flag** (Frame V4 replaces the legacy "archive" with a `status: active | inactive` field on the project — fully reversible). Mapping lives in [src/gb_automations/config.py](../../src/gb_automations/config.py) `PROJECT_STATUS_INACTIVE_TRIGGERS`:
+
+| Notion Status | Frame.io project status |
+| --- | --- |
+| `Ferdig`, `Tapt` | `inactive` |
+| anything else (incl. empty / cleared) | `active` |
+
+This is independent of the provisioning fan-out — it fires on *every* status change, including the previously-no-op ones (`Klar til oppstart`, `Venter på avklaring`, `Lang pause`, `Ferdig`, `Tapt`). The engine reads Frame's current status first and skips the PATCH when it already matches (`/debug/queue` shows the task as `unchanged`). If the project has no Frame entity yet (no `FrameProjectFolder` cache row), the engine no-ops silently — the next Sync Frame button click or `I produksjon` status change provisions it fresh.
+
+**Reopening a finished project**: moving Status from `Ferdig`/`Tapt` to anything else automatically flips Frame back to `active`. No manual unarchive needed.
+
+**One-way only**: we never read Frame's status and write it back to Notion. Notion is the source of truth for project lifecycle.
+
+### 6d — Test it
 
 1. Duplicate the template row (title stays `000_Kunde_Prosjekt TEMPLATE`) and set Status = `Tilbudsfase`. Expect `docker compose logs -f api` to show `project-status: page <id> title '000_Kunde_Prosjekt TEMPLATE' is a placeholder — skipping auto-provision`. `/debug/queue` shows no new tasks.
-2. Rename the row to a real project name. Nothing should happen yet (no Name automation). Re-touch Status (toggle it off then back to `Tilbudsfase`). Expect `🏷  gmail-only sync requested for 'Real Name'` in the logs and a `label_sync` task on `/debug/queue` → Gmail label appears in seeded mailboxes.
-3. On a fresh project (already renamed), set Status directly to `I produksjon`. Expect (env flags permitting) four queue rows: `label_sync`, `nas_folder_sync`, `toggl_project_sync`, `frame_project_sync` + N `frame_leveranse_sync`. Each engine that's globally disabled is reported as `skipped` in the JSON response.
-4. Change Status to `Ferdig`. Expect `project-status: page <id> status='Ferdig' is not mapped to any engine — skipping`. No new queue rows.
-5. Edit any other property on a project row (e.g. the Frame.io URL, or rename the row). Expect zero webhook hits — the trigger is property-scoped to `Status`.
+2. Rename the row to a real project name. Nothing should happen yet (no Name automation). Re-touch Status (toggle it off then back to `Tilbudsfase`). Expect `🏷  gmail-only sync requested for 'Real Name'` in the logs and a `label_sync` task on `/debug/queue` → Gmail label appears in seeded mailboxes. A `frame_project_status_sync` task also lands (it'll no-op if there's no Frame project yet — log: `no FrameProjectFolder cache row`).
+3. On a fresh project (already renamed), set Status directly to `I produksjon`. Expect (env flags permitting) five queue rows: `label_sync`, `nas_folder_sync`, `toggl_project_sync`, `frame_project_sync` + N `frame_leveranse_sync`, **plus** `frame_project_status_sync`. Each engine that's globally disabled is reported as `skipped` in the JSON response.
+4. Change Status to `Ferdig`. The provisioning fan-out is empty (`engines: []` in the response), but `frame_project_status_sync` is queued and the engine flips the Frame project to `inactive`. Confirm in the Frame UI: the project shows as Inactive.
+5. Change Status back to `I produksjon`. Provisioning re-fires (idempotent — no-ops on already-provisioned systems), and the Frame project flips back to `active`. No manual unarchive needed.
+6. Edit any other property on a project row (e.g. the Frame.io URL, or rename the row). Expect zero webhook hits — the trigger is property-scoped to `Status`.
 
 ---
 

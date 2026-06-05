@@ -45,6 +45,9 @@ _ACTIVE_TASK_FOLDER_PREDICATE = text(
 _ACTIVE_FRAME_PROJECT_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_project_sync'"
 )
+_ACTIVE_FRAME_PROJECT_STATUS_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'frame_project_status_sync'"
+)
 _ACTIVE_FRAME_LEVERANSE_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_leveranse_sync'"
 )
@@ -227,6 +230,45 @@ async def enqueue_frame_project_sync(project_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["project_page_id"],
             index_where=_ACTIVE_FRAME_PROJECT_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_frame_project_status_sync(project_page_id: str) -> int:
+    """Enqueue a Frame.io project active/inactive flip for a Notion Project page.
+
+    Mirrors enqueue_frame_project_sync (same dedup column, same placeholder
+    columns). project_page_id is the dedup key
+    (uq_sync_tasks_active_frame_project_status); the engine reads live Notion
+    Status at process time, so collapsing same-id bursts (Ferdig → Tapt →
+    Ferdig within the engine's window) to a single task is correct — the
+    last-flipped state is what gets written to Frame. Returns 1 if newly
+    enqueued, 0 if a duplicate was already active.
+
+    Independent of frame_project_sync — provisioning the Frame entity and
+    flipping its active/inactive flag are separate task types so they
+    don't share a queue row, and a status-flip on a project whose Frame
+    entity is still being provisioned will simply find no FrameProjectFolder
+    row and skip (the engine no-ops on unprovisioned projects).
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="frame_project_status_sync",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id"],
+            index_where=_ACTIVE_FRAME_PROJECT_STATUS_PREDICATE,
         )
     )
     async with SessionLocal() as own:
@@ -767,6 +809,7 @@ __all__ = [
     "enqueue_label_sync",
     "enqueue_task_folder_sync",
     "enqueue_frame_project_sync",
+    "enqueue_frame_project_status_sync",
     "enqueue_frame_leveranse_sync",
     "enqueue_frame_comment_sync",
     "enqueue_frame_version_sync",

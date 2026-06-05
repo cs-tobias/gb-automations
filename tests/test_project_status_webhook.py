@@ -126,6 +126,7 @@ def captured_enqueues(monkeypatch):
         "nas_folder_sync": [],
         "toggl_project_sync": [],
         "frame_project_sync": [],
+        "frame_project_status_sync": [],
         "frame_deliverable_fanout": [],
         "wake": [],
     }
@@ -146,6 +147,10 @@ def captured_enqueues(monkeypatch):
         calls["frame_project_sync"].append(page_id)
         return 1
 
+    async def fake_frame_project_status(page_id: str) -> int:
+        calls["frame_project_status_sync"].append(page_id)
+        return 1
+
     async def fake_fanout(page_id: str) -> tuple[int, int]:
         calls["frame_deliverable_fanout"].append(page_id)
         return (2, 3)
@@ -157,6 +162,11 @@ def captured_enqueues(monkeypatch):
     monkeypatch.setattr(webhooks, "enqueue_nas_folder_sync", fake_nas)
     monkeypatch.setattr(webhooks, "enqueue_toggl_project_sync", fake_toggl)
     monkeypatch.setattr(webhooks, "enqueue_frame_project_sync", fake_frame_project)
+    monkeypatch.setattr(
+        webhooks,
+        "enqueue_frame_project_status_sync",
+        fake_frame_project_status,
+    )
     monkeypatch.setattr(
         webhooks,
         "_enqueue_frame_deliverables_for_project",
@@ -299,11 +309,15 @@ def test_tilbudsfase_fires_only_gmail(captured_enqueues, monkeypatch):
     assert "nas" not in body["results"]
     assert "frame" not in body["results"]
     assert "toggl" not in body["results"]
+    # frame_status fires on EVERY status edit (re-activates a previously
+    # inactivated Frame project when the team moves out of Ferdig/Tapt).
+    assert body["results"]["frame_status"]["action"] == "queued"
 
     assert captured_enqueues["label_sync"] == ["proj-1"]
     assert captured_enqueues["nas_folder_sync"] == []
     assert captured_enqueues["frame_project_sync"] == []
     assert captured_enqueues["toggl_project_sync"] == []
+    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
     assert captured_enqueues["wake"] == [True]
 
 
@@ -322,6 +336,8 @@ def test_tilbud_godkjent_fires_gmail_and_nas(captured_enqueues, monkeypatch):
     assert captured_enqueues["nas_folder_sync"] == ["proj-1"]
     assert captured_enqueues["frame_project_sync"] == []
     assert captured_enqueues["toggl_project_sync"] == []
+    # frame_status still fires — independent of provisioning fan-out.
+    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
 
 
 def test_i_produksjon_fires_all_four(captured_enqueues, monkeypatch):
@@ -343,12 +359,18 @@ def test_i_produksjon_fires_all_four(captured_enqueues, monkeypatch):
     assert captured_enqueues["frame_deliverable_fanout"] == ["proj-1"]
     assert body["results"]["frame"]["leveranser_queued"] == 2
     assert body["results"]["frame"]["leveranser_total"] == 3
+    # frame_status lane fires alongside provisioning (a project entering
+    # I produksjon should be active in Frame — re-activating a previously
+    # inactivated row is a real case if the team toggles Ferdig → I produksjon).
+    assert body["results"]["frame_status"]["action"] == "queued"
+    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
 
 
-def test_unmapped_status_skips(captured_enqueues, monkeypatch):
-    # Ferdig / Tapt / Lang pause / Klar til oppstart / Venter på avklaring are
-    # explicit no-ops today — recognized, but no engine in the auto-provision
-    # map.
+def test_ferdig_fires_only_frame_status(captured_enqueues, monkeypatch):
+    # Ferdig has no provisioning engines (nothing to mint at end-of-life), but
+    # MUST still enqueue the frame project status sync so the Frame entity
+    # gets flipped to `inactive`. Pin both: no provisioning fired AND the
+    # frame_status lane DID fire.
     page = _page(status=PROJECT_STATUS_FERDIG)
     _patch_get_page(monkeypatch, page)
 
@@ -358,13 +380,24 @@ def test_unmapped_status_skips(captured_enqueues, monkeypatch):
     response = asyncio.run(webhooks._notion_project_status_impl(req))
     body = _response_json(response)
 
-    assert body["action"] == "skipped"
-    assert body["reason"] == "status not mapped"
+    assert body["engines"] == []
     assert body["status"] == PROJECT_STATUS_FERDIG
-    assert all(not v for k, v in captured_enqueues.items())
+    assert body["results"]["frame_status"]["action"] == "queued"
+    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
+    # No provisioning fan-out at Ferdig.
+    assert captured_enqueues["label_sync"] == []
+    assert captured_enqueues["nas_folder_sync"] == []
+    assert captured_enqueues["frame_project_sync"] == []
+    assert captured_enqueues["toggl_project_sync"] == []
+    # wake() called once even with no provisioning, so the worker picks up
+    # the frame_status task right away.
+    assert captured_enqueues["wake"] == [True]
 
 
-def test_empty_status_skips(captured_enqueues, monkeypatch):
+def test_empty_status_fires_frame_status_only(captured_enqueues, monkeypatch):
+    # Status cleared / empty — engine fan-out has nothing to do, but the
+    # frame_status engine still runs so a previously-inactivated Frame
+    # project gets re-activated when the user clears Status to "reopen".
     page = _page(status=None)
     _patch_get_page(monkeypatch, page)
 
@@ -374,9 +407,10 @@ def test_empty_status_skips(captured_enqueues, monkeypatch):
     response = asyncio.run(webhooks._notion_project_status_impl(req))
     body = _response_json(response)
 
-    assert body["action"] == "skipped"
-    assert body["reason"] == "status not mapped"
+    assert body["engines"] == []
     assert body["status"] is None
+    assert body["results"]["frame_status"]["action"] == "queued"
+    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +441,15 @@ def test_disabled_env_flags_skip_per_engine_but_still_run_enabled(
     assert body["results"]["nas"]["action"] == "skipped"
     assert body["results"]["frame"]["action"] == "skipped"
     assert body["results"]["toggl"]["action"] == "skipped"
+    # SYNC_FRAME=false also skips the active/inactive lane.
+    assert body["results"]["frame_status"]["action"] == "skipped"
+    assert body["results"]["frame_status"]["reason"] == "SYNC_FRAME=false"
     # Only the gmail enqueue actually ran.
     assert captured_enqueues["label_sync"] == ["proj-1"]
     assert captured_enqueues["nas_folder_sync"] == []
     assert captured_enqueues["frame_project_sync"] == []
     assert captured_enqueues["frame_deliverable_fanout"] == []
+    assert captured_enqueues["frame_project_status_sync"] == []
     assert captured_enqueues["toggl_project_sync"] == []
 
 

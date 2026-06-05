@@ -691,6 +691,24 @@ PROJECT_STATUS_AUTO_PROVISION: dict[str, set[str]] = {
     PROJECT_STATUS_I_PRODUKSJON: {"gmail", "nas", "frame", "toggl"},
 }
 
+# Status options that deactivate the project's Frame.io entity. When a
+# project transitions INTO one of these, the project-status webhook also
+# enqueues a `frame_project_status_sync` task that PATCHes the Frame
+# project to `status="inactive"` (V4 endpoint: PATCH
+# /v4/accounts/{aid}/projects/{pid}). Every OTHER status (including
+# unmapped ones like `Klar til oppstart` / `Venter på avklaring` /
+# `Lang pause`) flips it back to `active` — so reopening a finished
+# project automatically un-inactivates its Frame entity.
+#
+# Notion-only: the reverse direction (Frame archived → Notion Status)
+# is NOT mirrored. Notion is the source of truth for project lifecycle
+# (see CLAUDE.md). Skipped silently when the project has no Frame entity
+# provisioned yet (no FrameProjectFolder row).
+PROJECT_STATUS_INACTIVE_TRIGGERS: frozenset[str] = frozenset({
+    PROJECT_STATUS_FERDIG,
+    PROJECT_STATUS_TAPT,
+})
+
 # Titles that mark a row as "not yet a real project" — auto-triggered
 # provisioning (the /notion/project-status webhook) skips while the row still
 # carries one of these. Goldbox creates new projects by duplicating a template

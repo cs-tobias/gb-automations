@@ -57,6 +57,7 @@ from gb_automations.sync.queue import (
     enqueue_frame_comment_sync,
     enqueue_frame_file_status_sync,
     enqueue_frame_leveranse_sync,
+    enqueue_frame_project_status_sync,
     enqueue_frame_project_sync,
     enqueue_frame_version_sync,
     enqueue_label_sync,
@@ -743,6 +744,15 @@ async def notion_project_status(request: Request) -> Response:
     re-running them on an already-provisioned project is safe — that's what
     makes the "jump straight to I produksjon" path correct.
 
+    Independent of the provisioning fan-out, EVERY status change also enqueues
+    a `frame_project_status_sync` task: the engine reads the live Notion
+    status and flips the Frame project's V4 status to `inactive`
+    (Ferdig/Tapt — see `PROJECT_STATUS_INACTIVE_TRIGGERS`) or `active`
+    (anything else, including reopening a finished project by clearing
+    Status). Skipped silently inside the engine when the project has no
+    FrameProjectFolder cache row yet (not provisioned in Frame). Notion-only
+    direction: we never mirror Frame's status back to Notion.
+
     Placeholder-title gate: when the row's title is still
     `000_Kunde_Prosjekt TEMPLATE` (or any other entry in
     PROJECTS_PLACEHOLDER_TITLES) we skip every engine, because auto-provisioning
@@ -835,27 +845,58 @@ async def _notion_project_status_impl(request: Request) -> Response:
         )
 
     status = notion_client.extract_project_status(page)
-    engines = PROJECT_STATUS_AUTO_PROVISION.get(status or "")
-    if not engines:
-        logger.info(
-            "project-status: page %s status=%r is not mapped to any engine — skipping",
-            page_id,
-            status,
-        )
-        return _json(
-            {
-                "page_id": page_id,
-                "title": title,
-                "status": status,
-                "action": "skipped",
-                "reason": "status not mapped",
-            }
-        )
+    engines = PROJECT_STATUS_AUTO_PROVISION.get(status or "") or set()
 
     # Per-engine outcomes for /debug/queue observability. Engines globally
     # disabled by env flags surface as `skipped` with a reason so a
     # misconfigured deploy fails visibly rather than going quiet.
     results: dict[str, dict[str, Any]] = {}
+
+    # Frame project active/inactive lane — fires on EVERY status change
+    # (including currently-unmapped statuses like Ferdig/Tapt that don't
+    # provision anything). The engine itself decides active vs inactive
+    # based on the live Notion status. Independent of the provisioning
+    # fan-out below: a project at Ferdig has no `engines` to provision but
+    # still needs its Frame entity flipped to inactive; a project being
+    # reopened (Status cleared or moved back) needs the reverse. Skipped
+    # silently inside the engine when there is no FrameProjectFolder cache
+    # row (project not yet provisioned in Frame).
+    if settings.sync_frame:
+        inserted = await enqueue_frame_project_status_sync(page_id)
+        results["frame_status"] = {
+            "action": "queued" if inserted else "already_queued",
+        }
+    else:
+        results["frame_status"] = {
+            "action": "skipped",
+            "reason": "SYNC_FRAME=false",
+        }
+
+    if not engines:
+        # The provisioning fan-out has nothing to do (Klar til oppstart /
+        # Venter på avklaring / Lang pause / Ferdig / Tapt — none of these
+        # mint new systems). The Frame status lane above may still have
+        # enqueued work. Surface this as a normal response with empty
+        # `engines`, not the old `action: skipped` blanket reject — the
+        # frame_status entry is the load-bearing observability for
+        # Ferdig/Tapt now.
+        logger.info(
+            "project-status: page %s status=%r has no provisioning engines "
+            "mapped; frame_status=%s",
+            page_id,
+            status,
+            results.get("frame_status", {}).get("action"),
+        )
+        queue_worker.wake()
+        return _json(
+            {
+                "page_id": page_id,
+                "title": title,
+                "status": status,
+                "engines": [],
+                "results": results,
+            }
+        )
 
     if "gmail" in engines:
         if settings.sync_gmail_labels:
