@@ -14,11 +14,12 @@ services:
       - "8000:8000"
     volumes:
       - ./secrets:/app/secrets:ro
-      # Office NAS (the shared W: drive). The host must mount the share at
-      # NAS_HOST_PATH first; the container sees it at /mnt/nas, and
-      # NAS_PROJECTS_ROOT in .env points inside it (e.g. /mnt/nas/Prosjekt).
-      # Defaults to a throwaway dir so a fresh clone without a NAS still boots.
-      - ${NAS_HOST_PATH:-./.nas-stub}:/mnt/nas:rw
+      # Office NAS (the shared W: drive). Mounted as a CIFS volume managed by
+      # Docker itself — see the `nas` volume definition below. This works on
+      # both Linux hosts and Windows Docker Desktop with the WSL2 backend
+      # (where binding a Windows-mapped drive letter or UNC path does NOT
+      # work — see docs/misc/gotchas.md §15).
+      - nas:/mnt/nas:rw
     depends_on:
       db:
         condition: service_healthy
@@ -56,3 +57,30 @@ services:
 
 volumes:
   db_data:
+  # Office NAS, mounted by Docker as a CIFS volume. The api container sees
+  # this at /mnt/nas (see the bind above). Docker mounts named volumes
+  # lazily — the CIFS mount only happens when a container starts using the
+  # volume, so a misconfigured share causes the api container to fail to
+  # start with a mount error (the green-log-line check in main.py never
+  # gets reached). nas_available() in clients/nas.py is the runtime check
+  # for an already-mounted-but-unwritable share.
+  #
+  # NAS_CIFS_DEVICE — UNC path with forward slashes, no smb:// prefix, e.g.
+  #   //192.168.1.200/filserver/gb-automations-test
+  # NAS_USER / NAS_PASS — credentials for the share.
+  # uid=999,gid=999 matches the container's `app` user (see Dockerfile) so
+  # writes don't hit the classic CIFS uid-mismatch failure (gotchas §15).
+  # vers=3.0 is the modern SMB dialect; drop to 2.0 if the NAS only speaks
+  # SMB2. On Windows Docker Desktop WSL2 backend, the docker-desktop distro
+  # needs cifs-utils installed once (see docs/misc/nas-setup.md).
+  #
+  # No-NAS dev: set NAS_CIFS_DEVICE to a local path you control, e.g.
+  #   NAS_CIFS_DEVICE=//host.docker.internal/ShareName
+  # or comment out the `- nas:/mnt/nas:rw` line in `api.volumes` above (the
+  # app boots without it; only the NAS sync step degrades to nas:failed).
+  nas:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${NAS_USER:-},password=${NAS_PASS:-},uid=999,gid=999,file_mode=0664,dir_mode=0775,vers=3.0"
+      device: "${NAS_CIFS_DEVICE:-}"

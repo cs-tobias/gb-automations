@@ -17,37 +17,62 @@ mounted directory; there is no SMB client, VPN, or remote protocol in the code.
 
 ## One-time setup on the office host
 
-1. **Mount the share** so the container's user can write to it.
-   - Windows Docker Desktop host: ensure the mapped `W:` drive (or its UNC path)
-     is shared with Docker Desktop (Settings → Resources → File sharing) and set
-     `NAS_HOST_PATH` to the host path Docker can see.
-   - Linux host (CIFS): mount with options that match the container user, e.g.
-     ```bash
-     mount -t cifs //srvr-2/Prosjekt /mnt/nas/Prosjekt \
-       -o username=...,password=...,uid=<container-uid>,gid=<container-gid>,file_mode=0664,dir_mode=0775
-     ```
-     See [gotchas.md #15](gotchas.md) — the uid/gid mismatch is the classic
-     failure where the host can write but the container can't.
+Docker mounts the share itself as a CIFS volume — there is **no Windows-side
+drive-letter mapping involved**. This sidesteps the WSL2-backend limitation
+where bind-mounting a `W:` drive (or even a UNC path) into a container
+silently lands an empty directory (see [gotchas.md §15](gotchas.md)).
+
+1. **On Windows Docker Desktop (WSL2 backend): install `cifs-utils` in the
+   `docker-desktop` distro.** One-time, from PowerShell:
+   ```powershell
+   wsl -d docker-desktop apk add cifs-utils
+   ```
+   May need to be re-run after a Docker Desktop major upgrade (the distro is
+   sometimes wiped). Linux hosts already have it via the host kernel; skip
+   this step.
 
 2. **Set `.env`:**
    ```
    SYNC_NAS_FOLDERS=true
-   NAS_HOST_PATH=<host path to the mounted share root>   # bound into the container at /mnt/nas
-   NAS_PROJECTS_ROOT=/mnt/nas/Prosjekt                   # the Prosjekt root inside that mount
-   # NAS_RECEIVED_SUBFOLDER=Mottatt                      # default; override only if Goldbox renames it
+   NAS_CIFS_DEVICE=//192.168.1.200/filserver/gb-automations-test   # FORWARD slashes; the subfolder is the test root
+   NAS_USER=petter
+   NAS_PASS=<password for that share>
+   NAS_PROJECTS_ROOT=/mnt/nas/Prosjekt                              # the Prosjekt root inside the share
+   NAS_HOST_PATH=W:\gb-automations-test                             # Windows display path for Notion writeback (cosmetic)
+   # NAS_RECEIVED_SUBFOLDER=Mottatt                                 # default; override only if Goldbox renames it
    ```
-   `docker-compose.yml` binds `${NAS_HOST_PATH}:/mnt/nas` on the `api` service.
+   `docker-compose.yml` declares the `nas` volume with these credentials and
+   mounts it at `/mnt/nas` on the `api` service. `NAS_HOST_PATH` is purely
+   the display path written into the Projects-DB NAS URL column — it's never
+   used as a mount source.
 
-3. **Reload and verify the green light:**
-   ```bash
-   docker compose up -d --force-recreate api
-   docker compose logs api | grep NAS
+   For live (after the test sub-folder is validated), switch to:
    ```
-   Expect: `NAS project root '/mnt/nas/Prosjekt' is mounted and writable`. If you
-   instead see the "is not a writable directory" warning, the mount or uid is
-   wrong — fix it before clicking any project button (see gotchas #15). A
-   misconfigured NAS never blocks the Gmail-label step; it just reports
-   `nas:failed` on each click.
+   NAS_CIFS_DEVICE=//192.168.1.200/filserver
+   NAS_HOST_PATH=W:
+   # NAS_PROJECTS_ROOT stays /mnt/nas/Prosjekt
+   ```
+
+3. **Recreate the volume and the api container** (a `restart` alone won't
+   re-mount the CIFS volume with the new options — Docker remembers the old
+   options until the volume is removed):
+   ```powershell
+   docker compose down
+   docker volume rm gb-automations_nas    # name = <project>_<volume>; check with `docker volume ls`
+   docker compose up -d
+   docker compose logs api | Select-String NAS
+   ```
+   Expect: `NAS project root '/mnt/nas/Prosjekt' is mounted and writable`. If
+   you instead see the "is not a writable directory" warning, the mount or
+   uid is wrong — fix it before clicking any project button (see
+   [gotchas.md §15](gotchas.md)). A misconfigured NAS never blocks the
+   Gmail-label step; it just reports `nas:failed` on each click.
+
+   If the api container fails to **start** (not just warns) with a `mount
+   error(13)` / `mount error(2)` / `Permission denied`, the CIFS mount
+   itself is failing — bad credentials, wrong device path, wrong SMB
+   version, or `cifs-utils` not installed in the docker-desktop distro
+   (step 1). Check `docker compose logs api` for the mount error.
 
 ## Toggling targets while building
 

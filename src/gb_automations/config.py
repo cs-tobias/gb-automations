@@ -188,14 +188,15 @@ class Settings(BaseSettings):
     sync_gmail_labels: bool = True
     sync_nas_folders: bool = False
 
-    # Office NAS (the shared `W:` drive). The Docker host is an office
-    # workstation on the same LAN as the NAS, so the share is mounted into the
-    # container and these are plain filesystem paths — no SMB client needed.
-    # nas_host_path: the Windows-side path of the share root, e.g.
-    #   "X:\gb-nas-test" or "W:". docker-compose.yml binds this to /mnt/nas
-    #   inside the container; we also read it here so the NAS sync can write
-    #   a Windows-style path back to the Projects-DB "NAS" URL column (so the
-    #   team can click and open it in File Explorer). Empty → no Notion
+    # Office NAS (the shared `W:` drive). Docker mounts the share itself as
+    # a CIFS volume (see docker-compose.yml `nas` volume + NAS_CIFS_DEVICE /
+    # NAS_USER / NAS_PASS env vars) — this works uniformly on Linux hosts
+    # and Windows Docker Desktop with the WSL2 backend, where binding a
+    # Windows-mapped drive letter or UNC path does NOT work (gotchas §15).
+    # nas_host_path: the Windows-facing display path written back into the
+    #   Projects-DB "NAS" URL column so the team can click and open the
+    #   folder in File Explorer (e.g. "W:\Prosjekt" or "W:\gb-automations-test").
+    #   COSMETIC ONLY — it is NOT used to mount the share. Empty → no Notion
     #   writeback (the folder still gets created, the URL column stays blank).
     # nas_projects_root: mounted root inside the container, e.g.
     #   "/mnt/nas/Prosjekt". The NAS step is inert unless this is set AND

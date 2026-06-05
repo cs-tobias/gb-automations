@@ -62,10 +62,11 @@ def _to_display_path(target: Path) -> str | None:
     """Convert the container-visible NAS path to the team-visible Windows path.
 
     Example: /mnt/nas/Prosjekt/2026/1300_X → X:\\gb-nas-test\\Prosjekt\\2026\\1300_X
-    when NAS_HOST_PATH is "X:\\gb-nas-test". The relationship comes from the
-    docker-compose bind ${NAS_HOST_PATH}:/mnt/nas — the segment after /mnt/nas
-    in the container IS the segment after NAS_HOST_PATH on Windows, so we just
-    re-root and switch separators.
+    when NAS_HOST_PATH is "X:\\gb-nas-test". The container mounts the share
+    via Docker's CIFS volume (NAS_CIFS_DEVICE), so /mnt/nas inside the
+    container is the share root; NAS_HOST_PATH is the team's Windows-side
+    name for the same root, set by convention to match what Explorer shows.
+    Keep them in sync (e.g. NAS_CIFS_DEVICE=//srvr/share/X and NAS_HOST_PATH=W:\X).
 
     Returns None when NAS_HOST_PATH isn't configured (writeback skipped) or
     when `target` doesn't sit inside the container mount (defensive —
