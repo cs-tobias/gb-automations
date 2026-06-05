@@ -123,6 +123,50 @@ Clicking it on a project row enqueues **every** thread under that project's Gmai
 3. `curl http://localhost:8000/debug/queue` shows the threads moving `pending → done`.
 4. Click again while it's running → already-queued threads are skipped (idempotent, no duplicates).
 
+## Part 6 — Status-driven auto-provisioning (Projects DB)
+
+The buttons in Parts 4–5 stay, but you can also wire up two **Notion automations** on the Projects DB so the right systems provision themselves as a project moves through its lifecycle — no clicking required.
+
+Mapping (cumulative — a later status fires every earlier-status engine, all four are idempotent so re-runs are no-ops on already-provisioned systems):
+
+| Status | Auto-provisions |
+| --- | --- |
+| `Tilbudsfase` | Gmail labels |
+| `Tilbud godkjent` | Gmail + NAS folders |
+| `I produksjon` | Gmail + NAS + Frame.io + Toggl |
+| `Klar til oppstart`, `Venter på avklaring`, `Lang pause`, `Ferdig`, `Tapt` | No-op (recognized, do nothing) |
+
+Each engine respects its own env toggle (`SYNC_GMAIL_LABELS`, `SYNC_NAS_FOLDERS` + `NAS_PROJECTS_ROOT`, `SYNC_FRAME`, `SYNC_TOGGL`) — a globally-off engine surfaces as `skipped` in `/debug/queue` rather than silently no-op'ing.
+
+### 6a — Set up the automation
+
+1. Open the **Projects** database → top-right **🗲** (Automations) → **+ New automation**
+2. Name it `Auto-provision on Status change`
+3. **Trigger**: `Property edited` → choose `Status`
+   - This narrow trigger is what stops every other edit on a project row (Frame/NAS/Toggl URL writebacks, the `Sync` icon, `Sync progress`, **the title**, etc.) from firing this webhook. Edits inside the page body or in any embedded database also do not fire it.
+   - **Do NOT add a second automation on `Name`.** An earlier draft of this doc paired the Status automation with a Name-edited one (so a rename out of the template name would mint the Gmail label without re-touching Status). In practice Notion fires Name-edited multiple times per rename (autosave + per-pause coalescing), which storms the queue with redundant `label_sync` work. The intended workflow is: duplicate template → rename → set Status — the title is real by the time Status fires, so the Name automation is unnecessary.
+4. **Action**: `+ Add step` → **Send webhook**
+   - **URL**: `https://hub.{your-domain}/webhooks/notion/project-status`
+   - **Method**: `POST`
+   - **Headers**: `Authorization` → `Bearer <NOTION_WEBHOOK_SECRET>`, `Content-Type` → `application/json`
+   - **Body**: leave defaults — the receiver re-fetches the page to read live Status + title at processing time.
+
+### 6b — The placeholder-title gate
+
+Goldbox creates new projects by duplicating a template row literally named `000_Kunde_Prosjekt TEMPLATE`. If a user sets Status *before* renaming, the webhook would otherwise mint Gmail labels / NAS folders / Frame projects named `000_Kunde_Prosjekt TEMPLATE`, and two new template-named rows existing at the same time would collide on a single shared Gmail label.
+
+The receiver guards against this: when the title is still in `PROJECTS_PLACEHOLDER_TITLES` (currently just `000_Kunde_Prosjekt TEMPLATE`) the webhook skips every engine and logs a clear `skipped: placeholder title`. **Recovery path:** the user renames the row, then re-touches Status (e.g. change to a different value and back, or just re-select the same value). The next webhook fires against the real title.
+
+The list lives in [src/gb_automations/config.py](../../src/gb_automations/config.py) under `PROJECTS_PLACEHOLDER_TITLES` — edit there if the template name changes.
+
+### 6c — Test it
+
+1. Duplicate the template row (title stays `000_Kunde_Prosjekt TEMPLATE`) and set Status = `Tilbudsfase`. Expect `docker compose logs -f api` to show `project-status: page <id> title '000_Kunde_Prosjekt TEMPLATE' is a placeholder — skipping auto-provision`. `/debug/queue` shows no new tasks.
+2. Rename the row to a real project name. Nothing should happen yet (no Name automation). Re-touch Status (toggle it off then back to `Tilbudsfase`). Expect `🏷  gmail-only sync requested for 'Real Name'` in the logs and a `label_sync` task on `/debug/queue` → Gmail label appears in seeded mailboxes.
+3. On a fresh project (already renamed), set Status directly to `I produksjon`. Expect (env flags permitting) four queue rows: `label_sync`, `nas_folder_sync`, `toggl_project_sync`, `frame_project_sync` + N `frame_leveranse_sync`. Each engine that's globally disabled is reported as `skipped` in the JSON response.
+4. Change Status to `Ferdig`. Expect `project-status: page <id> status='Ferdig' is not mapped to any engine — skipping`. No new queue rows.
+5. Edit any other property on a project row (e.g. the Frame.io URL, or rename the row). Expect zero webhook hits — the trigger is property-scoped to `Status`.
+
 ---
 
 Notion is done.

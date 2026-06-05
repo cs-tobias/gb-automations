@@ -25,6 +25,7 @@ from gb_automations.config import (
     PROJECTS_FRAME_URL_PROP,
     PROJECTS_GMAIL_URL_PROP,
     PROJECTS_NAS_URL_PROP,
+    PROJECTS_STATUS_PROP,
     PROJECTS_SYNC_PROGRESS_PROP,
     PROJECTS_SYNC_PROP,
     PROJECTS_TOGGL_URL_PROP,
@@ -268,6 +269,34 @@ def extract_page_title(page: dict[str, Any]) -> str | None:
         if prop.get("type") == "title" and prop.get("title"):
             return "".join(t.get("plain_text", "") for t in prop["title"])
     return None
+
+
+def extract_project_status(page: dict[str, Any]) -> str | None:
+    """Read the Projects DB row's `Status` option name, or None when unset.
+
+    Reads BOTH `multi_select` and `select` (and Notion's newer `status` type).
+    Goldbox runs `Status` as a multi_select but only ever sets one option per
+    row — same pattern as `task_discipline` on Oppgaver. For multi_select we
+    return the first non-empty option name; if the row has no options or the
+    property is empty / unset, returns None.
+
+    Returns None defensively for every shape where the option name is
+    missing/empty so the caller can log a single "skipped: status not set"
+    branch instead of guarding three layers.
+    """
+    prop = (page.get("properties") or {}).get(PROJECTS_STATUS_PROP) or {}
+
+    multi = prop.get("multi_select")
+    if isinstance(multi, list) and multi:
+        for opt in multi:
+            name = (opt.get("name") or "").strip() if isinstance(opt, dict) else ""
+            if name:
+                return name
+        return None
+
+    sel = prop.get("select") or prop.get("status") or {}
+    name = sel.get("name") if isinstance(sel, dict) else None
+    return name or None
 
 
 def read_relation_ids(page: dict[str, Any], prop_name: str) -> list[str]:

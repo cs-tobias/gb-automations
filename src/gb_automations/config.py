@@ -659,6 +659,57 @@ STATUS_UTGAAR = "Utgår"
 # to move it out manually before the automation can write again.
 MANUAL_DELIVERABLE_STATUSES = frozenset({STATUS_TRENGER_AVKLARING, STATUS_UTGAAR})
 
+
+# Projects DB lifecycle Status select — separate from the Oppgaver Status
+# above (Oppgaver Status is per-deliverable; this one is per-project). Drives
+# auto-provisioning when a project's status changes in Notion: Tilbudsfase →
+# Gmail labels, Tilbud godkjent → NAS, I produksjon → Toggl + Frame. Cumulative
+# (a later status also fires every earlier-status engine — all four engines are
+# idempotent, so re-running them on an already-provisioned project is a no-op).
+# Names must match the option labels in Notion exactly.
+PROJECTS_STATUS_PROP = "Status"
+PROJECT_STATUS_TILBUDSFASE = "Tilbudsfase"
+PROJECT_STATUS_TILBUD_GODKJENT = "Tilbud godkjent"
+PROJECT_STATUS_KLAR_TIL_OPPSTART = "Klar til oppstart"
+PROJECT_STATUS_VENTER_AVKLARING = "Venter på avklaring"
+PROJECT_STATUS_I_PRODUKSJON = "I produksjon"
+PROJECT_STATUS_LANG_PAUSE = "Lang pause"
+PROJECT_STATUS_FERDIG = "Ferdig"
+PROJECT_STATUS_TAPT = "Tapt"
+
+# Status option name → which provisioning engines auto-fire. Cumulative by
+# design: I produksjon includes everything from the earlier stages so a project
+# that skips a stage still gets its earlier syncs (idempotent — re-runs are
+# no-ops for already-provisioned systems). Engines not in a stage's set are
+# left untouched. Statuses not in this map (Klar til oppstart / Venter på
+# avklaring / Lang pause / Ferdig / Tapt) are no-ops — recognized but explicitly
+# do nothing, so the team can later wire them up (e.g. an archive flow on
+# Ferdig) without changing the dispatch shape.
+PROJECT_STATUS_AUTO_PROVISION: dict[str, set[str]] = {
+    PROJECT_STATUS_TILBUDSFASE: {"gmail"},
+    PROJECT_STATUS_TILBUD_GODKJENT: {"gmail", "nas"},
+    PROJECT_STATUS_I_PRODUKSJON: {"gmail", "nas", "frame", "toggl"},
+}
+
+# Titles that mark a row as "not yet a real project" — auto-triggered
+# provisioning (the /notion/project-status webhook) skips while the row still
+# carries one of these. Goldbox creates new projects by duplicating a template
+# row literally named "000_Kunde_Prosjekt TEMPLATE"; auto-provisioning the
+# template name would mint garbage labels/folders, and two new placeholder
+# rows existing at the same time would collide on a single shared Gmail label
+# (label create-by-name is idempotent in Gmail, so both ProjectLabel rows
+# would write the same label_id — see sync_labels._create_label_for_all_users).
+# The companion Name-edited automation on the Projects DB fires
+# /notion/sync-gmail once the team renames the row, so users don't have to
+# re-touch Status to kick off provisioning after a rename.
+# Manual buttons (/notion/sync-gmail and friends) intentionally do NOT consult
+# this set — the team can still force-sync a placeholder name on purpose.
+# Matched exact, case-sensitive, post-strip. Add entries here if the template
+# row's name changes in Notion.
+PROJECTS_PLACEHOLDER_TITLES: frozenset[str] = frozenset({
+    "000_Kunde_Prosjekt TEMPLATE",
+})
+
 # The literal string we write to Frame.io's custom "Status" select field
 # when reflecting a Notion deliverable that's at Utgår. Matches the Notion
 # option name verbatim — the Frame workspace must have an option with the

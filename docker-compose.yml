@@ -19,7 +19,12 @@ services:
       # both Linux hosts and Windows Docker Desktop with the WSL2 backend
       # (where binding a Windows-mapped drive letter or UNC path does NOT
       # work — see docs/misc/gotchas.md §15).
-      - nas:/mnt/nas:rw
+      # Disabled on dev boxes without the NAS reachable: the volume requires
+      # NAS_CIFS_DEVICE/NAS_USER/NAS_PASS in .env (compose drops it with
+      # "missing device in volume options" otherwise). Re-enable on the
+      # office host where the share is reachable; pair with SYNC_NAS_FOLDERS
+      # in .env (the app code respects that flag independently).
+      # - nas:/mnt/nas:rw
     depends_on:
       db:
         condition: service_healthy
