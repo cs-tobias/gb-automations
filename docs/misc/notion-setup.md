@@ -149,7 +149,9 @@ Each engine respects its own env toggle (`SYNC_GMAIL_LABELS`, `SYNC_NAS_FOLDERS`
    - **URL**: `https://hub.{your-domain}/webhooks/notion/project-status`
    - **Method**: `POST`
    - **Headers**: `Authorization` → `Bearer <NOTION_WEBHOOK_SECRET>`, `Content-Type` → `application/json`
-   - **Body**: leave defaults — the receiver re-fetches the page to read live Status + title at processing time.
+   - **Body**: leave defaults — the receiver only reads the page id; the worker re-fetches the page at processing time.
+
+**Why this endpoint is a sub-50ms ack and not the actual provisioning work**: Notion auto-pauses webhook automations whose receiver responds too slowly (the timeout isn't published — community reports + [n8n issue #12257](https://github.com/n8n-io/n8n/issues/12257) indicate Notion's pause heuristic is over-eager and fires on slow 200s, not just 5xx). An earlier shape did 2 Notion API calls + 5 Postgres inserts inline before responding, which on Goldbox's prod workspace was tripping the pause. The receiver now does only bearer check + parent-DB check + a single insert that enqueues a `project_status_dispatch` task, then returns 200. The queue worker drains that task and does all the actual work (Notion fetch, placeholder gate, status read, fan-out to gmail/nas/toggl/frame + per-leveranse fan-out + active/inactive lane). If the automation pauses itself on you again, that points at network/TLS latency between Notion and your Cloudflare tunnel — not the app.
 
 ### 6b — The placeholder-title gate
 

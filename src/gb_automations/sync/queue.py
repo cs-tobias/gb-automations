@@ -48,6 +48,9 @@ _ACTIVE_FRAME_PROJECT_PREDICATE = text(
 _ACTIVE_FRAME_PROJECT_STATUS_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_project_status_sync'"
 )
+_ACTIVE_PROJECT_STATUS_DISPATCH_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'project_status_dispatch'"
+)
 _ACTIVE_FRAME_LEVERANSE_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_leveranse_sync'"
 )
@@ -269,6 +272,53 @@ async def enqueue_frame_project_status_sync(project_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["project_page_id"],
             index_where=_ACTIVE_FRAME_PROJECT_STATUS_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_project_status_dispatch(project_page_id: str) -> int:
+    """Enqueue the dispatcher for a Notion Projects-DB Status change.
+
+    The /webhooks/notion/project-status receiver does ONLY this enqueue +
+    the bearer check + parent-DB sanity check, so it returns to Notion in
+    well under a second. The dispatcher worker then does the slow work:
+    Notion get_page, placeholder-title check, status read, and fan-out to
+    every relevant per-engine task type (label_sync / nas_folder_sync /
+    frame_project_sync + deliverable fan-out / toggl_project_sync /
+    frame_project_status_sync).
+
+    Why this split exists: Notion auto-pauses webhook automations whose
+    receiver takes too long to respond (the timeout isn't published;
+    community reports + n8n issue #12257 indicate the pause heuristic is
+    over-eager and fires on slow 200s, not just 5xx). The earlier inline
+    shape did 2 Notion API calls + 5 Postgres inserts before responding,
+    which on Goldbox's prod workspace was tripping the pause. Returning
+    after a single insert keeps us safely under whatever the threshold is.
+
+    Same dedup pattern as the other project-scoped enqueues: rapid Status
+    flips (Ferdig → Tapt → Ferdig within seconds) collapse to one active
+    row. The dispatcher reads live Notion at process time, so the last-
+    flipped state is what gets propagated. Returns 1 if newly enqueued, 0
+    if a dispatch was already active for this project.
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="project_status_dispatch",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["project_page_id"],
+            index_where=_ACTIVE_PROJECT_STATUS_DISPATCH_PREDICATE,
         )
     )
     async with SessionLocal() as own:
@@ -811,6 +861,7 @@ __all__ = [
     "enqueue_frame_project_sync",
     "enqueue_frame_project_status_sync",
     "enqueue_frame_leveranse_sync",
+    "enqueue_project_status_dispatch",
     "enqueue_frame_comment_sync",
     "enqueue_frame_version_sync",
     "enqueue_oppgave_done_sync",

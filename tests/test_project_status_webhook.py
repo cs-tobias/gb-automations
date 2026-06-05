@@ -1,29 +1,26 @@
-"""Project-status auto-provision webhook (`/webhooks/notion/project-status`).
+"""Project-status webhook (`/webhooks/notion/project-status`).
 
-Pins the dispatch shape that turns a Notion project Status change into the
-right set of queued provisioning tasks. Mocks the boundaries (bearer verify,
-notion fetch, enqueue helpers, queue_worker.wake) the same way
-test_enqueue_project.py / test_sync_queue.py do — no FastAPI TestClient, no
-database — so the tests are unit-fast.
+This endpoint is deliberately minimal: bearer check + parent-DB sanity +
+enqueue one `project_status_dispatch` task + return 200. The actual work
+(Notion fetch, placeholder gate, status mapping, per-engine fan-out, Frame
+deliverable enumeration, active/inactive lane) lives on the worker and is
+covered by tests/test_dispatch_project_status.py.
+
+The split exists because Notion auto-pauses webhook automations whose
+receiver takes too long to respond (see u6r7s8t9o0p1 migration docstring).
+These tests pin the "fast ack" contract — nothing else.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
 
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
 import gb_automations.routes.webhooks as webhooks
-from gb_automations.config import (
-    PROJECT_STATUS_FERDIG,
-    PROJECT_STATUS_I_PRODUKSJON,
-    PROJECT_STATUS_TILBUD_GODKJENT,
-    PROJECT_STATUS_TILBUDSFASE,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -32,10 +29,6 @@ from gb_automations.config import (
 
 
 def _make_request(body: dict | None, *, auth: str | None = "Bearer s3cret") -> Request:
-    """Build a minimal Starlette Request carrying `body` (JSON) and an
-    Authorization header. Enough for the impl's `await request.body()` +
-    header read; nothing else in the handler touches the request.
-    """
     raw = json.dumps(body).encode("utf-8") if body is not None else b""
     headers: list[tuple[bytes, bytes]] = [(b"content-type", b"application/json")]
     if auth is not None:
@@ -54,133 +47,44 @@ def _make_request(body: dict | None, *, auth: str | None = "Bearer s3cret") -> R
     return Request(scope, receive)
 
 
-def _page(
-    *,
-    page_id: str = "proj-1",
-    parent_db: str = "projdb-uuid",
-    title: str = "Acme Boligprosjekt",
-    status: str | None = PROJECT_STATUS_TILBUDSFASE,
-    status_shape: str = "multi_select",
-) -> dict[str, Any]:
-    """Shape the Notion page object the impl reads via get_page.
-
-    `status_shape` flips between Notion's three Status-property variants so
-    each branch of extract_project_status gets exercised. Defaults to
-    `multi_select` because that's how Goldbox configures it in production
-    (the same shape `task_discipline` already handles on Oppgaver).
-    """
-    if status_shape == "multi_select":
-        status_prop = {
-            "type": "multi_select",
-            "multi_select": [{"name": status}] if status else [],
-        }
-    elif status_shape == "select":
-        status_prop = {
-            "type": "select",
-            "select": {"name": status} if status else None,
-        }
-    elif status_shape == "status":
-        status_prop = {
-            "type": "status",
-            "status": {"name": status} if status else None,
-        }
-    else:
-        raise ValueError(f"unknown status_shape: {status_shape}")
-    props: dict[str, Any] = {
-        "Navn": {
-            "type": "title",
-            "title": [{"plain_text": title}] if title else [],
-        },
-        "Status": status_prop,
-    }
-    return {
-        "id": page_id,
-        "parent": {"type": "database_id", "database_id": parent_db},
-        "properties": props,
-    }
-
-
 @pytest.fixture(autouse=True)
-def _wire_secrets_and_db(monkeypatch):
-    """Default env shape every test inherits: bearer secret set, Projects DB
-    id pinned so the parent check is on, every per-engine fan-out toggle ON
-    so the cumulative I produksjon path is exercised by default. Individual
-    tests override what they care about.
-    """
+def _wire_secrets(monkeypatch):
     monkeypatch.setattr(webhooks.settings, "notion_webhook_secret", "s3cret", raising=False)
     monkeypatch.setattr(webhooks.settings, "projects_db_id", "projdb-uuid", raising=False)
-    monkeypatch.setattr(webhooks.settings, "sync_gmail_labels", True, raising=False)
-    monkeypatch.setattr(webhooks.settings, "sync_nas_folders", True, raising=False)
-    monkeypatch.setattr(webhooks.settings, "nas_projects_root", "/mnt/nas/Prosjekt", raising=False)
-    monkeypatch.setattr(webhooks.settings, "sync_toggl", True, raising=False)
-    monkeypatch.setattr(webhooks.settings, "sync_frame", True, raising=False)
 
 
 @pytest.fixture
-def captured_enqueues(monkeypatch):
-    """Replace every enqueue helper + queue_worker.wake the impl reaches for,
-    capturing each call. Returns the capture dict so tests can assert on it.
+def captured(monkeypatch):
+    """Replace `enqueue_project_status_dispatch` + `queue_worker.wake` so we can
+    assert on the (single) thing this endpoint does. Anything else getting
+    touched is a regression — the contract is "ack + enqueue + return."
     """
     calls: dict[str, list] = {
-        "label_sync": [],
-        "nas_folder_sync": [],
-        "toggl_project_sync": [],
-        "frame_project_sync": [],
-        "frame_project_status_sync": [],
-        "frame_deliverable_fanout": [],
+        "dispatch": [],
         "wake": [],
     }
 
-    async def fake_label(page_id: str) -> int:
-        calls["label_sync"].append(page_id)
+    async def fake_enqueue(page_id: str) -> int:
+        calls["dispatch"].append(page_id)
         return 1
-
-    async def fake_nas(page_id: str) -> int:
-        calls["nas_folder_sync"].append(page_id)
-        return 1
-
-    async def fake_toggl(page_id: str) -> int:
-        calls["toggl_project_sync"].append(page_id)
-        return 1
-
-    async def fake_frame_project(page_id: str) -> int:
-        calls["frame_project_sync"].append(page_id)
-        return 1
-
-    async def fake_frame_project_status(page_id: str) -> int:
-        calls["frame_project_status_sync"].append(page_id)
-        return 1
-
-    async def fake_fanout(page_id: str) -> tuple[int, int]:
-        calls["frame_deliverable_fanout"].append(page_id)
-        return (2, 3)
 
     def fake_wake() -> None:
         calls["wake"].append(True)
 
-    monkeypatch.setattr(webhooks, "enqueue_label_sync", fake_label)
-    monkeypatch.setattr(webhooks, "enqueue_nas_folder_sync", fake_nas)
-    monkeypatch.setattr(webhooks, "enqueue_toggl_project_sync", fake_toggl)
-    monkeypatch.setattr(webhooks, "enqueue_frame_project_sync", fake_frame_project)
-    monkeypatch.setattr(
-        webhooks,
-        "enqueue_frame_project_status_sync",
-        fake_frame_project_status,
-    )
-    monkeypatch.setattr(
-        webhooks,
-        "_enqueue_frame_deliverables_for_project",
-        fake_fanout,
-    )
+    monkeypatch.setattr(webhooks, "enqueue_project_status_dispatch", fake_enqueue)
     monkeypatch.setattr(webhooks.queue_worker, "wake", fake_wake)
+
+    # Hard fail if the webhook touches Notion (it must not — that's what
+    # makes the response fast). A real Notion call in this path is the
+    # bug we're guarding against.
+    async def boom_get_page(_page_id):
+        raise AssertionError(
+            "webhook must not call notion.get_page — that work belongs on the worker"
+        )
+
+    monkeypatch.setattr(webhooks.notion_client, "get_page", boom_get_page)
+
     return calls
-
-
-def _patch_get_page(monkeypatch, page: dict[str, Any] | None) -> None:
-    async def fake_get_page(page_id: str) -> dict[str, Any]:
-        return page
-
-    monkeypatch.setattr(webhooks.notion_client, "get_page", fake_get_page)
 
 
 def _response_json(response) -> dict:
@@ -188,28 +92,26 @@ def _response_json(response) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Auth + payload-shape guards
+# Tests
 # ---------------------------------------------------------------------------
 
 
-def test_missing_bearer_returns_401(captured_enqueues):
+def test_missing_bearer_returns_401(captured):
     req = _make_request({"data": {"id": "p"}}, auth=None)
     with pytest.raises(HTTPException) as exc:
         asyncio.run(webhooks._notion_project_status_impl(req))
     assert exc.value.status_code == 401
-    # No engines reached, no wake.
-    assert all(not v for v in captured_enqueues.values())
+    assert captured["dispatch"] == []
 
 
-def test_wrong_bearer_returns_401(captured_enqueues):
+def test_wrong_bearer_returns_401(captured):
     req = _make_request({"data": {"id": "p"}}, auth="Bearer nope")
     with pytest.raises(HTTPException) as exc:
         asyncio.run(webhooks._notion_project_status_impl(req))
     assert exc.value.status_code == 401
 
 
-def test_invalid_json_returns_400(captured_enqueues):
-    # Build a request with a non-JSON body manually.
+def test_invalid_json_returns_400(captured):
     scope = {
         "type": "http",
         "method": "POST",
@@ -230,27 +132,17 @@ def test_invalid_json_returns_400(captured_enqueues):
     assert exc.value.status_code == 400
 
 
-def test_no_page_id_skips_without_fetch(captured_enqueues, monkeypatch):
-    # If get_page is reached, this raises — pins that we shortcut earlier.
-    async def boom(_):
-        raise AssertionError("must not fetch when there is no page id")
-
-    monkeypatch.setattr(webhooks.notion_client, "get_page", boom)
-
+def test_no_page_id_skips_without_enqueue(captured):
     response = asyncio.run(
         webhooks._notion_project_status_impl(_make_request({"data": {}}))
     )
     body = _response_json(response)
     assert body["action"] == "skipped"
     assert body["reason"] == "no page id"
+    assert captured["dispatch"] == []
 
 
-def test_wrong_parent_db_skips(captured_enqueues, monkeypatch):
-    async def boom(_):
-        raise AssertionError("must not fetch on wrong parent DB")
-
-    monkeypatch.setattr(webhooks.notion_client, "get_page", boom)
-
+def test_wrong_parent_db_skips_without_enqueue(captured):
     req = _make_request(
         {"data": {"id": "p", "parent": {"database_id": "wrong-db-uuid"}}}
     )
@@ -258,261 +150,56 @@ def test_wrong_parent_db_skips(captured_enqueues, monkeypatch):
     body = _response_json(response)
     assert body["action"] == "skipped"
     assert body["reason"] == "wrong parent DB"
+    assert captured["dispatch"] == []
 
 
-# ---------------------------------------------------------------------------
-# Placeholder-title gate
-# ---------------------------------------------------------------------------
-
-
-def test_placeholder_title_skips_all_engines(captured_enqueues, monkeypatch):
-    page = _page(title="000_Kunde_Prosjekt TEMPLATE", status=PROJECT_STATUS_I_PRODUKSJON)
-    _patch_get_page(monkeypatch, page)
-
+def test_valid_request_enqueues_dispatch_and_returns_immediately(captured):
+    # The happy path. No Notion API call (the boom_get_page fixture pins that
+    # — any reach into Notion crashes the test). Just enqueue + wake + 200.
     req = _make_request(
         {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
     )
     response = asyncio.run(webhooks._notion_project_status_impl(req))
     body = _response_json(response)
 
-    assert body["action"] == "skipped"
-    assert body["reason"] == "placeholder title"
-    # Title is reported back so the operator can see what we matched against.
-    assert body["title"] == "000_Kunde_Prosjekt TEMPLATE"
-    # No engine reached; no wake.
-    assert captured_enqueues["label_sync"] == []
-    assert captured_enqueues["nas_folder_sync"] == []
-    assert captured_enqueues["toggl_project_sync"] == []
-    assert captured_enqueues["frame_project_sync"] == []
-    assert captured_enqueues["frame_deliverable_fanout"] == []
-    assert captured_enqueues["wake"] == []
+    assert body["page_id"] == "proj-1"
+    assert body["kind"] == "project_status_dispatch"
+    assert body["action"] == "queued"
+    assert captured["dispatch"] == ["proj-1"]
+    assert captured["wake"] == [True]
 
 
-# ---------------------------------------------------------------------------
-# Status → engine mapping (cumulative)
-# ---------------------------------------------------------------------------
-
-
-def test_tilbudsfase_fires_only_gmail(captured_enqueues, monkeypatch):
-    page = _page(status=PROJECT_STATUS_TILBUDSFASE)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert body["status"] == PROJECT_STATUS_TILBUDSFASE
-    assert body["engines"] == ["gmail"]
-    assert body["results"]["gmail"]["action"] == "queued"
-    assert "nas" not in body["results"]
-    assert "frame" not in body["results"]
-    assert "toggl" not in body["results"]
-    # frame_status fires on EVERY status edit (re-activates a previously
-    # inactivated Frame project when the team moves out of Ferdig/Tapt).
-    assert body["results"]["frame_status"]["action"] == "queued"
-
-    assert captured_enqueues["label_sync"] == ["proj-1"]
-    assert captured_enqueues["nas_folder_sync"] == []
-    assert captured_enqueues["frame_project_sync"] == []
-    assert captured_enqueues["toggl_project_sync"] == []
-    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
-    assert captured_enqueues["wake"] == [True]
-
-
-def test_tilbud_godkjent_fires_gmail_and_nas(captured_enqueues, monkeypatch):
-    page = _page(status=PROJECT_STATUS_TILBUD_GODKJENT)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert sorted(body["engines"]) == ["gmail", "nas"]
-    assert captured_enqueues["label_sync"] == ["proj-1"]
-    assert captured_enqueues["nas_folder_sync"] == ["proj-1"]
-    assert captured_enqueues["frame_project_sync"] == []
-    assert captured_enqueues["toggl_project_sync"] == []
-    # frame_status still fires — independent of provisioning fan-out.
-    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
-
-
-def test_i_produksjon_fires_all_four(captured_enqueues, monkeypatch):
-    page = _page(status=PROJECT_STATUS_I_PRODUKSJON)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert sorted(body["engines"]) == ["frame", "gmail", "nas", "toggl"]
-    assert captured_enqueues["label_sync"] == ["proj-1"]
-    assert captured_enqueues["nas_folder_sync"] == ["proj-1"]
-    assert captured_enqueues["toggl_project_sync"] == ["proj-1"]
-    assert captured_enqueues["frame_project_sync"] == ["proj-1"]
-    # Frame fan-out was invoked; the captured (queued, total) is surfaced.
-    assert captured_enqueues["frame_deliverable_fanout"] == ["proj-1"]
-    assert body["results"]["frame"]["leveranser_queued"] == 2
-    assert body["results"]["frame"]["leveranser_total"] == 3
-    # frame_status lane fires alongside provisioning (a project entering
-    # I produksjon should be active in Frame — re-activating a previously
-    # inactivated row is a real case if the team toggles Ferdig → I produksjon).
-    assert body["results"]["frame_status"]["action"] == "queued"
-    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
-
-
-def test_ferdig_fires_only_frame_status(captured_enqueues, monkeypatch):
-    # Ferdig has no provisioning engines (nothing to mint at end-of-life), but
-    # MUST still enqueue the frame project status sync so the Frame entity
-    # gets flipped to `inactive`. Pin both: no provisioning fired AND the
-    # frame_status lane DID fire.
-    page = _page(status=PROJECT_STATUS_FERDIG)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert body["engines"] == []
-    assert body["status"] == PROJECT_STATUS_FERDIG
-    assert body["results"]["frame_status"]["action"] == "queued"
-    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
-    # No provisioning fan-out at Ferdig.
-    assert captured_enqueues["label_sync"] == []
-    assert captured_enqueues["nas_folder_sync"] == []
-    assert captured_enqueues["frame_project_sync"] == []
-    assert captured_enqueues["toggl_project_sync"] == []
-    # wake() called once even with no provisioning, so the worker picks up
-    # the frame_status task right away.
-    assert captured_enqueues["wake"] == [True]
-
-
-def test_empty_status_fires_frame_status_only(captured_enqueues, monkeypatch):
-    # Status cleared / empty — engine fan-out has nothing to do, but the
-    # frame_status engine still runs so a previously-inactivated Frame
-    # project gets re-activated when the user clears Status to "reopen".
-    page = _page(status=None)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert body["engines"] == []
-    assert body["status"] is None
-    assert body["results"]["frame_status"]["action"] == "queued"
-    assert captured_enqueues["frame_project_status_sync"] == ["proj-1"]
-
-
-# ---------------------------------------------------------------------------
-# Per-engine env-flag skips
-# ---------------------------------------------------------------------------
-
-
-def test_disabled_env_flags_skip_per_engine_but_still_run_enabled(
-    captured_enqueues, monkeypatch
-):
-    # I produksjon would normally fan out to all four; turn three of them off
-    # via env and pin that the impl reports each as `skipped: <reason>` while
-    # still queueing the one that IS enabled (gmail in this case).
-    monkeypatch.setattr(webhooks.settings, "sync_nas_folders", False, raising=False)
-    monkeypatch.setattr(webhooks.settings, "sync_frame", False, raising=False)
-    monkeypatch.setattr(webhooks.settings, "sync_toggl", False, raising=False)
-
-    page = _page(status=PROJECT_STATUS_I_PRODUKSJON)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert body["results"]["gmail"]["action"] == "queued"
-    assert body["results"]["nas"]["action"] == "skipped"
-    assert body["results"]["frame"]["action"] == "skipped"
-    assert body["results"]["toggl"]["action"] == "skipped"
-    # SYNC_FRAME=false also skips the active/inactive lane.
-    assert body["results"]["frame_status"]["action"] == "skipped"
-    assert body["results"]["frame_status"]["reason"] == "SYNC_FRAME=false"
-    # Only the gmail enqueue actually ran.
-    assert captured_enqueues["label_sync"] == ["proj-1"]
-    assert captured_enqueues["nas_folder_sync"] == []
-    assert captured_enqueues["frame_project_sync"] == []
-    assert captured_enqueues["frame_deliverable_fanout"] == []
-    assert captured_enqueues["frame_project_status_sync"] == []
-    assert captured_enqueues["toggl_project_sync"] == []
-
-
-def test_nas_skipped_when_root_unset_even_if_flag_on(
-    captured_enqueues, monkeypatch
-):
-    # nas_projects_root is the second half of the NAS gate — without a mount
-    # path, sync_nas_folders=true is still inert. Mirrors _sync_nas_impl.
-    monkeypatch.setattr(webhooks.settings, "nas_projects_root", "", raising=False)
-
-    page = _page(status=PROJECT_STATUS_TILBUD_GODKJENT)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert body["results"]["nas"]["action"] == "skipped"
-    assert "disabled or unconfigured" in body["results"]["nas"]["reason"]
-    assert captured_enqueues["nas_folder_sync"] == []
-
-
-@pytest.mark.parametrize("shape", ["multi_select", "select", "status"])
-def test_status_read_works_across_property_shapes(
-    captured_enqueues, monkeypatch, shape
-):
-    # Goldbox configures Status as a multi_select (one option per row); other
-    # workspaces may use plain select or Notion's `status` property type.
-    # extract_project_status reads all three — pin that the dispatch path
-    # behaves the same regardless of how the column is configured in Notion.
-    page = _page(status=PROJECT_STATUS_TILBUDSFASE, status_shape=shape)
-    _patch_get_page(monkeypatch, page)
-
-    req = _make_request(
-        {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
-    )
-    response = asyncio.run(webhooks._notion_project_status_impl(req))
-    body = _response_json(response)
-
-    assert body["status"] == PROJECT_STATUS_TILBUDSFASE
-    assert body["engines"] == ["gmail"]
-    assert captured_enqueues["label_sync"] == ["proj-1"]
-
-
-def test_idempotent_response_when_already_queued(captured_enqueues, monkeypatch):
-    # When an enqueue helper returns 0 (active task already exists for this
-    # project), the impl reports `already_queued` rather than `queued` — so
-    # the response surface tells the operator whether a click was a no-op.
-    async def fake_label(page_id: str) -> int:
-        captured_enqueues["label_sync"].append(page_id)
+def test_idempotent_response_when_already_queued(captured, monkeypatch):
+    # Rapid Status flips collapse on the active-task unique index — the
+    # enqueue helper returns 0. The webhook surfaces this as
+    # `already_queued`, not an error.
+    async def fake_enqueue(page_id: str) -> int:
+        captured["dispatch"].append(page_id)
         return 0
 
-    monkeypatch.setattr(webhooks, "enqueue_label_sync", fake_label)
-
-    page = _page(status=PROJECT_STATUS_TILBUDSFASE)
-    _patch_get_page(monkeypatch, page)
+    monkeypatch.setattr(webhooks, "enqueue_project_status_dispatch", fake_enqueue)
 
     req = _make_request(
         {"data": {"id": "proj-1", "parent": {"database_id": "projdb-uuid"}}}
     )
     response = asyncio.run(webhooks._notion_project_status_impl(req))
     body = _response_json(response)
+    assert body["action"] == "already_queued"
 
-    assert body["results"]["gmail"]["action"] == "already_queued"
+
+def test_parent_db_check_hyphen_and_case_insensitive(captured):
+    # Notion sometimes returns the db id with hyphens, sometimes without,
+    # and case can vary. The webhook normalizes both sides — pin that a
+    # hyphenated, uppercase id still matches the configured `projdb-uuid`.
+    req = _make_request(
+        {
+            "data": {
+                "id": "proj-1",
+                "parent": {"database_id": "PROJ-DB-UUID"},
+            }
+        }
+    )
+    response = asyncio.run(webhooks._notion_project_status_impl(req))
+    body = _response_json(response)
+    assert body["action"] == "queued"
+    assert captured["dispatch"] == ["proj-1"]

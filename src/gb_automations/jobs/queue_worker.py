@@ -34,6 +34,7 @@ from gb_automations.sync.queue import (
     set_task_project,
     status_counts,
 )
+from gb_automations.sync.dispatch_project_status import dispatch_project_status
 from gb_automations.sync.sync_frame import sync_frame_leveranse, sync_frame_project
 from gb_automations.sync.sync_frame_comments import sync_frame_comment
 from gb_automations.sync.sync_frame_file_status import sync_frame_file_status
@@ -428,6 +429,63 @@ async def _process_frame_project_status_sync(
     )
     await queue_mirror.refresh_project_dot(
         project_page_id, progress=progress, subject="Frame.io status"
+    )
+
+
+async def _process_project_status_dispatch(
+    claimed: _Claimed, progress: str
+) -> None:
+    """Run a project_status_dispatch task: the worker-side dispatcher for a
+    Notion Projects-DB `Status` change.
+
+    The /webhooks/notion/project-status endpoint only acks Notion (validates
+    bearer + enqueues this one row + returns 200) so Notion's auto-pause
+    heuristic doesn't fire on a slow inline response. All the actual work —
+    Notion get_page, placeholder-title gate, status read, fan-out to every
+    per-engine task type (label_sync / nas_folder_sync / toggl_project_sync /
+    frame_project_sync + per-leveranse Frame fan-out / frame_project_status_sync)
+    — happens here. Idempotent: every downstream enqueue is dedup'd by its
+    own active-task unique index, so a re-fired dispatch is safe.
+    """
+    project_page_id = claimed.project_page_id
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — dispatching Notion project-status change for %s%s",
+        progress,
+        project_page_id,
+        retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Status dispatch"
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError(
+                "project_status_dispatch task has no project_page_id"
+            )
+        result = await dispatch_project_status(project_page_id)
+        if result.action == "failed":
+            outcome_error = result.note or "project status dispatch failed"
+    except Exception as err:
+        log_api_error(
+            logger,
+            f"project status dispatch crashed for {project_page_id}",
+            err,
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(project_page_id),
+    )
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject="Status dispatch"
     )
 
 
@@ -877,6 +935,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "frame_project_status_sync":
         await _process_frame_project_status_sync(claimed, progress)
+        return
+    if claimed.task_type == "project_status_dispatch":
+        await _process_project_status_dispatch(claimed, progress)
         return
     if claimed.task_type == "toggl_project_sync":
         await _process_toggl_project_sync(claimed, progress)

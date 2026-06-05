@@ -43,8 +43,6 @@ from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
     DISCIPLINE_KEYS,
     EMAILS_PROPS,
-    PROJECT_STATUS_AUTO_PROVISION,
-    PROJECTS_PLACEHOLDER_TITLES,
     settings,
 )
 from gb_automations.db import SessionLocal
@@ -57,12 +55,12 @@ from gb_automations.sync.queue import (
     enqueue_frame_comment_sync,
     enqueue_frame_file_status_sync,
     enqueue_frame_leveranse_sync,
-    enqueue_frame_project_status_sync,
     enqueue_frame_project_sync,
     enqueue_frame_version_sync,
     enqueue_label_sync,
     enqueue_nas_folder_sync,
     enqueue_oppgave_done_sync,
+    enqueue_project_status_dispatch,
     enqueue_task_folder_sync,
     enqueue_threads,
     enqueue_toggl_project_sync,
@@ -731,6 +729,20 @@ async def _notion_oppgave_status_impl(request: Request) -> Response:
 async def notion_project_status(request: Request) -> Response:
     """Notion automation receiver: a Project's `Status` select changed.
 
+    THIS ENDPOINT IS DELIBERATELY MINIMAL — bearer check, parent-DB sanity
+    check, enqueue ONE `project_status_dispatch` task, return 200. The actual
+    work (Notion get_page, placeholder-title gate, status read, fan-out to
+    gmail/nas/toggl/frame + per-leveranse Frame + the active/inactive lane)
+    runs on the queue worker via `sync/dispatch_project_status.py`.
+
+    Why this shape: Notion auto-pauses webhook automations whose receiver
+    takes too long to respond (the timeout isn't published; community
+    reports + n8n issue #12257 indicate Notion's pause heuristic is
+    over-eager and fires on slow 200s, not just 5xx). The earlier inline
+    shape did 2 Notion API calls + 5 Postgres inserts before responding,
+    which on Goldbox's prod workspace was tripping the pause. Sub-50ms ack
+    keeps us safely under whatever the threshold is.
+
     Auth: `Authorization: Bearer <NOTION_WEBHOOK_SECRET>` (same secret every
     other Notion automation/button uses). The companion Notion automation
     must be configured on the Projects DB with trigger "Property edited"
@@ -738,40 +750,9 @@ async def notion_project_status(request: Request) -> Response:
     other edit on a project row (Frame/NAS/Toggl URL writebacks, the Sync
     icon, Sync progress, etc.) from firing this endpoint.
 
-    Cumulative semantics — see `PROJECT_STATUS_AUTO_PROVISION` in config.py.
-    Tilbudsfase fires Gmail; Tilbud godkjent fires Gmail + NAS; I produksjon
-    fires Gmail + NAS + Frame + Toggl. All four engines are idempotent, so
-    re-running them on an already-provisioned project is safe — that's what
-    makes the "jump straight to I produksjon" path correct.
-
-    Independent of the provisioning fan-out, EVERY status change also enqueues
-    a `frame_project_status_sync` task: the engine reads the live Notion
-    status and flips the Frame project's V4 status to `inactive`
-    (Ferdig/Tapt — see `PROJECT_STATUS_INACTIVE_TRIGGERS`) or `active`
-    (anything else, including reopening a finished project by clearing
-    Status). Skipped silently inside the engine when the project has no
-    FrameProjectFolder cache row yet (not provisioned in Frame). Notion-only
-    direction: we never mirror Frame's status back to Notion.
-
-    Placeholder-title gate: when the row's title is still
-    `000_Kunde_Prosjekt TEMPLATE` (or any other entry in
-    PROJECTS_PLACEHOLDER_TITLES) we skip every engine, because auto-provisioning
-    the template name would mint garbage Gmail labels / NAS folders / Frame
-    projects, and two new placeholder rows existing at the same time would
-    collide on a single shared Gmail label. Recovery: the user renames the
-    row and then re-touches Status (toggle to another value and back, or
-    re-select the same value) to refire the webhook against the real title.
-    We deliberately do NOT pair this endpoint with a Name-edited automation:
-    Notion fires Name-edited multiple times per rename (autosave + per-pause
-    coalescing) which floods the queue with redundant label_sync work, and
-    in the intended workflow (duplicate → rename → set Status) the title is
-    already real by the time Status fires anyway.
-
-    Per-engine env gates mirror the manual per-system buttons:
-    `sync_gmail_labels`, `sync_nas_folders + nas_projects_root`, `sync_frame`,
-    `sync_toggl`. A globally-off engine is reported as `skipped` (with a
-    reason) rather than silently no-op'd, so /debug/queue and the response
-    body both make the misconfiguration visible.
+    Per-engine semantics, placeholder-title gate, "no Name-edited automation"
+    rationale, etc. — all moved to the dispatcher's docstring. See
+    `sync/dispatch_project_status.py`.
     """
     with request_scope("project-status"):
         return await _notion_project_status_impl(request)
@@ -800,7 +781,8 @@ async def _notion_project_status_impl(request: Request) -> Response:
     # Defense: confirm the row really is in the Projects DB. The automation
     # is supposed to live on that DB, but a misconfigured automation pointing
     # at another DB would silently send junk events here otherwise — same
-    # guard pattern as /notion/oppgave-status.
+    # guard pattern as /notion/oppgave-status. Cheap (string compare on the
+    # automation payload); does NOT require a Notion API call.
     parent = (data.get("parent") or {}).get("database_id") or ""
     target_db = (settings.projects_db_id or "").replace("-", "").lower()
     payload_db = parent.replace("-", "").lower()
@@ -818,155 +800,18 @@ async def _notion_project_status_impl(request: Request) -> Response:
             }
         )
 
-    # Re-fetch the page: Notion's automation payload includes a `properties`
-    # field but it's empty (verified by the parallel oppgave-status / oppgave-
-    # done automations — see comment on /notion/oppgave-done). Read the live
-    # Status + title at process time.
-    try:
-        page = await notion_client.get_page(page_id)
-    except Exception as err:
-        logger.exception("project-status: failed to fetch Notion page %s", page_id)
-        raise HTTPException(502, f"Notion fetch failed: {err}") from err
-
-    title = (notion_client.extract_page_title(page) or "").strip()
-    if title in PROJECTS_PLACEHOLDER_TITLES:
-        logger.info(
-            "project-status: page %s title %r is a placeholder — skipping auto-provision",
-            page_id,
-            title,
-        )
-        return _json(
-            {
-                "page_id": page_id,
-                "title": title,
-                "action": "skipped",
-                "reason": "placeholder title",
-            }
-        )
-
-    status = notion_client.extract_project_status(page)
-    engines = PROJECT_STATUS_AUTO_PROVISION.get(status or "") or set()
-
-    # Per-engine outcomes for /debug/queue observability. Engines globally
-    # disabled by env flags surface as `skipped` with a reason so a
-    # misconfigured deploy fails visibly rather than going quiet.
-    results: dict[str, dict[str, Any]] = {}
-
-    # Frame project active/inactive lane — fires on EVERY status change
-    # (including currently-unmapped statuses like Ferdig/Tapt that don't
-    # provision anything). The engine itself decides active vs inactive
-    # based on the live Notion status. Independent of the provisioning
-    # fan-out below: a project at Ferdig has no `engines` to provision but
-    # still needs its Frame entity flipped to inactive; a project being
-    # reopened (Status cleared or moved back) needs the reverse. Skipped
-    # silently inside the engine when there is no FrameProjectFolder cache
-    # row (project not yet provisioned in Frame).
-    if settings.sync_frame:
-        inserted = await enqueue_frame_project_status_sync(page_id)
-        results["frame_status"] = {
-            "action": "queued" if inserted else "already_queued",
-        }
-    else:
-        results["frame_status"] = {
-            "action": "skipped",
-            "reason": "SYNC_FRAME=false",
-        }
-
-    if not engines:
-        # The provisioning fan-out has nothing to do (Klar til oppstart /
-        # Venter på avklaring / Lang pause / Ferdig / Tapt — none of these
-        # mint new systems). The Frame status lane above may still have
-        # enqueued work. Surface this as a normal response with empty
-        # `engines`, not the old `action: skipped` blanket reject — the
-        # frame_status entry is the load-bearing observability for
-        # Ferdig/Tapt now.
-        logger.info(
-            "project-status: page %s status=%r has no provisioning engines "
-            "mapped; frame_status=%s",
-            page_id,
-            status,
-            results.get("frame_status", {}).get("action"),
-        )
-        queue_worker.wake()
-        return _json(
-            {
-                "page_id": page_id,
-                "title": title,
-                "status": status,
-                "engines": [],
-                "results": results,
-            }
-        )
-
-    if "gmail" in engines:
-        if settings.sync_gmail_labels:
-            inserted = await enqueue_label_sync(page_id)
-            results["gmail"] = {
-                "action": "queued" if inserted else "already_queued",
-            }
-        else:
-            results["gmail"] = {
-                "action": "skipped",
-                "reason": "SYNC_GMAIL_LABELS=false",
-            }
-
-    if "nas" in engines:
-        if settings.sync_nas_folders and settings.nas_projects_root:
-            inserted = await enqueue_nas_folder_sync(page_id)
-            results["nas"] = {
-                "action": "queued" if inserted else "already_queued",
-            }
-        else:
-            results["nas"] = {
-                "action": "skipped",
-                "reason": "NAS sync is disabled or unconfigured",
-            }
-
-    if "toggl" in engines:
-        if settings.sync_toggl:
-            inserted = await enqueue_toggl_project_sync(page_id)
-            results["toggl"] = {
-                "action": "queued" if inserted else "already_queued",
-            }
-        else:
-            results["toggl"] = {
-                "action": "skipped",
-                "reason": "SYNC_TOGGL=false",
-            }
-
-    if "frame" in engines:
-        if settings.sync_frame:
-            inserted = await enqueue_frame_project_sync(page_id)
-            leveranse_queued, leveranser_total = (
-                await _enqueue_frame_deliverables_for_project(page_id)
-            )
-            results["frame"] = {
-                "action": "queued" if inserted else "already_queued",
-                "leveranser_queued": leveranse_queued,
-                "leveranser_total": leveranser_total,
-            }
-        else:
-            results["frame"] = {
-                "action": "skipped",
-                "reason": "SYNC_FRAME=false",
-            }
-
+    inserted = await enqueue_project_status_dispatch(page_id)
     queue_worker.wake()
     logger.info(
-        "📥 project-status %r → %r on %r (page %s): %s",
-        status,
-        sorted(engines),
-        title,
+        "📥 project-status dispatch %s for %s",
+        "enqueued" if inserted else "already_queued",
         page_id,
-        results,
     )
     return _json(
         {
             "page_id": page_id,
-            "title": title,
-            "status": status,
-            "engines": sorted(engines),
-            "results": results,
+            "kind": "project_status_dispatch",
+            "action": "queued" if inserted else "already_queued",
         }
     )
 

@@ -727,7 +727,7 @@ class SyncTask(Base):
             "'frame_file_status_sync','frame_project_status_sync',"
             "'oppgave_done_sync',"
             "'leveranse_status_recheck','toggl_project_sync',"
-            "'toggl_hours_sync')",
+            "'toggl_hours_sync','project_status_dispatch')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -793,6 +793,24 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'frame_project_status_sync'"
+            ),
+        ),
+        # At most one ACTIVE project_status_dispatch per project. The webhook
+        # is a tiny "ack + enqueue this one row" handler — the dispatch task
+        # does the slow work (Notion fetch, placeholder check, status read,
+        # fan-out to every provisioning engine). Collapsing rapid Status
+        # flips (Ferdig → Tapt → Ferdig within a few seconds) to one task is
+        # correct: the dispatcher reads live Notion state at process time, so
+        # the last-flipped state is what gets propagated. Reason for splitting
+        # this from frame_project_status_sync: dispatch fans out to ALL the
+        # engines (gmail/nas/frame/toggl + the frame status sync); the latter
+        # is just one of those fan-out targets.
+        Index(
+            "uq_sync_tasks_active_project_status_dispatch",
+            "project_page_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'project_status_dispatch'"
             ),
         ),
         # At most one ACTIVE frame_leveranse_sync per Leveranse (renamed
