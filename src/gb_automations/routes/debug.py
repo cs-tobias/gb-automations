@@ -945,8 +945,10 @@ async def debug_toggl_backfill(
         "rows_updated": result.rows_updated,
         "rows_archived": result.rows_archived,
         "skipped": {
-            # In-flight Toggl entries (stop=null) — picked up on next run.
-            "running": result.skipped_running,
+            # CSV rows with zero/unparseable Duration. Running entries are
+            # already excluded by Toggl's CSV export (no stop time → no
+            # Duration), so this counter only fires for malformed rows.
+            "zero_duration": result.skipped_zero_duration,
         },
         "kept_without_attribution": {
             # Rows landed in Notion but with an empty Ansatt people-property

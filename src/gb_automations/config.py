@@ -753,6 +753,11 @@ TIMER_PROPS = {
     "employee": "Ansatt",
     "project": "Prosjekt",           # relation → Projects (empty when no Notion match)
     "hours": "Timer",                # number — decimal hours (e.g. 7.5)
+    # Count of raw Toggl sessions aggregated into this row. Lets the
+    # operator (and verify route) sanity-check that no entries were lost
+    # in aggregation — sum across a window should equal Toggl's raw entry
+    # count for that window. Independent metric from total hours.
+    "entry_count": "Antall økter",
     # Aggregated unique entry descriptions for this (user, project, day) cell.
     # Joined with "; " and truncated to ~1900 chars so the row stays under
     # Notion's 2000-char rich_text limit.
@@ -912,6 +917,7 @@ def build_timer_db_schema(
             },
         },
         TIMER_PROPS["hours"]: {"number": {"format": "number"}},
+        TIMER_PROPS["entry_count"]: {"number": {"format": "number"}},
         TIMER_PROPS["description"]: {"rich_text": {}},
         TIMER_PROPS["toggl_project_name"]: {"rich_text": {}},
         TIMER_PROPS["toggl_user_name"]: {"rich_text": {}},

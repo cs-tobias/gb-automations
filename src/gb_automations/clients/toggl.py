@@ -299,76 +299,55 @@ async def create_project(
         return response.json()
 
 
-async def search_time_entries(
+async def export_time_entries_csv(
     workspace_id: str,
     *,
     start_date: str,
     end_date: str,
-    page_size: int = 50,
-) -> list[dict[str, Any]]:
-    """Reports v3 — every time entry in `[start_date, end_date]` for the workspace.
+) -> list[dict[str, str]]:
+    """Reports v3 CSV export — every time entry in `[start_date, end_date]`.
 
-    Called by the nightly hours aggregator. Uses the admin token's scope so
-    one call returns every workspace member's entries (the same call by a
-    non-admin would only return their own).
+    Uses the same endpoint Toggl's own UI calls when you click "Export →
+    CSV" in the Detailed Report: `POST /reports/api/v3/workspace/{wid}/
+    search/time_entries.csv`. Returns flat, untruncated rows — one per
+    actual time session — with no grouping or deduplication.
 
-    Endpoint: `POST /reports/api/v3/workspace/{wid}/search/time_entries`.
-    Pagination is via response headers (`X-Next-ID`, `X-Next-Row-Number`,
-    `X-Next-Timestamp`) fed back as `first_id` / `first_row_number` /
-    `first_timestamp` in the next request body. Iterate until no headers
-    come back.
+    Why not the JSON variant of the same path? The JSON endpoint silently
+    truncates results at a hidden cap (~650 rows per query, irrespective
+    of pagination) — proven against Goldbox's workspace by comparing
+    `Q1+Q2+Q3+Q4 == FullYear` for CSV (matches) vs JSON (~13% of CSV).
+    Payroll-grade completeness requires CSV. The JSON variant is not safe
+    here and must not be reintroduced.
+
+    Returns: `list[dict[str, str]]` — one dict per CSV data row, keyed by
+    the CSV column headers. Goldbox-observed columns:
+        User, Email, Client, Project, Task, Description, Billable,
+        Start date, Start time, End date, End time, Duration, Tags,
+        Currency, Amount
+    The timestamps come back in the workspace's timezone (Europe/Oslo for
+    Goldbox), naive (no offset suffix). Duration is `HH:MM:SS`.
 
     Date range is ISO 8601 (`YYYY-MM-DD`). Toggl enforces a max range of
-    one year per call — way more than the 14-day window the engine uses.
-
-    Per-entry fields seen in practice: `user_id`, `project_id`,
-    `description`, `tag_ids`, `billable`, `seconds` (duration), `start`,
-    `stop` (ISO 8601 UTC). A running entry has `stop` null (and in v9
-    `duration` would be negative; Reports v3 doesn't expose duration the
-    same way, so the engine filters on `stop is None`).
+    one year per call; multi-year callers must slice externally.
     """
-    body: dict[str, Any] = {
-        "start_date": start_date,
-        "end_date": end_date,
-        "page_size": page_size,
-    }
-    all_entries: list[dict[str, Any]] = []
+    import csv
+    import io
 
+    body = {"start_date": start_date, "end_date": end_date}
     async with await _client() as client:
-        while True:
-            response = await _with_retries(
-                lambda b=body: client.post(
-                    f"/reports/api/v3/workspace/{workspace_id}/search/time_entries",
-                    json=b,
-                ),
-                op_name="search_time_entries",
-            )
-            _raise_for_status(response)
-            page = response.json() or []
-            if isinstance(page, list):
-                all_entries.extend(page)
-
-            # Cursor headers — absent means we've reached the last page.
-            # Toggl's docs spell `X-Next-Row-Number`; HTTP headers are
-            # case-insensitive so httpx normalizes the lookup either way.
-            next_row = response.headers.get("X-Next-Row-Number")
-            next_id = response.headers.get("X-Next-ID")
-            next_ts = response.headers.get("X-Next-Timestamp")
-            if not next_row and not next_id and not next_ts:
-                break
-            body = {
-                "start_date": start_date,
-                "end_date": end_date,
-                "page_size": page_size,
-            }
-            if next_row:
-                body["first_row_number"] = int(next_row)
-            if next_id:
-                body["first_id"] = int(next_id)
-            if next_ts:
-                body["first_timestamp"] = int(next_ts)
-
-    return all_entries
+        response = await _with_retries(
+            lambda: client.post(
+                f"/reports/api/v3/workspace/{workspace_id}/search/time_entries.csv",
+                json=body,
+            ),
+            op_name="export_time_entries_csv",
+        )
+        _raise_for_status(response)
+        # Toggl returns the entire CSV in one response body — no pagination
+        # cursor for the .csv variant. The body is plain text.
+        reader = csv.DictReader(io.StringIO(response.text))
+        rows = [dict(row) for row in reader]
+    return rows
 
 
 async def update_project(
