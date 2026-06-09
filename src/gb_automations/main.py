@@ -275,7 +275,7 @@ app = FastAPI(title="gb-automations", version="0.1.0", lifespan=lifespan)
 app.include_router(debug_routes.router)
 app.include_router(oauth_routes.router)
 app.include_router(webhook_routes.router)
-# The dynamic placeholder route (/assets/placeholder/{id}.png) must be
+# The dynamic placeholder route (/assets/placeholder/{id}.jpg) must be
 # registered BEFORE the static /assets mount below: a Mount matches by path
 # prefix and would otherwise swallow the request (and 404, since no such file
 # exists on disk). Explicit routes are matched ahead of mounts in registration

@@ -258,7 +258,7 @@ class Settings(BaseSettings):
     # Swap the asset under /assets/ to change the image without redeploying.
     frame_placeholder_url: str = ""
     # The studio identifier baked into every Frame placeholder filename:
-    #   <project>_<studio>_<task>_V00.png
+    #   <project>_<studio>_<task>_V00.jpg
     # Renaming the studio later only affects NEW placeholders — existing
     # uploads keep their old filename (Frame's version stack is keyed by file
     # slot, not name, so re-naming after the fact is purely cosmetic).
@@ -270,7 +270,7 @@ class Settings(BaseSettings):
         is reachable at, derived from `frame_placeholder_url`.
 
         The dynamic per-deliverable placeholder lives at
-        `<origin>/assets/placeholder/<page_id>.png`. We derive the origin from
+        `<origin>/assets/placeholder/<page_id>.jpg`. We derive the origin from
         the already-required `frame_placeholder_url` (the static fallback,
         e.g. https://hub.<domain>/assets/placeholder.png) rather than adding a
         second env var — they're always the same host (our own FastAPI app

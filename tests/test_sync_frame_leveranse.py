@@ -223,7 +223,7 @@ def test_first_sync_creates_placeholder(monkeypatch):
     # Placeholder source is the per-deliverable dynamic render endpoint, with
     # the origin derived from frame_placeholder_url (http://x/p.png → http://x).
     assert file_calls == [
-        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/assets/placeholder/t1.png")
+        ("discF", "Fasade Nord_Goldbox.no_V00.jpg", "http://x/assets/placeholder/t1.jpg")
     ]
     assert len(sessions[1].added) == 1
     added = sessions[1].added[0]
@@ -276,7 +276,7 @@ def test_rename_renames_placeholder_file(monkeypatch):
     result = asyncio.run(sf.sync_frame_leveranse("t1"))
 
     assert result.action == "renamed"
-    assert rename_calls == [("fileF", "New Name_Goldbox.no_V00.png")]
+    assert rename_calls == [("fileF", "New Name_Goldbox.no_V00.jpg")]
     assert create_calls == 0
     assert result.frame_placeholder_file_id == "fileF"
     assert lev_row.current_name == "New Name"
@@ -364,7 +364,7 @@ def test_self_heal_evicts_stale_leveranse(monkeypatch):
     assert result.action == "created"
     assert result.frame_placeholder_file_id == "freshFile"
     assert file_calls == [
-        ("discF", "Fasade Nord_Goldbox.no_V00.png", "http://x/assets/placeholder/t1.png")
+        ("discF", "Fasade Nord_Goldbox.no_V00.jpg", "http://x/assets/placeholder/t1.jpg")
     ]
     assert sessions[1].deleted == [lev_row]
 
@@ -431,7 +431,7 @@ def test_adopts_existing_placeholder_with_view_url(monkeypatch):
         return {"id": "should-not-be-called"}
 
     async def fake_find_file(parent, name):
-        assert (parent, name) == ("discF", "Fasade Nord_Goldbox.no_V00.png")
+        assert (parent, name) == ("discF", "Fasade Nord_Goldbox.no_V00.jpg")
         return {
             "id": "preExistingFile",
             "name": name,
@@ -514,11 +514,12 @@ def test_adopts_existing_placeholder_fetches_url_when_missing(monkeypatch):
 
 def test_placeholder_filename_shape(monkeypatch):
     """Pin the exact filename shape so a future config-name change doesn't
-    silently shift it. The order matters: <task>_<studio>_V00.png (no project
-    prefix)."""
+    silently shift it. The order matters: <task>_<studio>_V00.jpg (no project
+    prefix). Extension is .jpg — Goldbox ships deliverables as JPG and the
+    V00 placeholder matches what V01 will overwrite in Frame's version stack."""
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "Goldbox.no")
     out = sf._placeholder_filename("1230_Metropolis_Orangeriet", "Vinkel 1")
-    assert out == "Vinkel 1_Goldbox.no_V00.png"
+    assert out == "Vinkel 1_Goldbox.no_V00.jpg"
 
 
 def test_placeholder_filename_uses_configured_studio(monkeypatch):
@@ -526,15 +527,78 @@ def test_placeholder_filename_uses_configured_studio(monkeypatch):
     straight through to new uploads."""
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "OtherStudio")
     out = sf._placeholder_filename("Proj", "Task")
-    assert out == "Task_OtherStudio_V00.png"
+    assert out == "Task_OtherStudio_V00.jpg"
 
 
 def test_placeholder_filename_falls_back_when_studio_empty(monkeypatch):
     """A blank studio setting would produce a malformed filename
-    ('Task__V00.png'); fall back to 'Goldbox.no' as the default."""
+    ('Task__V00.jpg'); fall back to 'Goldbox.no' as the default."""
     monkeypatch.setattr(sf.settings, "frame_filename_studio", "")
     out = sf._placeholder_filename("Proj", "Task")
-    assert out == "Task_Goldbox.no_V00.png"
+    assert out == "Task_Goldbox.no_V00.jpg"
+
+
+# ---------------------------------------------------------------------------
+# _frame_file_has_media: the verify guard for Frame's async source-URL fetch.
+#
+# Real failure observed in prod: Frame's fetcher pulled a short HTTP error
+# body from our Cloudflare tunnel and stored it as `file_size: 15,
+# media_type: "text/plain"`. The previous `file_size > 0` check let it
+# through and we never retried.
+# ---------------------------------------------------------------------------
+
+def test_has_media_accepts_real_jpeg():
+    ok, reason = sf._frame_file_has_media(
+        {"file_size": 17312, "media_type": "image/jpeg"}
+    )
+    assert ok and reason == ""
+
+
+def test_has_media_accepts_legacy_png():
+    """Legacy placeholders uploaded before the .jpg switch are still image/*
+    and still ingested fine — don't false-positive on them."""
+    ok, reason = sf._frame_file_has_media(
+        {"file_size": 17312, "media_type": "image/png"}
+    )
+    assert ok and reason == ""
+
+
+def test_has_media_rejects_tiny_error_body():
+    """The exact prod-observed failure: 15-byte text/plain from a tunnel hiccup."""
+    ok, reason = sf._frame_file_has_media(
+        {"file_size": 15, "media_type": "text/plain"}
+    )
+    assert not ok
+    assert "file_size=15" in reason  # size reason fires first; either is fine
+
+
+def test_has_media_rejects_non_image_media_type_even_when_large():
+    """If Frame stored a multi-KB JSON/HTML error body, size alone wouldn't
+    catch it. media_type guards that corner."""
+    ok, reason = sf._frame_file_has_media(
+        {"file_size": 50000, "media_type": "text/html"}
+    )
+    assert not ok
+    assert "text/html" in reason
+
+
+def test_has_media_rejects_zero_size():
+    ok, reason = sf._frame_file_has_media(
+        {"file_size": 0, "media_type": "image/jpeg"}
+    )
+    assert not ok
+
+
+def test_has_media_tolerates_missing_fields():
+    """Schema drift insurance — if Frame stops returning file_size /
+    media_type entirely, don't spuriously re-upload every placeholder."""
+    ok, _ = sf._frame_file_has_media({})
+    assert ok
+
+
+def test_has_media_rejects_non_dict():
+    ok, _ = sf._frame_file_has_media(None)  # type: ignore[arg-type]
+    assert not ok
 
 
 if __name__ == "__main__":

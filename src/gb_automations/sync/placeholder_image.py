@@ -43,9 +43,15 @@ _TEXT_BOX_FRAC = 0.82
 
 
 def render_placeholder(text: str | None, bg_bytes: bytes | None) -> bytes:
-    """Render a PNG placeholder. Background = `bg_bytes` (cover-cropped to the
+    """Render a JPEG placeholder. Background = `bg_bytes` (cover-cropped to the
     canvas) or solid black; `text` (when non-empty) is wrapped + centered in
-    white over a darkening scrim. Always returns valid PNG bytes.
+    white over a darkening scrim. Always returns valid JPEG bytes.
+
+    JPEG (not PNG): Goldbox ships all client deliverables as JPG, and the
+    placeholder slot is what the studio's first real V01 upload replaces in
+    Frame's version stack — keeping the same extension matches their workflow.
+    Quality 90 is well above the threshold where text-on-flat-color edges
+    show JPEG ringing; bytes are still ~5× smaller than the PNG was.
 
     Text rendering is wrapped defensively — under bulk-Sync concurrency PIL
     has occasionally raised on shared font handles. We log + skip the text
@@ -64,7 +70,7 @@ def render_placeholder(text: str | None, bg_bytes: bytes | None) -> bytes:
                 exc_info=True,
             )
     out = BytesIO()
-    canvas.save(out, format="PNG")
+    canvas.save(out, format="JPEG", quality=90, optimize=True)
     return out.getvalue()
 
 

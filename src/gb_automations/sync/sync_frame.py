@@ -7,10 +7,10 @@ folder structure inside it:
     <workspace>/<ProjectName> (Frame Project)
                  └── (project's root_folder_id, auto-created by Frame)
                      ├── Interiør/
-                     │   ├── <LeveranseA>_<studio>_V00.png
-                     │   └── <LeveranseB>_<studio>_V00.png
+                     │   ├── <LeveranseA>_<studio>_V00.jpg
+                     │   └── <LeveranseB>_<studio>_V00.jpg
                      └── Eksteriør/
-                         └── <LeveranseC>_<studio>_V00.png
+                         └── <LeveranseC>_<studio>_V00.jpg
 
 Each Notion Project is its own top-level Frame Project, visible in Frame V4's
 "Active Projects" view. Discipline folders are lazily created from each
@@ -74,11 +74,12 @@ _discipline_folder_cache: dict[tuple[str, str], str] = {}
 def _placeholder_filename(project_name: str, task_name: str) -> str:
     """Build the per-task placeholder filename.
 
-    Shape: `<task>_<studio>_V00.png` — e.g. `Vinkel 1_Goldbox.no_V00.png`.
+    Shape: `<task>_<studio>_V00.jpg` — e.g. `Vinkel 1_Goldbox.no_V00.jpg`.
     The leveranse name alone (no project prefix) keeps filenames uniquely
     labelled within a shared discipline folder while matching the format
-    Goldbox wants to see in Frame. The placeholder is always V00; the team's
-    first real delivery uploads on top as V01 in Frame's version stack.
+    Goldbox wants to see in Frame (deliverables ship as JPG). The placeholder
+    is always V00; the team's first real delivery uploads on top as V01 in
+    Frame's version stack.
 
     The studio slot comes from settings.frame_filename_studio (default
     "Goldbox.no"). Renaming the studio in .env affects only NEW placeholders
@@ -87,14 +88,14 @@ def _placeholder_filename(project_name: str, task_name: str) -> str:
     but is kept in the signature so callers don't need to change.
     """
     studio = settings.frame_filename_studio or "Goldbox.no"
-    return f"{task_name}_{studio}_V00.png"
+    return f"{task_name}_{studio}_V00.jpg"
 
 
 def _placeholder_source_url(leveranse_page_id: str) -> str:
     """URL Frame fetches the placeholder bytes from.
 
     Prefer the per-deliverable dynamic render endpoint
-    (`<origin>/assets/placeholder/<page_id>.png`), which composes the
+    (`<origin>/assets/placeholder/<page_id>.jpg`), which composes the
     background + description text from the live Notion row. Falls back to the
     static `frame_placeholder_url` when the public origin can't be derived
     (e.g. frame_placeholder_url isn't an absolute URL). Frame fetches this
@@ -104,7 +105,7 @@ def _placeholder_source_url(leveranse_page_id: str) -> str:
     base = settings.placeholder_render_base
     if not base:
         return settings.frame_placeholder_url
-    return f"{base}/assets/placeholder/{leveranse_page_id}.png"
+    return f"{base}/assets/placeholder/{leveranse_page_id}.jpg"
 
 # Frame's V4 API returns a canonical `view_url` on every project/folder/file
 # response, so we just persist what Frame gives us instead of building URLs
@@ -170,7 +171,7 @@ class FrameLeveranseResult:
     project_page_id: str | None = None
     # adopted = a sibling folder with the same name already existed under
     # the discipline folder and we matched it instead of creating a duplicate
-    # (and reused its placeholder.png if one was present).
+    # (and reused its placeholder.jpg if one was present).
     action: str = "skipped"  # created | adopted | renamed | unchanged | skipped | failed
     frame_folder_id: str | None = None
     frame_placeholder_file_id: str | None = None
@@ -280,12 +281,12 @@ async def _find_child_file_by_name(
 ) -> dict | None:
     """Return the child file object whose `name` matches, or None.
 
-    Mirror of _find_child_folder_by_name for the placeholder.png lookup —
+    Mirror of _find_child_folder_by_name for the placeholder.jpg lookup —
     same list_folder_children call returns folders AND files, we just
     filter the opposite way. We accept any non-folder type because the
     exact V4 file type string isn't pinned anywhere in our wrapper; the
-    only sibling of a placeholder.png that would slip past this is another
-    folder named "placeholder.png", which is nonsensical.
+    only sibling of a placeholder.jpg that would slip past this is another
+    folder named "placeholder.jpg", which is nonsensical.
     """
     children = await frame_client.list_folder_children(parent_folder_id)
     for child in children:
@@ -544,32 +545,61 @@ async def sync_frame_project(project_page_id: str) -> FrameProjectResult:
 _PLACEHOLDER_VERIFY_WAIT_SECONDS = 15.0
 
 
-def _frame_file_has_media(file_obj: dict) -> bool:
-    """Did Frame's async background fetcher actually ingest bytes from
-    our source URL?
+# Smallest plausible real placeholder image. The bare black-canvas fallback
+# (`render_placeholder(None, None)`) is a few KB even as a JPEG; any text
+# render is well above. Any value below this floor is Frame having stored
+# an HTTP error body (the bug this guard catches: Frame's fetcher
+# occasionally lands an "error code: 1015"-style text payload from the
+# Cloudflare tunnel and reports `file_size: 15, media_type: text/plain`
+# back to us). 1000 bytes is a comfortable floor that flags those without
+# false-positiving on any legitimate render.
+_PLACEHOLDER_MIN_BYTES = 1000
 
-    The load-bearing signal is `file_size > 0`. Verified live against
-    Frame V4 on Goldbox's tenant: a placeholder where Frame's fetch
-    dropped comes back with `status="transcoded"` (the standard
-    "processing done" status) and `media_type="image/png"` (derived from
-    the upload's filename extension at create time, NOT from fetched
-    bytes) — so neither field is a discriminator. Only `file_size: 0`
-    reliably indicates "Frame finished its pipeline with zero bytes
-    ingested."
 
-    Defensive: if the payload doesn't include `file_size` (older API
-    surface, or a shape drift), we treat the file as fetched-OK to
-    avoid spuriously re-uploading. The whole verify-and-retry path is
-    a workaround for a Frame-side race, not a hard correctness gate —
-    a false negative is acceptable, a false positive (= no retry when
-    we should retry) is what we're tightening here.
+def _frame_file_has_media(file_obj: dict) -> tuple[bool, str]:
+    """Did Frame's async background fetcher actually ingest our image?
+
+    Returns `(ok, reason)` — `reason` is empty on success, a short
+    human-readable cause on failure (used by the WARNING log so operators
+    can triage at a glance: did Frame fetch nothing, or fetch garbage?).
+
+    Two checks, both load-bearing — verified live against Frame V4 on
+    Goldbox's tenant after a bulk-Sync run where 5/6 placeholders showed
+    no UI thumbnail despite Frame returning `status="transcoded"`:
+
+      • `file_size >= _PLACEHOLDER_MIN_BYTES` — guards against the case
+        where Frame's fetcher pulled a short HTTP error body (observed:
+        `file_size: 15` from a Cloudflare-tunnel hiccup). The previous
+        `> 0` check was too lax and let those through.
+      • `media_type` starts with `image/` — Frame DERIVES `media_type`
+        from the response Content-Type, NOT from the upload filename
+        (contrary to an earlier docstring's claim). On a successful
+        ingest it's `image/jpeg` (currently) or `image/png` (legacy);
+        on the error-body case above it comes back `text/plain`. Same
+        broken file flags both signals, but they're independent enough
+        that catching either is cheap insurance against a shape drift
+        on one side.
+
+    Defensive: if either field is missing entirely (older API surface
+    or schema drift), we treat the file as fetched-OK to avoid spuriously
+    re-uploading. The whole verify-and-retry path is a workaround for a
+    Frame-side race, not a hard correctness gate — a false negative is
+    acceptable, a false positive (= no retry when we should retry) is
+    what this guard tightens.
     """
     if not isinstance(file_obj, dict):
-        return False
-    if "file_size" not in file_obj:
-        return True  # field missing → can't say, assume OK
+        return False, "no file payload"
+
     size = file_obj.get("file_size")
-    return isinstance(size, (int, float)) and size > 0
+    if size is not None:
+        if not isinstance(size, (int, float)) or size < _PLACEHOLDER_MIN_BYTES:
+            return False, f"file_size={size}"
+
+    media_type = file_obj.get("media_type")
+    if media_type is not None and not str(media_type).startswith("image/"):
+        return False, f"media_type={media_type!r}"
+
+    return True, ""
 
 
 async def _verify_or_reupload_placeholder(
@@ -601,7 +631,8 @@ async def _verify_or_reupload_placeholder(
         )
         return placeholder_id, {}
 
-    if _frame_file_has_media(file_obj):
+    ok, reason = _frame_file_has_media(file_obj)
+    if ok:
         logger.info(
             "frame: placeholder %s for leveranse %s verified — Frame "
             "ingested the source URL ok",
@@ -611,12 +642,13 @@ async def _verify_or_reupload_placeholder(
         return placeholder_id, file_obj
 
     logger.warning(
-        "frame: placeholder %s for leveranse %s has NO media after "
-        "%.0fs — Frame's async fetcher dropped the fetch. Deleting + "
-        "re-uploading.",
+        "frame: placeholder %s for leveranse %s has NO valid media after "
+        "%.0fs (%s) — Frame's async fetcher dropped the fetch or stored an "
+        "error body. Deleting + re-uploading.",
         placeholder_id,
         leveranse_page_id,
         _PLACEHOLDER_VERIFY_WAIT_SECONDS,
+        reason,
     )
     try:
         await frame_client.delete_file(placeholder_id)
@@ -641,12 +673,14 @@ async def _verify_or_reupload_placeholder(
         verified = await frame_client.get_file(new_id)
     except Exception:
         return new_id, new_file
-    if not _frame_file_has_media(verified):
+    ok2, reason2 = _frame_file_has_media(verified)
+    if not ok2:
         logger.warning(
-            "frame: placeholder %s for leveranse %s STILL has no media "
-            "after re-upload — operator should re-click Sync on this row",
+            "frame: placeholder %s for leveranse %s STILL has no valid media "
+            "after re-upload (%s) — operator should re-click Sync on this row",
             new_id,
             leveranse_page_id,
+            reason2,
         )
     else:
         logger.info(
@@ -752,7 +786,7 @@ async def sync_frame_leveranse(leveranse_page_id: str) -> FrameLeveranseResult:
         project_id_for_url = project_row.frame_project_id
 
         # Per-leveranse placeholder filename, e.g.
-        #   "Vinkel 1_Goldbox.no_V00.png"
+        #   "Vinkel 1_Goldbox.no_V00.jpg"
         # Computed from the leveranse title + the configured studio slot. The
         # "_V00" marks this as the placeholder version; the team's first real
         # delivery uploads on top of it as V01 in Frame's version stack.

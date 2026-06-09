@@ -346,7 +346,7 @@ class FrameLeveranseFolder(Base):
 
     Layout shift (post-flatten): there is no longer a per-leveranse wrapping
     folder. The placeholder file sits directly under the discipline folder,
-    and the filename (`<project>_<studio>_<leveranse>_V00.png`) IS the visible
+    and the filename (`<project>_<studio>_<leveranse>_V00.jpg`) IS the visible
     label in Frame's UI. As a consequence:
       - `frame_folder_id` now holds the SHARED discipline folder id —
         multiple FrameLeveranseFolder rows in the same discipline-of-project
