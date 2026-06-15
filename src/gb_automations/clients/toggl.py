@@ -278,7 +278,7 @@ async def get_project(
 
 
 async def create_project(
-    workspace_id: str, name: str, *, active: bool = True
+    workspace_id: str, name: str, *, active: bool = True, is_private: bool = False
 ) -> dict[str, Any]:
     """`POST /api/v9/workspaces/{wid}/projects` — create a project.
 
@@ -286,8 +286,13 @@ async def create_project(
     `active=true` explicitly so the project lands in the team's default
     timer dropdowns — Toggl doesn't show archived projects there. Color
     is left unset (Toggl auto-assigns).
+
+    `is_private=False` so the whole workspace can see and track time on
+    it — Toggl's default is True (creator + admins only), which makes the
+    project invisible to the rest of the team and its `track.toggl.com/
+    projects/{id}` URL 404 for them.
     """
-    body = {"name": name, "active": active}
+    body = {"name": name, "active": active, "is_private": is_private}
     async with await _client() as client:
         response = await _with_retries(
             lambda: client.post(

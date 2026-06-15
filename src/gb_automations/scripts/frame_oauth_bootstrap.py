@@ -116,6 +116,12 @@ async def main() -> None:
     settings.frame_refresh_token = refresh_token
     frame_auth.reset_cache()
 
+    # Also persist to the oauth_tokens table so the .env paste below is a
+    # backup / convenience rather than a hard requirement. From this point
+    # on the running api reads from DB-first, so a missed .env edit no
+    # longer breaks Frame.
+    await frame_auth._save_refresh_token_to_db(refresh_token)
+
     print()
     print("✓ Got refresh + access tokens.")
     print()
@@ -171,8 +177,18 @@ async def main() -> None:
 
     print()
     print("=" * 76)
-    print("DONE — paste these into .env (host machine), then restart the api:")
+    print("DONE — refresh token already persisted to the oauth_tokens table.")
     print("=" * 76)
+    print()
+    print("The api is now using the new token live (no restart needed for")
+    print("auth to work). Daily APScheduler keepalive rotates it before the")
+    print("14-day Adobe expiry, so this script shouldn't need to be re-run")
+    print("unless the Adobe credential is rotated or petter@goldbox.no's")
+    print("password changes.")
+    print()
+    print("Still paste these into .env on the host so a fresh container")
+    print("bootstrap (empty DB) has a seed, and so FRAME_ACCOUNT_ID /")
+    print("FRAME_WORKSPACE_ID are available at process start:")
     print()
     print(f"FRAME_REFRESH_TOKEN={refresh_token}")
     print(f"FRAME_ACCOUNT_ID={account['id']}")
@@ -182,7 +198,7 @@ async def main() -> None:
     print("  SYNC_FRAME=true")
     print("  FRAME_PLACEHOLDER_URL=https://hub.<your-domain>/assets/Goldbox_Logo_White.png")
     print()
-    print("Then on the host:")
+    print("Then on the host (only if you changed SYNC_FRAME or other flags):")
     print("  docker compose up -d --force-recreate api")
     print()
     print(

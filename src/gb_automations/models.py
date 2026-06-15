@@ -33,6 +33,32 @@ class SyncCursor(Base):
     )
 
 
+class OAuthToken(Base):
+    """Live OAuth refresh token per provider, rotated in place.
+
+    Adobe IMS rotates refresh tokens on every /token call — the response
+    body carries a fresh refresh_token that replaces the one used to make
+    the call, and the original token issued at bootstrap is valid for 14
+    days. Each rotation resets that window, so as long as we capture the
+    rotated value, the integration runs indefinitely.
+
+    Storing the live token in Postgres (rather than relying on .env) means
+    container rebuilds don't lose rotations, and the operator no longer has
+    to re-paste tokens on every Adobe credential change.
+    """
+
+    __tablename__ = "oauth_tokens"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    refresh_token: Mapped[str] = mapped_column(String(2048), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class User(Base):
     """Workspace mailbox the backend should sync."""
 

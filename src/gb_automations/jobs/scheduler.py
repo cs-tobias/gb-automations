@@ -7,6 +7,9 @@ Currently:
     02:00 Europe/Oslo so the previous day's entries are settled before the
     pull. Only ENQUEUES a task — the durable worker runs the actual sync,
     so a long Reports v3 call can't trip the scheduler's misfire timeout.
+  - Daily Frame.io refresh-token keepalive. Adobe IMS rotates the token on
+    every refresh call and the original expires after 14 days; a quiet week
+    (holidays, low Frame activity) would otherwise let the clock run out.
 
 The scheduler is started in main.py's lifespan handler and shut down on app exit.
 """
@@ -44,6 +47,24 @@ async def _enqueue_toggl_hours_job() -> None:
         )
 
 
+async def _frame_token_keepalive() -> None:
+    """Force a Frame refresh-token rotation so the 14-day clock can't run out.
+
+    Adobe IMS rotates the refresh token on every refresh call. Even an idle
+    deployment (no Frame webhook traffic for a week+) needs SOMEONE to call
+    /token before day 14, or the original token expires and the integration
+    breaks with access_denied. Failure here is logged but never raised —
+    the scheduler must keep ticking other jobs even if Adobe is down.
+    """
+    from gb_automations.clients.frame_auth import get_access_token
+
+    try:
+        await get_access_token(force_refresh=True)
+        logger.info("⏰ Frame.io token keepalive refresh succeeded")
+    except Exception:
+        logger.exception("⏰ Frame.io token keepalive refresh failed")
+
+
 def start_scheduler() -> None:
     """Wire up jobs and start the scheduler. Idempotent — safe to call once at startup."""
     if scheduler.running:
@@ -66,6 +87,19 @@ def start_scheduler() -> None:
             _enqueue_toggl_hours_job,
             CronTrigger(hour=2, minute=0, timezone="Europe/Oslo"),
             id="toggl_hours_daily",
+            replace_existing=True,
+        )
+
+    # Frame.io refresh-token keepalive. Adobe rotates on each refresh call;
+    # forcing one every day keeps the 14-day expiry window perpetually
+    # renewed even when no one touches Frame for a stretch. Gated on
+    # frame_client_id so a deploy without Frame configured doesn't fire a
+    # job that immediately errors.
+    if settings.frame_client_id and settings.frame_client_secret:
+        scheduler.add_job(
+            _frame_token_keepalive,
+            CronTrigger(hour=3, minute=30, timezone="Europe/Oslo"),
+            id="refresh_frame_token_daily",
             replace_existing=True,
         )
 
