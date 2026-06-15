@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -713,12 +713,28 @@ async def claim_one(session: AsyncSession) -> SyncTask | None:
 
 
 async def mark_done(session: AsyncSession, task_id: int) -> None:
-    """Mark a task done (synced, or legitimately skipped — e.g. no project)."""
+    """Mark a task done (synced, or legitimately skipped — e.g. no project).
+
+    Also clears any stale terminally-`failed` rows of the SAME task_type for
+    the SAME project — when the operator retries and the task finally works,
+    the project's red dot should turn green. We scope by task_type so a Frame
+    success doesn't paper over a real Toggl failure on the same project.
+    """
+    task = await session.get(SyncTask, task_id)
     await session.execute(
         update(SyncTask)
         .where(SyncTask.id == task_id)
         .values(status="done", finished_at=func.now(), last_error=None)
     )
+    if task is not None and task.project_page_id:
+        await session.execute(
+            delete(SyncTask).where(
+                SyncTask.project_page_id == task.project_page_id,
+                SyncTask.task_type == task.task_type,
+                SyncTask.status == "failed",
+                SyncTask.id != task_id,
+            )
+        )
 
 
 async def mark_failed(
