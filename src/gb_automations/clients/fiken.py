@@ -207,7 +207,7 @@ async def list_companies() -> list[dict[str, Any]]:
             lambda: client.get("/companies"), op_name="list_companies"
         )
         _raise_for_status(response)
-        return response.json() or []
+        return _unwrap_list(response.json())
 
 
 async def create_contact(
@@ -264,18 +264,44 @@ async def create_contact(
         }
 
 
+def _unwrap_list(payload: Any) -> list[dict[str, Any]]:
+    """Defensive coercion for Fiken's list responses.
+
+    Fiken returns a plain JSON array `[{...}, ...]` on list endpoints.
+    (Earlier we thought it returned `{"value": [...], "Count": N}`, but
+    that was PowerShell's `Invoke-RestMethod | ConvertTo-Json` wrapping
+    arrays — confirmed against raw `curl` showing `[`.) The helper kept
+    for safety against future Fiken response-shape changes; returns []
+    on anything we don't recognize so the caller never crashes on a
+    surprise.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        items = payload.get("value")
+        if isinstance(items, list):
+            return items
+    return []
+
+
 async def list_contacts(
     company_slug: str, *, customer: bool = True
 ) -> list[dict[str, Any]]:
     """`GET /companies/{slug}/contacts?customer=true` — paginated.
 
     Returns every contact flagged as a customer (the engine resolves a
-    Notion project's customer name against `name`, `email`, or
-    `organizationNumber` on these). Stops on the first empty page;
-    pageSize=100 is Fiken's documented max.
+    Notion project's customer by `organizationNumber`).
+
+    Fiken paginates with `page` STARTING AT 0 (not 1 — verified
+    empirically via the `fiken-api-page` response header). Sending
+    page=1 returns an empty array when there are fewer than 100
+    results, which silently broke duplicate-detection (engine saw no
+    matches → created a fresh contact every run, eventually 7
+    duplicates of the same Cinesuit). pageSize=100 is Fiken's
+    documented max.
     """
     rows: list[dict[str, Any]] = []
-    page = 1
+    page = 0
     async with await _client() as client:
         while True:
             response = await _with_retries(
@@ -290,12 +316,10 @@ async def list_contacts(
                 op_name="list_contacts",
             )
             _raise_for_status(response)
-            data = response.json() or []
+            data = _unwrap_list(response.json())
             if not data:
                 break
             rows.extend(data)
-            # Fiken returns Link headers OR plain truncation on the last
-            # page. The empty-body check above handles both.
             if len(data) < 100:
                 break
             page += 1
@@ -307,10 +331,11 @@ async def list_products(company_slug: str) -> list[dict[str, Any]]:
 
     Mirrors list_contacts. The engine uses this to discover any existing
     per-discipline products by `productNumber` so a fresh deployment
-    adopts what's already in Fiken instead of duplicating them.
+    adopts what's already in Fiken instead of duplicating them. Fiken's
+    pagination is 0-indexed (see list_contacts docstring).
     """
     rows: list[dict[str, Any]] = []
-    page = 1
+    page = 0
     async with await _client() as client:
         while True:
             response = await _with_retries(
@@ -321,7 +346,7 @@ async def list_products(company_slug: str) -> list[dict[str, Any]]:
                 op_name="list_products",
             )
             _raise_for_status(response)
-            data = response.json() or []
+            data = _unwrap_list(response.json())
             if not data:
                 break
             rows.extend(data)

@@ -704,7 +704,12 @@ FAKTURERT_LABELS_SLUTT_DONE = (
 # Simpler operator UX than a per-project percentage; one click does the
 # right thing.
 PROJECTS_FIKEN_PROPS = {
-    "last_draft_url": "Siste fiken-utkast",  # url
+    # One URL per invoice side. Each Fiken draft is recorded under its
+    # own column so clicking "slutt" doesn't overwrite the link to the
+    # earlier "oppstart" draft. Engine writes the side that just ran;
+    # the other side stays untouched.
+    "oppstart_draft_url": "Oppstartsfaktura",  # url
+    "slutt_draft_url": "Sluttfaktura",         # url
 }
 
 

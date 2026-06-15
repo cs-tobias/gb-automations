@@ -883,8 +883,8 @@ async def create_fiken_invoice(
 
     if draft_url:
         try:
-            await notion_client.set_project_last_draft_url(
-                project_page_id, draft_url
+            await notion_client.set_project_draft_url(
+                project_page_id, invoice_type=invoice_type, url=draft_url
             )
         except Exception as err:  # noqa: BLE001
             logger.warning(

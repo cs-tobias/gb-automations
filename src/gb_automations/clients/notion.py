@@ -1114,13 +1114,17 @@ async def set_oppgave_billing_state(
 ) -> None:
     """Stamp billing state on an Oppgave after a Fiken draft is created.
 
-    Atomic on Notion's side (single PATCH carrying both updates), so we
-    never leave a row half-stamped — the `Fakturert` multi-select picks
-    up the new label AND the corresponding `Skal …` checkbox clears,
-    or neither.
+    Writes ONLY the `Fakturert` multi-select — the `Skal …faktureres`
+    checkbox is left exactly where the operator put it. Reasoning: the
+    checkbox is history ("yes, I picked this row for billing"), not
+    a transient picker. Auto-clearing destroyed information about what
+    was actually invoiced. The `Fakturert` label is the authoritative
+    "is this row already billed" signal — duplicate runs are prevented
+    by the label, not by the checkbox state.
 
-    `invoice_type` is "oppstart" or "slutt". The corresponding
-    `Skal …faktureres` checkbox is cleared.
+    `invoice_type` is "oppstart" or "slutt" — used to pick the column
+    only for validation right now, kept in the signature for symmetry
+    with the checkbox-aware version and for future use.
 
     `label_to_add` is the Fakturert label the caller decided to add
     (e.g. "Oppstartsfakturert", "Sluttfakturert", "Sluttfakturert (full)").
@@ -1132,17 +1136,11 @@ async def set_oppgave_billing_state(
 
     `existing_labels` is the row's current multi-select option names,
     read by the caller (typically from a `get_page` immediately
-    beforehand). Passing them in keeps this helper a pure write — no
-    extra read here for the racy "labels could change between our
-    re-read and the PATCH" case.
+    beforehand). Passing them in keeps this helper a pure write.
 
     Idempotent at the API level (PATCHing the same union is a no-op).
     """
-    if invoice_type == "oppstart":
-        checkbox_prop = OPPGAVER_PROPS["should_invoice_at_start"]
-    elif invoice_type == "slutt":
-        checkbox_prop = OPPGAVER_PROPS["should_invoice_at_end"]
-    else:
+    if invoice_type not in ("oppstart", "slutt"):
         raise ValueError(f"invoice_type must be oppstart|slutt, got {invoice_type!r}")
 
     fakturert_prop = OPPGAVER_PROPS["billed_status"]
@@ -1156,7 +1154,6 @@ async def set_oppgave_billing_state(
 
     props = {
         fakturert_prop: {"multi_select": multi_select_payload},
-        checkbox_prop: {"checkbox": False},
     }
     async with _client() as client:
         response = await _with_retries(
@@ -1168,21 +1165,32 @@ async def set_oppgave_billing_state(
         _raise_for_status(response)
 
 
-async def set_project_last_draft_url(project_page_id: str, url: str | None) -> None:
-    """Write the `Siste fiken-utkast` URL property on a Projects-DB page.
-    Idempotent.
+async def set_project_draft_url(
+    project_page_id: str, *, invoice_type: str, url: str | None
+) -> None:
+    """Write the Fiken draft URL on a Projects-DB page, routed to the
+    side-specific column (`Oppstartsfaktura` or `Sluttfaktura`).
+    Idempotent — touches only the column for this invoice_type, so
+    clicking the slutt button doesn't erase the oppstart link.
 
-    Called by sync_fiken_invoice after a successful draft creation so the
-    user can jump straight to the draft from the project row. Pass
-    `url=None` to clear.
+    Pass `url=None` to clear.
     """
-    props = {PROJECTS_FIKEN_PROPS["last_draft_url"]: {"url": url}}
+    if invoice_type == "oppstart":
+        prop_name = PROJECTS_FIKEN_PROPS["oppstart_draft_url"]
+    elif invoice_type == "slutt":
+        prop_name = PROJECTS_FIKEN_PROPS["slutt_draft_url"]
+    else:
+        raise ValueError(
+            f"invoice_type must be oppstart|slutt, got {invoice_type!r}"
+        )
+
+    props = {prop_name: {"url": url}}
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
                 f"/pages/{project_page_id}", json={"properties": props}
             ),
-            op_name=f"PATCH /pages/{project_page_id} last_draft_url",
+            op_name=f"PATCH /pages/{project_page_id} {prop_name}",
         )
         _raise_for_status(response)
 
