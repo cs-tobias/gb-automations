@@ -470,6 +470,12 @@ _ACTIVE_LEVERANSE_STATUS_PREDICATE = text(
 _ACTIVE_FRAME_FILE_STATUS_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_file_status_sync'"
 )
+_ACTIVE_FIKEN_INVOICE_CREATE_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'fiken_invoice_create'"
+)
+_ACTIVE_FIKEN_POLL_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'fiken_poll'"
+)
 
 
 async def enqueue_frame_version_sync(stack_id: str) -> int:
@@ -594,6 +600,84 @@ async def enqueue_frame_file_status_sync(
         .on_conflict_do_nothing(
             index_elements=["gmail_thread_id"],
             index_where=_ACTIVE_FRAME_FILE_STATUS_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+# ============================================================
+# Fiken Phase A — invoice creation (button) + poller (singleton)
+# ============================================================
+
+
+async def enqueue_fiken_invoice_create(
+    project_page_id: str, invoice_type: str
+) -> int:
+    """Enqueue a Fiken draft-invoice creation for one Notion Project.
+
+    Fired by the per-project Notion buttons (Opprett oppstartsfaktura /
+    Opprett sluttfaktura). The worker reads the live Notion project +
+    ticked Oppgaver at process time, so collapsing rapid double-clicks
+    of the same button to one task is correct — the engine sees whatever
+    state the rows are in when it runs.
+
+    `invoice_type` is "oppstart" or "slutt". We pack
+    f"{project_page_id}:{invoice_type}" into gmail_thread_id so the same
+    project can have BOTH an oppstart and a slutt creation in flight
+    simultaneously (distinct dedup keys), while two clicks of the SAME
+    button on the same project collapse to one row via
+    uq_sync_tasks_active_fiken_invoice_create.
+
+    Returns 1 if newly enqueued, 0 if a duplicate was already active.
+    """
+    if not project_page_id or invoice_type not in ("oppstart", "slutt"):
+        return 0
+
+    dedup_key = f"{project_page_id}:{invoice_type}"
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="fiken_invoice_create",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=dedup_key,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_FIKEN_INVOICE_CREATE_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_fiken_poll() -> int:
+    """Enqueue a Fiken sent-invoices/offers poll. Singleton — at most one
+    active row globally (cron + manual /debug/fiken/poll double-fire
+    collapses to one).
+
+    Returns 1 if newly enqueued, 0 if one was already pending/in_progress.
+    Mirrors enqueue_toggl_hours_sync.
+    """
+    # Late import — the sentinel lives next to SyncTask in models.py and
+    # pulling it here avoids the import-cycle risk of constants near the top.
+    from gb_automations.models import FIKEN_POLL_SINGLETON_KEY
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="fiken_poll",
+            user_email="*",
+            gmail_thread_id=FIKEN_POLL_SINGLETON_KEY,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_FIKEN_POLL_PREDICATE,
         )
     )
     async with SessionLocal() as own:
@@ -866,6 +950,8 @@ __all__ = [
     "enqueue_frame_version_sync",
     "enqueue_oppgave_done_sync",
     "enqueue_leveranse_status_recheck",
+    "enqueue_fiken_invoice_create",
+    "enqueue_fiken_poll",
     "claim_one",
     "mark_done",
     "mark_failed",

@@ -22,6 +22,7 @@ from gb_automations.config import (
     MANUAL_DELIVERABLE_STATUSES,
     OPPGAVER_FRAME_URL_PROP,
     OPPGAVER_PROPS,
+    PROJECTS_FIKEN_PROPS,
     PROJECTS_FRAME_URL_PROP,
     PROJECTS_GMAIL_URL_PROP,
     PROJECTS_NAS_URL_PROP,
@@ -367,6 +368,62 @@ def read_rich_text_prop(page: dict[str, Any], prop_name: str) -> str | None:
     blocks = prop.get("rich_text") or prop.get("title") or []
     text = "".join(b.get("plain_text", "") for b in blocks).strip()
     return text or None
+
+
+def read_number_prop(page: dict[str, Any], prop_name: str) -> float | None:
+    """Read a `number` property from a page object. Returns None when unset.
+
+    Used by the Fiken creation engine to read `Pris` (per-Oppgave unit
+    price) and the two `*_fakturert andel` fractions. Notion stores
+    numbers as JSON numbers (int or float); we always return float for
+    uniform downstream math.
+    """
+    prop = (page.get("properties") or {}).get(prop_name)
+    if not prop:
+        return None
+    value = prop.get("number")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_checkbox_prop(page: dict[str, Any], prop_name: str) -> bool:
+    """Read a `checkbox` property from a page object. Returns False on
+    absent/empty (Notion treats an unset checkbox as false).
+
+    Used by the Fiken creation engine to read the per-Oppgave
+    `Skal oppstartsfaktureres` / `Skal sluttfaktureres` picker checkboxes.
+    """
+    prop = (page.get("properties") or {}).get(prop_name)
+    if not prop:
+        return False
+    return bool(prop.get("checkbox"))
+
+
+def read_multi_select_names(page: dict[str, Any], prop_name: str) -> list[str]:
+    """Read a `multi_select` property's option names from a page object.
+
+    Returns a list of (stripped) names in the order Notion sends them.
+    Empty list when the property is absent, empty, or not a multi_select.
+
+    Used by the Fiken creation engine to read the `Fakturert` column —
+    a row's billing state machine ("Oppstartsfakturert", "Sluttfakturert",
+    "Sluttfakturert (full)", "Kreditert") lives there.
+    """
+    prop = (page.get("properties") or {}).get(prop_name)
+    if not prop:
+        return []
+    options = prop.get("multi_select") or []
+    names: list[str] = []
+    for opt in options:
+        if isinstance(opt, dict):
+            name = (opt.get("name") or "").strip()
+            if name:
+                names.append(name)
+    return names
 
 
 def read_first_file_url(page: dict[str, Any], prop_name: str) -> str | None:
@@ -1039,6 +1096,93 @@ async def set_deliverable_frame_url(deliverable_page_id: str, url: str | None) -
                 f"/pages/{deliverable_page_id}", json={"properties": props}
             ),
             op_name=f"PATCH /pages/{deliverable_page_id} frame_url (deliverable)",
+        )
+        _raise_for_status(response)
+
+
+# ============================================================
+# Fiken — billing-state writebacks on Oppgaver + Project rows
+# ============================================================
+
+
+async def set_oppgave_billing_state(
+    oppgave_page_id: str,
+    *,
+    invoice_type: str,
+    label_to_add: str,
+    existing_labels: list[str],
+) -> None:
+    """Stamp billing state on an Oppgave after a Fiken draft is created.
+
+    Atomic on Notion's side (single PATCH carrying both updates), so we
+    never leave a row half-stamped — the `Fakturert` multi-select picks
+    up the new label AND the corresponding `Skal …` checkbox clears,
+    or neither.
+
+    `invoice_type` is "oppstart" or "slutt". The corresponding
+    `Skal …faktureres` checkbox is cleared.
+
+    `label_to_add` is the Fakturert label the caller decided to add
+    (e.g. "Oppstartsfakturert", "Sluttfakturert", "Sluttfakturert (full)").
+    Engine code computes this from the row's CURRENT labels — slutt
+    after a prior oppstart adds "Sluttfakturert"; slutt on a fresh row
+    adds "Sluttfakturert (full)". This helper is content-agnostic; it
+    just unions `label_to_add` into the existing set so labels never
+    overwrite each other.
+
+    `existing_labels` is the row's current multi-select option names,
+    read by the caller (typically from a `get_page` immediately
+    beforehand). Passing them in keeps this helper a pure write — no
+    extra read here for the racy "labels could change between our
+    re-read and the PATCH" case.
+
+    Idempotent at the API level (PATCHing the same union is a no-op).
+    """
+    if invoice_type == "oppstart":
+        checkbox_prop = OPPGAVER_PROPS["should_invoice_at_start"]
+    elif invoice_type == "slutt":
+        checkbox_prop = OPPGAVER_PROPS["should_invoice_at_end"]
+    else:
+        raise ValueError(f"invoice_type must be oppstart|slutt, got {invoice_type!r}")
+
+    fakturert_prop = OPPGAVER_PROPS["billed_status"]
+
+    # Union the new label with what's already there. Dedup by name
+    # (preserve order: existing first, then new if not present).
+    merged: list[str] = list(existing_labels)
+    if label_to_add and label_to_add not in merged:
+        merged.append(label_to_add)
+    multi_select_payload = [{"name": name} for name in merged if name]
+
+    props = {
+        fakturert_prop: {"multi_select": multi_select_payload},
+        checkbox_prop: {"checkbox": False},
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{oppgave_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{oppgave_page_id} fiken billing state ({invoice_type})",
+        )
+        _raise_for_status(response)
+
+
+async def set_project_last_draft_url(project_page_id: str, url: str | None) -> None:
+    """Write the `Siste fiken-utkast` URL property on a Projects-DB page.
+    Idempotent.
+
+    Called by sync_fiken_invoice after a successful draft creation so the
+    user can jump straight to the draft from the project row. Pass
+    `url=None` to clear.
+    """
+    props = {PROJECTS_FIKEN_PROPS["last_draft_url"]: {"url": url}}
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{project_page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{project_page_id} last_draft_url",
         )
         _raise_for_status(response)
 

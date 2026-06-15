@@ -356,6 +356,38 @@ class Settings(BaseSettings):
                 out[left] = right
         return out
 
+    # Fiken (Norwegian accounting). Two halves:
+    #   1. CREATION — Notion buttons on a Project enqueue
+    #      `fiken_invoice_create` tasks that POST a DRAFT invoice to Fiken
+    #      (oppstart at the project's configured percentage, slutt = remainder).
+    #      The user reviews + sends from Fiken's UI.
+    #   2. POLLER — APScheduler enqueues a singleton `fiken_poll` task that
+    #      lists sent invoices/offers and upserts them into year-partitioned
+    #      `Fakturaer YYYY` / `Tilbud YYYY` Notion DBs (replaces the Make
+    #      automation that matches on the project name in the reference field).
+    # Personal API token (Bearer header). Created at *Rediger konto →
+    # Sikkerhet → Personlige API-nøkler* in Fiken. Non-expiring, revocable.
+    fiken_api_token: str = ""
+    # Company slug from `GET /companies`. Every endpoint is scoped via
+    # `/companies/{slug}/…`. Single-tenant Goldbox → one slug suffices.
+    fiken_company_slug: str = ""
+    # Parent Notion page under which yearly `Fakturaer YYYY` / `Tilbud YYYY`
+    # databases auto-create (same pattern as emails_parent_page_id /
+    # toggl_timer_parent_page_id).
+    fiken_parent_page_id: str = ""
+    # How often the poller runs. 30 min is fine — invoices are low-velocity
+    # and we don't need real-time mirror.
+    fiken_poll_interval_minutes: int = 30
+    # On the first poll after enabling, how far back to backfill. 90 days
+    # covers a normal accounting quarter; older invoices stay in Fiken.
+    fiken_first_poll_window_days: int = 90
+    # Feature flag — OFF by default. When true: the scheduled poller runs,
+    # the Notion fiken-create-invoice webhook accepts requests, and
+    # _validate_required_settings requires the token + slug + parent page id
+    # + projects_db_id. Flip to true once the personal-account smoke test
+    # passes.
+    sync_fiken: bool = False
+
 
 settings = Settings()
 
@@ -421,6 +453,26 @@ COMPANIES_PROPS = {
     "name": "Navn",
     "domain": "Nettside",
     "contacts": "Kontaktpersoner",
+    # Relation → Fakturamottaker DB. The Fakturamottaker row holds the
+    # company's Orgnr (Norwegian organization number) which is the
+    # authoritative key for resolving the matching Fiken customer.
+    # Read-only for the Fiken creation engine.
+    "fakturamottaker": "Fakturamottaker",
+}
+
+
+# The relation property on the Projects DB that links a project to its
+# Kunder (Companies) row. Read-only for the Fiken creation engine; the
+# engine walks Project → Kunder → Fakturamottaker → Orgnr to resolve the
+# Fiken customer.
+PROJECTS_KUNDER_PROP = "Kunder"
+
+
+# Properties on the Fakturamottaker DB. Only the Orgnr is read by the
+# Fiken creation engine — Fakturamottaker rows carry additional address
+# / billing-recipient fields that this app doesn't touch.
+FAKTURAMOTTAKER_PROPS = {
+    "orgnr": "Orgnr",   # rich_text — Norwegian organization number
 }
 
 
@@ -594,6 +646,65 @@ OPPGAVER_PROPS = {
     # sub-items are enabled; default label "Parent item"). Korreksjonsrunde
     # sub-rows point at their deliverable.
     "parent": "Parent item",
+    # Fiken billing columns (only meaningful on deliverable rows). `Pris`
+    # drives the invoice line's unitAmount. The two `Skal …` checkboxes
+    # are the "pick which rows to bill" UX (user ticks before clicking
+    # the project-level Opprett-faktura button). `Fakturert` is the
+    # multi-select carrying the row's billing state — engine-written
+    # after a successful draft creation. See FAKTURERT_LABELS below for
+    # the four option names + their state-machine semantics.
+    "price_per_row": "Pris",                              # number (NOK)
+    "should_invoice_at_start": "Skal oppstartsfaktureres",  # checkbox
+    "should_invoice_at_end": "Skal sluttfaktureres",      # checkbox
+    "billed_status": "Fakturert",                         # multi_select
+}
+
+
+# The four option names that may appear in the `Fakturert` multi-select
+# on an Oppgaver row. Engine reads them to decide eligibility, writes
+# them after billing.
+#
+# State machine:
+#   (empty)                                — never billed; both Skal-* eligible
+#   oppstart                               — 50% billed on a startup invoice; slutt eligible
+#   oppstart + slutt                       — fully billed across two invoices (50/50)
+#   slutt_full                             — fully billed on a single slutt invoice (no oppstart)
+#   kreditert                              — a credit note has voided this row; engine never re-bills
+#                                            (Phase B reads only; Phase C will write this when the
+#                                            poller sees a credit note in Fiken)
+#
+# Engine NEVER writes `kreditert` — operator (or Phase C) sets it
+# manually when a draft is cancelled or credit-noted in Fiken.
+FAKTURERT_LABEL_OPPSTART = "Oppstartsfakturert"
+FAKTURERT_LABEL_SLUTT = "Sluttfakturert"
+FAKTURERT_LABEL_SLUTT_FULL = "Sluttfakturert (full)"
+FAKTURERT_LABEL_KREDITERT = "Kreditert"
+
+FAKTURERT_LABELS_ALL = (
+    FAKTURERT_LABEL_OPPSTART,
+    FAKTURERT_LABEL_SLUTT,
+    FAKTURERT_LABEL_SLUTT_FULL,
+    FAKTURERT_LABEL_KREDITERT,
+)
+
+# "Any slutt-side label is present" — used by the eligibility filter to
+# decide a row has already been finally-billed (either split or single).
+FAKTURERT_LABELS_SLUTT_DONE = (
+    FAKTURERT_LABEL_SLUTT,
+    FAKTURERT_LABEL_SLUTT_FULL,
+)
+
+
+# Properties added to the Projects DB for the Fiken integration.
+# `last_draft_url` is engine-written after each successful draft creation
+# so the user can jump straight to the draft in Fiken's UI.
+#
+# Oppstart/slutt split is hardcoded — oppstart always bills 50%, slutt
+# bills the remainder (100% on its own / 50% if oppstart ran first).
+# Simpler operator UX than a per-project percentage; one click does the
+# right thing.
+PROJECTS_FIKEN_PROPS = {
+    "last_draft_url": "Siste fiken-utkast",  # url
 }
 
 

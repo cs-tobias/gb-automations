@@ -97,6 +97,27 @@ def _validate_required_settings() -> None:
                 + ". Run `python -m gb_automations.scripts.frame_oauth_bootstrap` "
                 "to seed account/workspace/refresh token + root project id."
             )
+    # Fiken integration requires the personal API token + company slug for
+    # all API calls, the parent Notion page for the year-partitioned
+    # Fakturaer/Tilbud DBs, and projects_db_id so the poller can resolve the
+    # Prosjekt relation on each invoice row.
+    if settings.sync_fiken:
+        missing = [
+            name
+            for name, value in (
+                ("FIKEN_API_TOKEN", settings.fiken_api_token),
+                ("FIKEN_COMPANY_SLUG", settings.fiken_company_slug),
+                ("FIKEN_PARENT_PAGE_ID", settings.fiken_parent_page_id),
+                ("PROJECTS_DB_ID", settings.projects_db_id),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "SYNC_FIKEN=true but required Fiken settings are missing: "
+                + ", ".join(missing)
+                + ". See docs/misc/fiken-integration.md for the bootstrap flow."
+            )
 
 
 _validate_required_settings()

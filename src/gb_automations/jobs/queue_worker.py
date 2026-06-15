@@ -35,6 +35,7 @@ from gb_automations.sync.queue import (
     status_counts,
 )
 from gb_automations.sync.dispatch_project_status import dispatch_project_status
+from gb_automations.sync.sync_fiken_invoice import create_fiken_invoice
 from gb_automations.sync.sync_frame import sync_frame_leveranse, sync_frame_project
 from gb_automations.sync.sync_frame_comments import sync_frame_comment
 from gb_automations.sync.sync_frame_file_status import sync_frame_file_status
@@ -489,6 +490,68 @@ async def _process_project_status_dispatch(
     )
 
 
+async def _process_fiken_invoice_create(
+    claimed: _Claimed, progress: str
+) -> None:
+    """Run a fiken_invoice_create task: create a DRAFT invoice in Fiken
+    for a Notion Project's ticked Oppgaver.
+
+    The enqueue helper packs `f"{project_page_id}:{invoice_type}"` into
+    gmail_thread_id so the same project can have BOTH an oppstart and
+    a slutt task in flight at once (different keys). Parse it back here.
+
+    Engine: `sync/sync_fiken_invoice.py::create_fiken_invoice`.
+    """
+    project_page_id = claimed.project_page_id
+    raw = claimed.gmail_thread_id or ""
+    if ":" in raw:
+        _, invoice_type = raw.rsplit(":", 1)
+    else:
+        invoice_type = ""
+    retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
+    logger.info(
+        "▶ task %s — fiken %s draft for %s%s",
+        progress,
+        invoice_type or "?",
+        project_page_id,
+        retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject=f"Fiken {invoice_type} draft"
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError("fiken_invoice_create task has no project_page_id")
+        if invoice_type not in ("oppstart", "slutt"):
+            raise ValueError(
+                f"fiken_invoice_create: unparseable gmail_thread_id {raw!r}"
+            )
+        result = await create_fiken_invoice(project_page_id, invoice_type)
+        if result.action == "failed":
+            outcome_error = result.note or "fiken invoice creation failed"
+    except Exception as err:
+        log_api_error(
+            logger,
+            f"fiken_invoice_create crashed for {project_page_id}",
+            err,
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=f"{project_page_id}:{invoice_type}",
+    )
+    await queue_mirror.refresh_project_dot(
+        project_page_id, progress=progress, subject=f"Fiken {invoice_type} draft"
+    )
+
+
 async def _process_toggl_hours_sync(claimed: _Claimed, progress: str) -> None:
     """Run a toggl_hours_sync task: nightly aggregation from Toggl Reports
     v3 → year-partitioned `Timer YYYY` Notion DB.
@@ -938,6 +1001,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "project_status_dispatch":
         await _process_project_status_dispatch(claimed, progress)
+        return
+    if claimed.task_type == "fiken_invoice_create":
+        await _process_fiken_invoice_create(claimed, progress)
         return
     if claimed.task_type == "toggl_project_sync":
         await _process_toggl_project_sync(claimed, progress)

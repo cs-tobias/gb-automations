@@ -1089,3 +1089,164 @@ async def debug_notion_automation_health() -> dict[str, Any]:
             "change-automation-against-auto-pause)."
         ),
     }
+
+
+# ============================================================
+# Fiken — smoke tests + manual draft trigger (bypasses webhook)
+# ============================================================
+
+
+@router.get("/fiken")
+async def debug_fiken() -> dict[str, Any]:
+    """Fiken connection smoke test.
+
+    Calls `GET /user` + `GET /companies` to prove the full auth chain:
+    FIKEN_API_TOKEN valid, Bearer header accepted, Fiken API reachable.
+    Echoes back the configured `FIKEN_COMPANY_SLUG` so the operator can
+    confirm it matches one of the slugs in the companies list.
+
+    Fails with a 502 + the actual error message if anything is wrong.
+    Typical failure: token unset, token revoked, or 99 NOK/mo API module
+    not enabled on the Fiken organization.
+    """
+    from gb_automations.clients import fiken as fiken_client
+    from gb_automations.config import settings
+
+    try:
+        user = await fiken_client.whoami()
+        companies = await fiken_client.list_companies()
+    except fiken_client.FikenAPIError as err:
+        raise HTTPException(502, str(err)) from err
+
+    company_slugs = [
+        (c.get("slug") or "", c.get("name") or "") for c in companies
+    ]
+    return {
+        "ok": True,
+        "user_name": user.get("name"),
+        "user_email": user.get("email"),
+        "companies": company_slugs,
+        "configured_slug": settings.fiken_company_slug or None,
+        "configured_slug_matches": any(
+            slug == settings.fiken_company_slug for slug, _ in company_slugs
+        ),
+    }
+
+
+@router.post("/fiken/create-draft")
+async def debug_fiken_create_draft(
+    project_page_id: str = Query(..., description="Notion Project page id"),
+    invoice_type: str = Query(
+        ...,
+        description="'oppstart' or 'slutt'",
+        pattern="^(oppstart|slutt)$",
+    ),
+) -> dict[str, Any]:
+    """Manually enqueue a fiken_invoice_create task — bypasses the Notion
+    button (and its bearer auth) so the engine can be exercised from a
+    laptop without configuring Notion automations first.
+
+    Same code path as the webhook: enqueue + wake worker + return
+    immediately. The actual work happens on the queue worker; poll
+    `/debug/queue` to see when it finishes.
+    """
+    from gb_automations.jobs import queue_worker
+    from gb_automations.sync.queue import enqueue_fiken_invoice_create
+
+    inserted = await enqueue_fiken_invoice_create(project_page_id, invoice_type)
+    queue_worker.wake()
+    return {
+        "project_page_id": project_page_id,
+        "invoice_type": invoice_type,
+        "action": "queued" if inserted else "already_queued",
+    }
+
+
+@router.get("/fiken/inspect")
+async def debug_fiken_inspect(
+    project_page_id: str = Query(..., description="Notion Project page id"),
+    invoice_type: str = Query(
+        "oppstart",
+        description="'oppstart' or 'slutt'",
+        pattern="^(oppstart|slutt)$",
+    ),
+) -> dict[str, Any]:
+    """Dump exactly what the Fiken creation engine sees under this project.
+
+    For each Oppgave returned by `oppgaver_for_project`, shows every value
+    the eligibility filter checks (raw Type label, normalized discipline,
+    Pris, the four checkbox/andel columns) and why the row passed or
+    failed. The goal is to never have to guess what Notion is sending —
+    if the engine says "no eligible Oppgaver", this endpoint tells you
+    which check ate them.
+
+    Doesn't enqueue anything, doesn't touch Fiken — pure read.
+    """
+    from gb_automations.clients import notion as notion_client
+    from gb_automations.config import DISCIPLINE_KEYS, OPPGAVER_PROPS
+    from gb_automations.sync.sync_fiken_invoice import (
+        _row_fraction_for_invoice_type,
+    )
+
+    rows = await notion_client.oppgaver_for_project(project_page_id)
+    inspected: list[dict[str, Any]] = []
+    checkbox_prop = (
+        OPPGAVER_PROPS["should_invoice_at_start"]
+        if invoice_type == "oppstart"
+        else OPPGAVER_PROPS["should_invoice_at_end"]
+    )
+
+    for row in rows:
+        raw_type = notion_client.task_discipline(row)
+        canonical = DISCIPLINE_KEYS.get((raw_type or "").strip().lower())
+        ticked = notion_client.read_checkbox_prop(row, checkbox_prop)
+        fakturert = notion_client.read_multi_select_names(
+            row, OPPGAVER_PROPS["billed_status"]
+        )
+        price = notion_client.read_number_prop(row, OPPGAVER_PROPS["price_per_row"])
+        remainder = _row_fraction_for_invoice_type(row, invoice_type)
+
+        # The exact same gate the engine uses — keep this aligned with
+        # _eligible_rows in sync_fiken_invoice.py.
+        reasons: list[str] = []
+        if canonical is None:
+            reasons.append(f"Type {raw_type!r} not a recognized discipline")
+        if not ticked:
+            reasons.append(f"{checkbox_prop!s} not ticked")
+        if remainder <= 0.0:
+            reasons.append(
+                f"already billed for this side (Fakturert={fakturert})"
+            )
+        eligible = not reasons
+
+        # Build the title from the row's title-typed property (whatever
+        # its name happens to be — Notion only has one title per row).
+        title = ""
+        for prop in (row.get("properties") or {}).values():
+            if prop.get("type") == "title" and prop.get("title"):
+                title = "".join(t.get("plain_text", "") for t in prop["title"])
+                break
+
+        inspected.append({
+            "page_id": row.get("id"),
+            "title": title,
+            "raw_Type": raw_type,
+            "normalized_discipline": canonical,
+            "Pris": price,
+            "Skal_ticked": ticked,
+            "Fakturert_labels": fakturert,
+            "remainder_for_this_run": remainder,
+            "eligible": eligible,
+            "skipped_because": reasons,
+            "archived": bool(row.get("archived")),
+            "in_trash": bool(row.get("in_trash")),
+        })
+
+    return {
+        "project_page_id": project_page_id,
+        "invoice_type": invoice_type,
+        "checkbox_prop_read": checkbox_prop,
+        "total_rows": len(rows),
+        "eligible_count": sum(1 for r in inspected if r["eligible"]),
+        "rows": inspected,
+    }

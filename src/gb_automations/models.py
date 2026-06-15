@@ -587,6 +587,160 @@ class EmailsDbCache(Base):
     )
 
 
+class FikenInvoice(Base):
+    """One Fiken invoice (draft or sent) that we've touched.
+
+    Two roles in one table:
+
+    1. **Creation audit trail** — every time the Notion creation engine
+       successfully POSTs a draft to Fiken, it writes one row here BEFORE
+       touching Notion. If the Notion stamp write fails (Oppstartsfakturert
+       andel + Skal-checkboxes), the next run sees the audit row and skips
+       — so a flaky network during the Notion call can't double-bill.
+    2. **Poller dedup cache** — when the scheduled `fiken_poll` task pulls
+       a sent invoice from Fiken, this row keeps the resolved Notion page
+       id (in the `Fakturaer YYYY` DB) for cheap "did we already mirror this
+       invoice?" lookups. `last_modified_date` lets us skip unchanged rows.
+
+    Why both roles share the table: an invoice we created via the button
+    also gets seen by the poller once the user clicks Send in Fiken. The
+    PK (company_slug, fiken_invoice_id) is the stable identity in both
+    directions; the optional columns track whichever role wrote first.
+
+    `invoice_type` is "oppstart" / "slutt" for our own creations, NULL
+    for poller-discovered invoices (we don't know whether a hand-created
+    Fiken invoice is a startup or final invoice). `oppstart_fraction` is
+    the per-row fraction applied at creation time (e.g. 0.5 for a 50%
+    startup invoice), persisted so a re-run of the slutt engine reads
+    truth from here OR from Notion and they always agree.
+    """
+
+    __tablename__ = "fiken_invoices"
+
+    company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fiken_invoice_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # The Notion project this invoice belongs to. Resolved by the creation
+    # engine (it IS the source) or by the poller (matched via the reference
+    # field that carries the project title — replaces the Make automation).
+    # Nullable because the poller may legitimately not match a project on
+    # a hand-created invoice; the operator hand-links in Notion.
+    project_page_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # The Notion page id in `Fakturaer YYYY`, written by the poller. NULL on
+    # rows written only by the creation engine until the poller first sees it.
+    notion_page_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # "oppstart" / "slutt" for our own creations; NULL for poller-discovered.
+    invoice_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The fraction applied per ticked row at creation time. NULL on poller-
+    # discovered rows. 0.5 for a default 50% startup invoice.
+    invoice_fraction: Mapped[float | None] = mapped_column(nullable=True)
+    # Fiken's lastModifiedDate (string yyyy-mm-dd) — poll cursor reads this
+    # to skip unchanged rows on incremental polls.
+    last_modified_date: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    inserted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class FikenInvoiceLine(Base):
+    """One Oppgave row billed on one Fiken invoice — the per-row audit trail.
+
+    Written by the creation engine after a successful POST. Lets us answer
+    "what was billed on the startup invoice?" without re-querying Fiken,
+    so the slutt engine can validate its remainder math against persisted
+    truth (a second cross-check on top of `Oppstartsfakturert andel` on the
+    Notion row itself).
+
+    PK is (company_slug, fiken_invoice_id, oppgave_page_id) — the same
+    Oppgave can appear on both an oppstart and a slutt invoice as separate
+    rows in this table (different fiken_invoice_id). `discipline` and
+    `unit_price_ore` (NOK øre, integer cents) are captured at creation
+    time so a later price edit on the Notion row doesn't rewrite history.
+    """
+
+    __tablename__ = "fiken_invoice_lines"
+
+    company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fiken_invoice_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    oppgave_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    discipline: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Fraction billed on THIS invoice for this Oppgave (e.g. 0.5 on oppstart,
+    # 0.5 on the slutt that follows). The sum of fractions across an
+    # Oppgave's lines should be ≤ 1 at all times.
+    fraction: Mapped[float] = mapped_column(nullable=False)
+    # NOK price * 100, captured at creation. Integer to avoid float drift.
+    unit_price_ore: Mapped[int] = mapped_column(Integer, nullable=False)
+    inserted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_fiken_invoice_lines_oppgave", "oppgave_page_id"),
+    )
+
+
+class FikenProductCache(Base):
+    """Fiken product per (company_slug, discipline). Keeps the product
+    catalogue in sync with Notion's per-row prices so invoice lines can
+    link to a real product (richer Fiken-side reports) rather than only
+    free-text lines.
+
+    The creation engine ensures one Fiken product exists per discipline
+    (Interiør / Eksteriør / Animasjon / Annet) and updates its unitPrice
+    when a new Notion price is seen. Distinct from FikenInvoice/Line: this
+    is "what does the catalogue look like", not "what got billed".
+    """
+
+    __tablename__ = "fiken_product_cache"
+
+    company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    discipline: Mapped[str] = mapped_column(String(32), primary_key=True)
+    fiken_product_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    product_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_unit_price_ore: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class FakturaerDbCache(Base):
+    """Year → Notion DB ID for the year-partitioned Fakturaer databases.
+
+    Direct parallel to EmailsDbCache / TimerDbCache. The Fiken year router
+    (`clients/notion_fiken_db.py`) auto-creates `Fakturaer YYYY` databases
+    on first sighting of an invoice in that year and caches the resolved
+    id here. Self-heal: a cached id that no longer exists in Notion is
+    evicted and the DB re-created on the next resolve.
+    """
+
+    __tablename__ = "fakturaer_db_cache"
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notion_db_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class TilbudDbCache(Base):
+    """Year → Notion DB ID for the year-partitioned Tilbud databases.
+
+    Same shape as FakturaerDbCache; offers (tilbud) and invoices live in
+    separate year DBs so views/filters don't have to discriminate by a
+    type column.
+    """
+
+    __tablename__ = "tilbud_db_cache"
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notion_db_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 # Status values for SyncTask. Kept as a plain string + CHECK (not a Postgres
 # ENUM) because ENUMs are painful to extend via Alembic and the rest of the
 # schema uses plain strings/booleans.
@@ -645,6 +799,14 @@ SYNC_TASK_TYPES = (
     "leveranse_status_recheck",
     "toggl_project_sync",
     "toggl_hours_sync",
+    # Fiken Phase A. `fiken_invoice_create` is fired by the per-project
+    # Notion buttons (Opprett oppstartsfaktura / Opprett sluttfaktura);
+    # gmail_thread_id carries f"{project_page_id}:{invoice_type}" so
+    # oppstart and slutt for the same project can be active at once.
+    # `fiken_poll` is the scheduled global singleton — at most one active
+    # ever, mirroring toggl_hours_sync.
+    "fiken_invoice_create",
+    "fiken_poll",
 )
 
 # Sentinel value stuffed into gmail_thread_id on toggl_hours_sync rows so
@@ -653,6 +815,11 @@ SYNC_TASK_TYPES = (
 # flight. Exposed as a constant so the enqueue helper and the migration
 # downgrade both reference the same string.
 TOGGL_HOURS_SINGLETON_KEY = "toggl-hours-singleton"
+
+# Same idea for the Fiken scheduled poller: every active row carries this
+# sentinel in gmail_thread_id so uq_sync_tasks_active_fiken_poll collapses
+# any concurrent enqueue attempts (cron + manual /debug/fiken/poll) to one.
+FIKEN_POLL_SINGLETON_KEY = "fiken-poll-singleton"
 
 
 class SyncTask(Base):
@@ -727,7 +894,8 @@ class SyncTask(Base):
             "'frame_file_status_sync','frame_project_status_sync',"
             "'oppgave_done_sync',"
             "'leveranse_status_recheck','toggl_project_sync',"
-            "'toggl_hours_sync','project_status_dispatch')",
+            "'toggl_hours_sync','project_status_dispatch',"
+            "'fiken_invoice_create','fiken_poll')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -919,6 +1087,32 @@ class SyncTask(Base):
             unique=True,
             postgresql_where=text(
                 "status IN ('pending','in_progress') AND task_type = 'toggl_hours_sync'"
+            ),
+        ),
+        # Fiken Phase A — At most one ACTIVE fiken_invoice_create per
+        # (project, invoice_type). The enqueue helper packs
+        # f"{project_page_id}:{invoice_type}" into gmail_thread_id so the
+        # SAME project can have an oppstart AND a slutt task in flight
+        # simultaneously (different keys), while a double-click on the
+        # same button collapses to one row.
+        Index(
+            "uq_sync_tasks_active_fiken_invoice_create",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'fiken_invoice_create'"
+            ),
+        ),
+        # Fiken Phase A — At most one ACTIVE fiken_poll ever (global
+        # singleton, mirrors uq_sync_tasks_active_toggl_hours). The enqueue
+        # helper stuffs FIKEN_POLL_SINGLETON_KEY into gmail_thread_id so
+        # cron + manual /debug/fiken/poll collapse to one run.
+        Index(
+            "uq_sync_tasks_active_fiken_poll",
+            "gmail_thread_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending','in_progress') AND task_type = 'fiken_poll'"
             ),
         ),
         # Drives the worker's claim query: filter by status, FIFO by oldest
