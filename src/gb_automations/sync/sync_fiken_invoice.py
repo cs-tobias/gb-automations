@@ -707,11 +707,19 @@ async def create_fiken_invoice(
     # incomeAccount field on the line directly, so the booking still
     # routes to the right ledger account.
     #
-    # Field names sent on each line (verified against Fiken's actual
-    # UI behavior, not just the POST docs):
-    #   - description   the per-Oppgave Navn from Notion
-    #   - quantity      decimal (0.5 / 1.0 / etc — Fiken accepts floats)
-    #   - unitPrice     kroner (decimal NOK; the UI shows what we send)
+    # Field names sent on each line:
+    #   - description   per-Oppgave Navn from Notion
+    #   - quantity      decimal (Fiken accepts floats)
+    #   - unitPrice     INTEGER ØRE for free-text lines. Yes — the field
+    #                   is called "unitPrice" in BOTH directions but its
+    #                   scale differs by line type: lines linked to a
+    #                   productId use unitPrice=kroner (because the
+    #                   product carries its own scale), free-text lines
+    #                   use unitPrice=øre. Empirically observed: sending
+    #                   13500 on a free-text line displayed as 135,00 NOK
+    #                   in Fiken's UI (i.e. Fiken treated 13500 as øre).
+    #                   So we send the unit_price_ore we've been carrying
+    #                   internally, no conversion.
     #   - vatType       "HIGH" for 25% MVA
     #   - incomeAccount "3020" (services) — routes the booking
     line_payloads: list[dict[str, Any]] = []
@@ -719,7 +727,7 @@ async def create_fiken_invoice(
         payload: dict[str, Any] = {
             "description": line.description,
             "quantity": round(line.quantity, 4),
-            "unitPrice": round(line.unit_price_ore / 100.0, 2),
+            "unitPrice": line.unit_price_ore,
             "vatType": fiken_client.VAT_TYPE_25_PCT,
             "incomeAccount": fiken_client.INCOME_ACCOUNT_SERVICES_VAT,
         }
@@ -755,11 +763,30 @@ async def create_fiken_invoice(
             draft,
         )
     result.fiken_invoice_id = draft_id or None
-    draft_url = (
-        f"https://fiken.no/foretak/{company_slug}/fakturering/utkast/{draft_id}"
-        if draft_id
-        else None
-    )
+
+    # Build the URL Fiken's web UI uses. The POST response only carries
+    # the numeric draftId, but the UI's draft page is keyed on `uuid`
+    # (`/foretak/{slug}/fakturautkast/{uuid}`). Fetch the draft once to
+    # read its uuid. Best-effort: if the GET fails, fall back to the
+    # numeric-id URL (which 404s in the UI but at least preserves the id
+    # in the Notion field for debugging).
+    draft_url: str | None = None
+    if draft_id:
+        try:
+            full_draft = await fiken_client.get_invoice_draft(
+                company_slug, draft_id
+            )
+            uuid = full_draft.get("uuid")
+            if uuid:
+                draft_url = (
+                    f"https://fiken.no/foretak/{company_slug}/fakturautkast/{uuid}"
+                )
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "fiken_invoice_create: GET draft %s for uuid failed: %s",
+                draft_id,
+                err,
+            )
     result.draft_url = draft_url
 
     # 7. Audit trail: persist FikenInvoice + FikenInvoiceLine.

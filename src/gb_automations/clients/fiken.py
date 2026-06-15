@@ -450,6 +450,27 @@ async def update_product(
         return {"productId": product_id, "name": name}
 
 
+async def get_invoice_draft(
+    company_slug: str, draft_id: str
+) -> dict[str, Any]:
+    """`GET /companies/{slug}/invoices/drafts/{id}` — read a single draft.
+
+    Used right after creation to pull the draft's `uuid`, which is what
+    Fiken's web UI uses in its URL path (`/foretak/{slug}/fakturautkast/{uuid}`).
+    The numeric draftId from the POST response goes nowhere useful in
+    the UI.
+    """
+    async with await _client() as client:
+        response = await _with_retries(
+            lambda: client.get(
+                f"/companies/{company_slug}/invoices/drafts/{draft_id}"
+            ),
+            op_name="get_invoice_draft",
+        )
+        _raise_for_status(response)
+        return response.json()
+
+
 async def create_invoice_draft(
     company_slug: str,
     *,
@@ -528,6 +549,7 @@ __all__ = [
     "FIKEN_API_BASE",
     "REFERENCE_FIELD",
     "create_contact",
+    "get_invoice_draft",
     "VAT_TYPE_25_PCT",
     "FikenAPIError",
     "whoami",
