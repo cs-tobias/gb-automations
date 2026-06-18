@@ -98,16 +98,22 @@ def _validate_required_settings() -> None:
                 "to seed account/workspace/refresh token + root project id."
             )
     # Fiken integration requires the personal API token + company slug for
-    # all API calls, the parent Notion page for the year-partitioned
-    # Fakturaer/Tilbud DBs, and projects_db_id so the poller can resolve the
+    # every API call, and projects_db_id so the engine can resolve the
     # Prosjekt relation on each invoice row.
+    #
+    # NOTE: the earlier `FIKEN_PARENT_PAGE_ID` requirement is gone. That
+    # setting was a leftover from an abandoned year-partitioned
+    # `Fakturaer YYYY` / `Tilbud YYYY` design. The replacement (when
+    # Phase C — Fiken → Notion read-back — eventually lands) is a single
+    # `FAKTURA_DB_ID` pointing at one persistent invoice DB; nothing
+    # reads it at runtime today, so we deliberately do NOT validate it
+    # here. Operators can omit FIKEN_PARENT_PAGE_ID from .env entirely.
     if settings.sync_fiken:
         missing = [
             name
             for name, value in (
                 ("FIKEN_API_TOKEN", settings.fiken_api_token),
                 ("FIKEN_COMPANY_SLUG", settings.fiken_company_slug),
-                ("FIKEN_PARENT_PAGE_ID", settings.fiken_parent_page_id),
                 ("PROJECTS_DB_ID", settings.projects_db_id),
             )
             if not value

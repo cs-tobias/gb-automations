@@ -371,10 +371,17 @@ class Settings(BaseSettings):
     # Company slug from `GET /companies`. Every endpoint is scoped via
     # `/companies/{slug}/…`. Single-tenant Goldbox → one slug suffices.
     fiken_company_slug: str = ""
-    # Parent Notion page under which yearly `Fakturaer YYYY` / `Tilbud YYYY`
-    # databases auto-create (same pattern as emails_parent_page_id /
-    # toggl_timer_parent_page_id).
-    fiken_parent_page_id: str = ""
+    # Phase C (Fiken → Notion read-back) placeholder. ID of the single
+    # Notion `Faktura` DB the future poller will upsert sent invoices into.
+    # Empty during Phase B (today) because nothing reads it at runtime;
+    # operators can leave it unset until Phase C lands.
+    #
+    # This replaces the earlier `fiken_parent_page_id` / year-partitioned
+    # `Fakturaer YYYY` shape, which was abandoned in favor of one
+    # persistent DB. The `FakturaerDbCache` / `TilbudDbCache` tables left
+    # in models.py + migration `v7s8t9u0p1q2` are vestigial — harmless,
+    # never written to, will get cleaned up when Phase C is wired.
+    faktura_db_id: str = ""
     # How often the poller runs. 30 min is fine — invoices are low-velocity
     # and we don't need real-time mirror.
     fiken_poll_interval_minutes: int = 30

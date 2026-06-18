@@ -42,11 +42,19 @@ This doc captures the original Fiken→Notion research (sections below) so we do
 
 ## Phase C — Fiken → Notion read-back (still not started)
 
-The original v1 plan below is the Phase C poller (sent invoices + offers → year-partitioned `Fakturaer YYYY` / `Tilbud YYYY` Notion DBs). The schema landed in [migration v7s8t9u0p1q2](../../migrations/versions/v7s8t9u0p1q2_add_fiken_phase_a.py); the engine still needs writing.
+The original v1 plan below was a Phase C poller upserting sent invoices + offers into **year-partitioned** `Fakturaer YYYY` / `Tilbud YYYY` Notion DBs. That shape has been **abandoned** in favor of a **single persistent `Faktura` DB** the operator points the engine at via `FAKTURA_DB_ID` in `.env`. Reasons: invoice volume is low (no need for year partitioning to keep Notion responsive), one DB is easier to view/filter, and the operator setup is one id instead of a parent page id + auto-creation logic.
+
+What this means for the code today:
+
+- `FIKEN_PARENT_PAGE_ID` is **gone** from settings + startup validation. Do not put it in `.env`.
+- `FAKTURA_DB_ID` is the placeholder setting (`settings.faktura_db_id`, empty by default) that the future poller will read. Empty is fine until Phase C lands; nothing reads it at runtime.
+- The `FakturaerDbCache` / `TilbudDbCache` tables created in [migration v7s8t9u0p1q2](../../migrations/versions/v7s8t9u0p1q2_add_fiken_phase_a.py) are vestigial — never written to, harmless, will be cleaned up when Phase C ships.
 
 The Phase C cutover replaces the existing Make automation that pulls sent invoices from Fiken into a Notion DB today.
 
 ---
+
+> ⚠️ **Heads-up**: everything below is the original Phase C v1 research from June 2026. The **year-partitioned `Fakturaer YYYY` / `Tilbud YYYY`** shape it describes is **abandoned**; see the "Phase C" section above for the current direction (single `Faktura` DB via `FAKTURA_DB_ID`). Mentions of `FIKEN_PARENT_PAGE_ID` are stale — that setting no longer exists. Useful as background for the Fiken API surface area; ignore the schema/setup specifics.
 
 ## What was decided for v1
 
