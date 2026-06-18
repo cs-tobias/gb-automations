@@ -80,6 +80,7 @@ from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from gb_automations.clients import brreg as brreg_client
 from gb_automations.clients import fiken as fiken_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
@@ -91,44 +92,34 @@ from gb_automations.config import (
     FAKTURERT_STATUS_FULL,
     FAKTURERT_STATUS_IKKE,
     FAKTURERT_STATUS_UTGAR,
+    FIKEN_FREE_TEXT_INCOME_ACCOUNT,
+    KORREKSJON_KIND_KORREKSJONSRUNDE,
     FAKTURAMOTTAKER_PROPS,
-    FIKEN_DEFAULT_INCOME_ACCOUNT,
-    FIKEN_KATEGORI_TO_ACCOUNT,
     OPPGAVER_DESC_PROP,
     OPPGAVER_PROPS,
     PROJECTS_FAKTURA_MERKES_PROP,
     PROJECTS_FAKTURA_STATUS_PROP,
     PROJECTS_FAKTURAMOTTAKER_PROP,
+    PROJECTS_KUNDER_PROP,
     settings,
 )
 from gb_automations.db import SessionLocal
 from gb_automations.models import (
+    FikenBankAccount,
     FikenInvoice,
     FikenInvoiceLine,
     FikenPlaceholderContact,
-    FikenProductCache,
+    FikenProductByKategori,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# Per-discipline Fiken product number stems. Used as the stable Fiken-side
-# productNumber (distinct from the numeric productId Fiken auto-assigns
-# and which the cache stores). Free-text invoice lines don't actually link
-# to a productId today (so the customer sees the row Navn instead of a
-# generic "Interiør"), but the catalogue mirror keeps these registered so
-# the price-by-discipline analytics in Fiken stay populated.
-FIKEN_DISCIPLINE_PRODUCT_NUMBERS = {
-    "interior": "goldbox-interior",
-    "exterior": "goldbox-exterior",
-    "animation": "goldbox-animation",
-    "other": "goldbox-other",
-}
-
-# Display names used as the Fiken catalogue product name. Norwegian to
-# match what the customer sees on the printed invoice; the canonical
-# discipline keys are English for code consistency.
-FIKEN_DISCIPLINE_DISPLAY_NAMES = {
+# Norwegian display names used by `_line_product_name` as a final
+# fallback when the row has no Kategori AND no Navn/Beskrivelse. Very
+# rare in practice; kept inline so the engine never produces an empty
+# line description.
+_DISCIPLINE_FALLBACK_NAMES = {
     "interior": "Interiør",
     "exterior": "Eksteriør",
     "animation": "Animasjon",
@@ -149,33 +140,47 @@ DEFAULT_DAYS_UNTIL_DUE_DATE = 14
 class InvoiceLine:
     """One Fiken invoice line — one per eligible Oppgave.
 
-    Two amount-shaped fields by design: `unit_price_nok_ore` is what we
-    send to Fiken's `unitPrice` (un-discounted — Fiken applies `discount`
-    on its side so the customer sees "Pris kr 5000 / Rabatt 15% / Sum
-    kr 4250" on the printed invoice). `amount_nok_ore` is what was
-    actually billed *after* Fiken applies the discount, used for the
-    audit trail and the `Fakturert beløp` stampback in Notion.
+    Price/quantity contract (v3 — "Pris is always Pris"):
+      - `unit_price_nok_ore` is the FULL agreed Pris from Notion, every
+        run, in øre. Oppstart and slutt both send the same unit price;
+        only `quantity_fraction` changes between modes.
+      - `quantity_fraction` is the fraction of the row to bill on this
+        run: 0.5 on oppstart, `remaining/gross` on slutt (1.0 when no
+        prior oppstart, < 1.0 when partially billed already). Fiken
+        prints it as "Antall" so the customer sees how much of the
+        agreed deliverable they're paying for now.
+      - Fiken's line math is `quantity × unitPrice × (1 − discount/100)`,
+        which lands on the post-rabatt NOK amount we record as
+        `amount_nok_ore` (and stamp onto Notion's `Fakturert beløp`).
 
-    Fiken line text comes in two pieces by design:
-      - `product_name` (→ Fiken `description`): the bold first line on
-        the printed invoice. Sourced from the Oppgave's `Oppgave kategori`
-        multi_select (first label) — e.g. "Næring - Interiør", "Print".
-        Falls back to "Navn — Beskrivelse" when no Kategori is set.
-      - `comment` (→ Fiken `comment`): the smaller sub-line below the
-        product name. "Navn - Beskrivelse" (or just Navn when Beskrivelse
-        is blank), so the customer reads "what category they're paying
-        for" up top and "exactly which deliverable" right beneath.
+    Product link (v3 — Kategori → Fiken product):
+      - `product_id` is the numeric Fiken product id resolved from the
+        Oppgave's `Oppgave kategori` multi-select (first label, name
+        match against Fiken's `/products`). When linked, Fiken auto-
+        fills the line's `incomeAccount` from the product itself — the
+        engine never sends a hardcoded account.
+      - `description` (→ Fiken's `description`, the bold first line) is
+        the Kategori label when present, falling back to "Navn —
+        Beskrivelse" when not.
+      - `comment` (→ Fiken's `comment`, the smaller sub-line) is always
+        "Navn - Beskrivelse" so the customer reads the category up top
+        and the specific deliverable right beneath.
 
-    `income_account` is derived from the Kategori too via
-    `FIKEN_KATEGORI_TO_ACCOUNT` (3020 for tjeneste, 3000 for vare, etc.).
-    Defaults to 3020 with a WARN when Kategori is missing or unknown.
+    Free-text fallback: when no Fiken product matches the Kategori label,
+    `product_id` is None and the engine sends a free-text line. Fiken
+    rejects free-text lines with no `incomeAccount` (400), which the
+    operator resolves by adding the missing Fiken product.
     """
 
-    discipline: str            # canonical key, e.g. "interior"
-    product_name: str          # → Fiken `description` (main bold line)
+    # Canonical discipline key (e.g. "interior") OR None when the row's
+    # Type isn't a recognized discipline. Informational on the line
+    # dataclass; the engine no longer gates rows on it (bulletproof mode).
+    discipline: str | None
+    product_id: int | None     # → Fiken `productId` when set; None = free-text
+    description: str           # → Fiken `description` (bold first line)
     comment: str               # → Fiken `comment` (sub-line)
-    income_account: str        # → Fiken `incomeAccount` (kontonummer)
-    unit_price_nok_ore: int    # full undiscounted price in øre → Fiken `unitPrice`
+    unit_price_nok_ore: int    # → Fiken `unitPrice`; ALWAYS the full Pris in øre
+    quantity_fraction: float   # → Fiken `quantity` (Antall)
     discount_percent: float    # 0–100 → Fiken `discount` (per-line, percent)
     amount_nok_ore: int        # post-discount net billed on this line, in øre
     oppgave_page_id: str
@@ -217,15 +222,28 @@ def _eligible_rows(
 ) -> list[dict[str, Any]]:
     """Filter Notion rows to those eligible for this invoice run.
 
-    A row passes iff:
-      - `Type` is a recognized discipline (deliverable, not internal task).
-      - `Fakturert status` is NOT one of {Fakturert, Utgår} — those are
-        "skip, no matter what."
-      - For oppstart: `Fakturert status == "Ikke fakturert"`.
-      - For slutt:    `Fakturert status ∈ {"Ikke fakturert", "Fakturert 50%"}`.
+    "Bulletproof" mode: the engine errs on the side of INCLUDING rows
+    so the operator can trust that every Oppgave they see lands on the
+    invoice draft unless they explicitly excluded it (`Utgår`) or it's
+    an auto-generated admin sub-row (`Korreksjonsrunde`).
 
-    Blank `Fakturert status` (operator never set it) is treated as
-    "Ikke fakturert" so the engine is forgiving on freshly-cloned templates.
+    A row is SKIPPED iff:
+      - `Type == "Korreksjonsrunde"` — these are auto-created by the
+        Frame.io integration to track correction rounds; they're admin
+        metadata, not deliverables.
+      - `Fakturert status == "Utgår"` — operator excluded it.
+      - `Fakturert status == "Fakturert"` — already fully billed,
+        nothing to add (Fakturert beløp = gross already; this is a
+        nothing-to-bill case, not a hidden filter).
+      - For oppstart: `Fakturert status == "Fakturert 50%"` — already
+        oppstartet; re-clicking oppstart shouldn't double-bill.
+      - For slutt: nothing further; both `Ikke fakturert` AND
+        `Fakturert 50%` land. ("Fakturert" is caught above.)
+
+    Everything else passes — including rows with blank Type, unknown
+    Type, missing Pris, missing Kategori, etc. Downstream stages handle
+    those gracefully (kr 0 unitPrice, free-text with default
+    incomeAccount, etc.).
     """
     if invoice_type not in ("oppstart", "slutt"):
         raise ValueError(
@@ -233,9 +251,13 @@ def _eligible_rows(
         )
     out: list[dict[str, Any]] = []
     for row in rows:
-        discipline = notion_client.task_discipline(row)
-        if not _normalize_discipline(discipline):
+        # Skip Korreksjonsrunde sub-rows. `task_discipline` returns the
+        # raw Type label (e.g. "Interiør", "Klargjøre modell",
+        # "Korreksjonsrunde", or None for blank).
+        raw_type = (notion_client.task_discipline(row) or "").strip()
+        if raw_type.lower() == KORREKSJON_KIND_KORREKSJONSRUNDE.lower():
             continue
+
         status = (
             notion_client.read_select_name(row, OPPGAVER_PROPS["billed_status"])
             or FAKTURERT_STATUS_IKKE
@@ -243,66 +265,81 @@ def _eligible_rows(
         if status in (FAKTURERT_STATUS_FULL, FAKTURERT_STATUS_UTGAR):
             continue
         if invoice_type == "oppstart":
-            if status != FAKTURERT_STATUS_IKKE:
+            if status == FAKTURERT_STATUS_50:
                 continue
-        else:  # slutt
-            if status not in (FAKTURERT_STATUS_IKKE, FAKTURERT_STATUS_50):
-                continue
+        # else slutt: Ikke fakturert AND Fakturert 50% both pass.
+
         out.append(row)
     return out
 
 
 def _row_billable_nok(
     row: dict[str, Any], invoice_type: str
-) -> tuple[float, float, float, float] | None:
+) -> tuple[float, float, float, float, float] | None:
     """Compute the per-row billing amounts.
 
-    Returns a 4-tuple
-        (to_bill_nok, new_billed_total_nok, unit_price_nok, discount_fraction)
+    Returns a 5-tuple
+        (to_bill_nok, new_billed_total_nok, unit_price_nok,
+         quantity_fraction, discount_fraction)
     or None when the row should be skipped (no Pris, or renegotiation
     pushed remaining ≤ 0). All NOK values are decimals; the integer-øre
     conversion happens in the caller.
 
-    Two ways to view "what's owed":
-        post-rabatt:   gross = Pris × (1 − Rabatt)
-        pre-rabatt:    unit_price = Pris (×  oppstart fraction when oppstart)
-
-    The post-rabatt number drives the run amount and the Notion ledger
-    (`Fakturert beløp`). The pre-rabatt number is the `unitPrice` we send
-    to Fiken — Fiken applies the rabatt on its side so the customer sees
-    "Pris kr X / Rabatt Y% / Sum kr Z" on the printed invoice rather
-    than just a pre-discounted unit price.
+    Contract (v3 — "Pris is always Pris"):
+      - `unit_price_nok` is ALWAYS the full agreed Pris from Notion,
+        regardless of mode. The customer sees the same unit price on
+        every invoice; only `quantity_fraction` (Antall) changes between
+        oppstart and slutt.
+      - `quantity_fraction` is how much of the row to bill on this run.
+        Oppstart = 0.5. Slutt = remaining/gross — the proportion of the
+        gross still owed, which is 1.0 on a fresh row and 0.5 after a
+        clean oppstart. Renegotiation cases (operator drops Pris between
+        runs) flow through naturally because we recompute remaining
+        against the live `Pris × (1 − Rabatt)`.
+      - `to_bill_nok` is the post-rabatt NOK that lands on Notion's
+        `Fakturert beløp` and the audit trail. Equals
+        `quantity_fraction × Pris × (1 − Rabatt)` — same number Fiken
+        computes from the line internally.
 
     Math:
-        gross         = Pris × (1 − Rabatt)        # Rabatt is a fraction (0.15 = 15%)
+        gross         = Pris × (1 − Rabatt)       # Rabatt is a fraction (0.15 = 15%)
         already       = Fakturert beløp (running total Notion holds)
         remaining     = gross − already
-        oppstart  →   to_bill    = round(gross × 0.5)        # 50% of fresh gross
-                      unit_price = round(Pris × 0.5)         # 50% of fresh full price
-        slutt     →   to_bill    = round(remaining)          # whatever is left
-                      unit_price = round(remaining / (1 − Rabatt))
-                                                              # pre-rabatt amount
-                                                              # that yields the same
-                                                              # remaining post-rabatt
+        oppstart  →   quantity_fraction = 0.5
+                      to_bill           = round(gross × 0.5)
+        slutt     →   quantity_fraction = remaining / gross   (0 < q ≤ 1; 0 when
+                                                                gross=0)
+                      to_bill           = round(remaining)
+        unit_price    = Pris             (always; pre-rabatt, full agreed price)
         new_total     = already + to_bill
 
-    Notes on the slutt unit_price derivation: at slutt time the row may
-    have been partially billed at oppstart, so the "this run's pre-rabatt
-    price" is whatever pre-rabatt amount Fiken would have to apply
-    Rabatt% to in order to land at our intended `remaining`. That's the
-    inverse: `unit_price = remaining / (1 − Rabatt)`. When Rabatt is 0
-    this collapses to `unit_price = remaining`, matching the no-discount
-    path.
+    Bulletproof mode: missing/zero Pris is treated as Pris=0, NOT a
+    skip. The engine emits a kr 0 line so the operator sees the row on
+    the draft and can fill in the Pris later. Only the genuine
+    "nothing to bill" case (slutt with remaining ≤ 0 — operator
+    lowered Pris below what was already invoiced) returns None; that
+    one is silently skipped because Notion's `Budsjett` vs `Fakturert
+    sum` rollups already make the over-billing visible at project
+    level (and credit-note logic is out of scope for this engine).
     """
-    price_nok = notion_client.read_number_prop(
+    raw_price = notion_client.read_number_prop(
         row, OPPGAVER_PROPS["price_per_row"]
     )
-    if price_nok is None or price_nok <= 0:
-        logger.warning(
-            "fiken send-faktura: row %s has no Pris set — skipping",
+    # Bulletproof: missing or non-positive Pris becomes 0. The row still
+    # lands on the draft as a kr 0 line so the operator can fix the Pris
+    # in Notion and re-create the draft, OR edit the line directly in
+    # Fiken's UI.
+    if raw_price is None or raw_price <= 0:
+        logger.info(
+            "fiken send-faktura: row %s has no Pris set — sending kr 0 "
+            "line (operator can fix Pris in Notion and re-click, or edit "
+            "the line in Fiken's UI)",
             row.get("id"),
         )
-        return None
+        price_nok = 0.0
+    else:
+        price_nok = float(raw_price)
+
     # Rabatt: Notion's "Percent" number format returns the value as a
     # fraction (0.15 for 15%), NOT as a percent integer (15). The Oppgaver
     # `Rabatt` column is modeled as Percent so operators see the `%` suffix
@@ -314,7 +351,7 @@ def _row_billable_nok(
         or 0.0
     )
     discount_fraction = max(0.0, min(float(discount_fraction), 1.0))
-    gross = float(price_nok) * (1.0 - discount_fraction)
+    gross = price_nok * (1.0 - discount_fraction)
 
     already = (
         notion_client.read_number_prop(row, OPPGAVER_PROPS["billed_amount"])
@@ -323,68 +360,148 @@ def _row_billable_nok(
     already = max(0.0, float(already))
 
     if invoice_type == "oppstart":
+        quantity_fraction = OPPSTART_FRACTION
         to_bill = round(gross * OPPSTART_FRACTION)
-        unit_price = round(float(price_nok) * OPPSTART_FRACTION)
     else:
-        to_bill = round(gross - already)
-        # Pre-rabatt amount that yields `to_bill` post-rabatt. Rabatt=1.0
-        # is impossible here (clamped, and gross would be 0 → already
-        # caught), so the division is safe.
-        unit_price = (
-            round(to_bill / (1.0 - discount_fraction))
-            if discount_fraction < 1.0
-            else to_bill
-        )
-    if to_bill <= 0:
-        logger.info(
-            "fiken send-faktura: row %s has nothing left to bill "
-            "(gross=%.2f, already=%.2f, to_bill=%.2f) — skipping",
-            row.get("id"),
-            gross,
-            already,
-            to_bill,
-        )
-        return None
+        remaining = gross - already
+        # gross == 0 → land as a kr 0 line (quantity_fraction = 0 so
+        # Fiken still creates the line cleanly).
+        if gross <= 0:
+            quantity_fraction = 0.0
+            to_bill = 0
+        elif remaining <= 0:
+            # Genuine over-billed case: operator lowered Pris below what
+            # was already invoiced. Skip silently — the over-bill is
+            # already visible in Notion via the `Budsjett` vs `Fakturert
+            # sum` rollups, and a credit note (future feature) is the
+            # proper resolution.
+            logger.info(
+                "fiken send-faktura: row %s already over-billed "
+                "(gross=%.2f, already=%.2f, remaining=%.2f) — skipping; "
+                "Notion rollups surface the discrepancy",
+                row.get("id"),
+                gross,
+                already,
+                remaining,
+            )
+            return None
+        else:
+            quantity_fraction = remaining / gross
+            to_bill = round(remaining)
+
     return (
         float(to_bill),
         already + float(to_bill),
-        float(unit_price),
+        price_nok,              # unit_price ALWAYS = Pris (0 when blank)
+        float(quantity_fraction),
         discount_fraction,
     )
 
 
-def _resolve_kategori_and_account(row: dict[str, Any]) -> tuple[str | None, str]:
-    """Read `Oppgave kategori` (multi_select) and resolve to
-    (kategori_label, income_account).
+def _resolve_kategori_label(row: dict[str, Any]) -> str | None:
+    """Read `Oppgave kategori` (multi_select) and return the FIRST label.
 
-    Multi-select: a row CAN carry multiple kategoris, but a Fiken line
-    has one description + one income account. The engine picks the FIRST
-    selected label (Notion preserves the operator's selection order).
-    Unknown / unmapped labels and missing kategori both fall back to
-    `FIKEN_DEFAULT_INCOME_ACCOUNT` (3020) with a WARN log so the gap is
-    visible.
-
-    Returns (None, default_account) when no Kategori is set — caller
-    then composes the line description from Navn/Beskrivelse instead.
+    Notion preserves the operator's selection order, so the first label
+    is their primary intent. Returns None when the column is blank —
+    caller then falls through to the free-text / Navn-Beskrivelse path.
     """
     labels = notion_client.read_multi_select_names(
         row, OPPGAVER_PROPS["kategori"]
     )
-    if not labels:
-        return None, FIKEN_DEFAULT_INCOME_ACCOUNT
-    first = labels[0]
-    account = FIKEN_KATEGORI_TO_ACCOUNT.get(first)
-    if account is None:
-        logger.warning(
-            "fiken send-faktura: row %s has Oppgave kategori %r which is "
-            "not in FIKEN_KATEGORI_TO_ACCOUNT — defaulting to account %s "
-            "(add the kategori to the map in config.py to route it explicitly)",
-            row.get("id"),
-            first,
-            FIKEN_DEFAULT_INCOME_ACCOUNT,
+    return labels[0] if labels else None
+
+
+async def _resolve_kategori_to_product_id(
+    company_slug: str, kategori_label: str
+) -> int | None:
+    """Map a Notion `Oppgave kategori` label to a Fiken `productId`.
+
+    Lookup path:
+      1. Postgres cache (`fiken_product_by_kategori`) keyed on
+         (company_slug, kategori_label). Hit → return cached id.
+      2. Miss → list Fiken's products and find the one whose `name`
+         equals `kategori_label` exactly. When multiple match, prefer
+         the active one (operators sometimes leave a deactivated
+         duplicate). Cache the (kategori_label → productId) mapping.
+      3. No name match → return None. Caller logs a WARN and sends the
+         line free-text; Fiken then 400s on the missing incomeAccount,
+         which is the operator's prompt to add the product in Fiken.
+
+    The cache is a pure speedup: we could rebuild it from Fiken's
+    catalogue at any time. There's no self-heal for stale entries (a
+    Fiken-side delete leaves a dangling id in our cache); a 400 from
+    Fiken on the next draft surfaces the gap.
+    """
+    if not kategori_label:
+        return None
+
+    async with SessionLocal() as session:
+        cached = await session.get(
+            FikenProductByKategori,
+            {"company_slug": company_slug, "kategori_label": kategori_label},
         )
-        account = FIKEN_DEFAULT_INCOME_ACCOUNT
-    return first, account
+    if cached is not None:
+        try:
+            return int(cached.fiken_product_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "fiken: cached productId %r for kategori %r is not an int "
+                "— re-resolving against Fiken",
+                cached.fiken_product_id,
+                kategori_label,
+            )
+
+    try:
+        products = await fiken_client.list_products(company_slug)
+    except Exception as err:  # noqa: BLE001
+        logger.exception(
+            "fiken: list_products failed while resolving kategori %r",
+            kategori_label,
+        )
+        return None
+
+    # Match by name (case-sensitive, exact). Prefer active products if
+    # multiple share a name.
+    matches = [
+        p for p in products if (p.get("name") or "") == kategori_label
+    ]
+    if not matches:
+        return None
+    active = [p for p in matches if p.get("active", True)]
+    chosen = active[0] if active else matches[0]
+    raw_id = chosen.get("productId") or chosen.get("id")
+    try:
+        product_id = int(raw_id) if raw_id is not None else None
+    except (TypeError, ValueError):
+        product_id = None
+    if product_id is None:
+        logger.warning(
+            "fiken: product %r matched kategori but has no usable productId "
+            "(%s)",
+            kategori_label,
+            chosen,
+        )
+        return None
+
+    async with SessionLocal() as session:
+        await session.execute(
+            pg_insert(FikenProductByKategori)
+            .values(
+                company_slug=company_slug,
+                kategori_label=kategori_label,
+                fiken_product_id=str(product_id),
+                name_when_cached=chosen.get("name") or kategori_label,
+            )
+            .on_conflict_do_update(
+                index_elements=["company_slug", "kategori_label"],
+                set_={
+                    "fiken_product_id": str(product_id),
+                    "name_when_cached": chosen.get("name") or kategori_label,
+                },
+            )
+        )
+        await session.commit()
+    return product_id
 
 
 def _line_product_name(row: dict[str, Any], kategori: str | None) -> str:
@@ -412,7 +529,7 @@ def _line_product_name(row: dict[str, Any], kategori: str | None) -> str:
         return description
     canonical = _normalize_discipline(notion_client.task_discipline(row))
     if canonical:
-        return FIKEN_DISCIPLINE_DISPLAY_NAMES.get(canonical, canonical.title())
+        return _DISCIPLINE_FALLBACK_NAMES.get(canonical, canonical.title())
     return ""
 
 
@@ -437,43 +554,99 @@ def _line_comment(row: dict[str, Any]) -> str:
     return ""
 
 
-def _build_line_items(
-    eligible: list[dict[str, Any]], *, invoice_type: str
+async def _build_line_items(
+    eligible: list[dict[str, Any]],
+    *,
+    invoice_type: str,
+    company_slug: str,
 ) -> list[InvoiceLine]:
     """Compose Fiken invoice lines from eligible rows — ONE line per
-    Oppgave. Per-line amount is the NOK already computed by
-    `_row_billable_nok`. Free-text lines (no productId) so the customer
-    sees the Oppgave's Navn (or Navn — Beskrivelse) rather than a
-    generic discipline name.
+    Oppgave. Per-line amount + quantity come from `_row_billable_nok`;
+    the product link comes from `_resolve_kategori_to_product_id`.
 
-    Skips rows missing a Pris or whose remaining is ≤ 0 (renegotiation
-    leftover). Stable order: preserves the order Notion returned them.
+    Bulletproof: every eligible row (passed by _eligible_rows) lands as
+    a line. The only `None` return from _row_billable_nok is the
+    genuine over-billed case (slutt with remaining ≤ 0 — operator
+    lowered Pris below Fakturert beløp); that one is intentionally
+    skipped so the over-bill stays visible only in Notion's rollups.
+
+    Rows with missing Type, missing Pris, missing Kategori, etc. ALL
+    land:
+      - Missing Type → discipline=None on the InvoiceLine; description
+        falls back to Navn — Beskrivelse (and ultimately to the row id
+        if even Navn is blank). The Fiken line still renders.
+      - Missing Pris → kr 0 unit price; line shows on the draft as a
+        zero-amount line that the operator can edit in Fiken or fix in
+        Notion + re-click.
+      - Missing Kategori (or Kategori with no Fiken product match) →
+        free-text line with the default `incomeAccount` (handled at
+        payload assembly).
+
+    Stable order: preserves the order Notion returned them.
+    Async because the kategori → productId path hits Fiken on cache miss.
     """
     lines: list[InvoiceLine] = []
     for row in eligible:
+        # `_normalize_discipline` returns None for rows whose Type isn't
+        # in DISCIPLINE_KEYS. We no longer reject those rows — discipline
+        # is just informational on the line dataclass now, used for audit
+        # trail / fallback labels.
         canonical = _normalize_discipline(notion_client.task_discipline(row))
-        if not canonical:
-            continue
+
         amounts = _row_billable_nok(row, invoice_type)
         if amounts is None:
+            # _row_billable_nok only returns None in the over-billed
+            # case (slutt with remaining ≤ 0). Skip silently — Notion
+            # rollups surface the mismatch.
             continue
-        to_bill_nok, new_total_nok, unit_price_nok, discount_fraction = amounts
+        (
+            to_bill_nok,
+            new_total_nok,
+            unit_price_nok,
+            quantity_fraction,
+            discount_fraction,
+        ) = amounts
         amount_ore = int(round(to_bill_nok * 100))
         unit_price_ore = int(round(unit_price_nok * 100))
-        if amount_ore <= 0:
-            continue
-        kategori, income_account = _resolve_kategori_and_account(row)
-        product_name = _line_product_name(
-            row, kategori
-        ) or FIKEN_DISCIPLINE_DISPLAY_NAMES.get(canonical, canonical.title())
+        # kr 0 lines land — bulletproof. Negative would be a bug; clamp.
+        if amount_ore < 0:
+            amount_ore = 0
+        if unit_price_ore < 0:
+            unit_price_ore = 0
+
+        kategori = _resolve_kategori_label(row)
+        product_id: int | None = None
+        if kategori:
+            product_id = await _resolve_kategori_to_product_id(
+                company_slug, kategori
+            )
+            if product_id is None:
+                logger.warning(
+                    "fiken send-faktura: row %s has Oppgave kategori %r "
+                    "but no Fiken product with that exact name exists "
+                    "— sending as free-text with default incomeAccount "
+                    "(add the product in Fiken's UI to route it cleanly)",
+                    row.get("id"),
+                    kategori,
+                )
+        # Description fallback chain: Kategori → Navn — Beskrivelse →
+        # discipline display → row id (so the line is never empty).
+        description = _line_product_name(row, kategori)
+        if not description and canonical:
+            description = _DISCIPLINE_FALLBACK_NAMES.get(
+                canonical, canonical.title()
+            )
+        if not description:
+            description = row.get("id", "") or "(no description)"
         comment = _line_comment(row)
         lines.append(
             InvoiceLine(
                 discipline=canonical,
-                product_name=product_name,
+                product_id=product_id,
+                description=description,
                 comment=comment,
-                income_account=income_account,
                 unit_price_nok_ore=unit_price_ore,
+                quantity_fraction=round(quantity_fraction, 6),
                 discount_percent=round(discount_fraction * 100.0, 4),
                 amount_nok_ore=amount_ore,
                 oppgave_page_id=row.get("id", ""),
@@ -545,116 +718,6 @@ async def _resolve_project_orgnr(
         if normalized:
             return normalized, fakt_name
     return None, first_fakt_name
-
-
-# ============================================================
-# Product cache (Fiken-side IO)
-# ============================================================
-
-
-async def _ensure_fiken_product(
-    company_slug: str,
-    discipline: str,
-    unit_price_ore: int,
-) -> dict[str, Any] | None:
-    """Adopt or create the Fiken product for this discipline. Mirrors the
-    pre-v2 implementation — the per-line `productId` link still isn't
-    sent on free-text lines (so the customer sees the row description,
-    not the generic discipline name), but keeping the catalogue mirror
-    in step lets Fiken's per-product reports stay correct.
-
-    Returns the product dict (carries `productId`) or None when discipline
-    is outside the catalogue.
-    """
-    product_number = FIKEN_DISCIPLINE_PRODUCT_NUMBERS.get(discipline)
-    if not product_number:
-        return None
-    display_name = FIKEN_DISCIPLINE_DISPLAY_NAMES.get(discipline, discipline.title())
-    unit_price = unit_price_ore / 100.0
-
-    async with SessionLocal() as session:
-        cached = await session.get(
-            FikenProductCache, {"company_slug": company_slug, "discipline": discipline}
-        )
-
-    if cached is None:
-        existing = await fiken_client.list_products(company_slug)
-        adopted = next(
-            (p for p in existing if (p.get("productNumber") or "") == product_number),
-            None,
-        )
-        if adopted is None:
-            adopted = await fiken_client.create_product(
-                company_slug,
-                name=display_name,
-                product_number=product_number,
-                unit_price=unit_price,
-            )
-        product_id = str(adopted.get("productId") or adopted.get("id") or "")
-        if not product_id:
-            logger.warning(
-                "fiken: created/adopted product %s has no productId in response: %s",
-                product_number,
-                adopted,
-            )
-            return adopted
-        async with SessionLocal() as session:
-            await session.execute(
-                pg_insert(FikenProductCache)
-                .values(
-                    company_slug=company_slug,
-                    discipline=discipline,
-                    fiken_product_id=product_id,
-                    product_number=product_number,
-                    last_unit_price_ore=unit_price_ore,
-                )
-                .on_conflict_do_update(
-                    index_elements=["company_slug", "discipline"],
-                    set_={
-                        "fiken_product_id": product_id,
-                        "product_number": product_number,
-                        "last_unit_price_ore": unit_price_ore,
-                    },
-                )
-            )
-            await session.commit()
-        return adopted
-
-    if cached.last_unit_price_ore != unit_price_ore:
-        try:
-            await fiken_client.update_product(
-                company_slug,
-                cached.fiken_product_id,
-                name=display_name,
-                unit_price=unit_price,
-            )
-        except fiken_client.FikenAPIError as err:
-            logger.warning(
-                "fiken: failed to PUT product %s price update: %s",
-                cached.fiken_product_id,
-                err,
-            )
-        else:
-            async with SessionLocal() as session:
-                await session.execute(
-                    pg_insert(FikenProductCache)
-                    .values(
-                        company_slug=company_slug,
-                        discipline=discipline,
-                        fiken_product_id=cached.fiken_product_id,
-                        product_number=cached.product_number,
-                        last_unit_price_ore=unit_price_ore,
-                    )
-                    .on_conflict_do_update(
-                        index_elements=["company_slug", "discipline"],
-                        set_={"last_unit_price_ore": unit_price_ore},
-                    )
-                )
-                await session.commit()
-    return {
-        "productId": cached.fiken_product_id,
-        "productNumber": cached.product_number,
-    }
 
 
 # ============================================================
@@ -743,6 +806,385 @@ async def _ensure_placeholder_contact(company_slug: str) -> int | None:
 
 
 # ============================================================
+# Bank account (Kontonummer on the printed invoice)
+# ============================================================
+
+
+async def _ensure_bank_account_number(company_slug: str) -> str | None:
+    """Resolve the bank account number to send on this draft.
+
+    Lookup precedence:
+      1. `settings.fiken_bank_account_number` (env override) — pinned by
+         the operator. Bypasses cache entirely; useful when the company
+         has multiple accounts and the operator wants a specific one.
+      2. Postgres cache `fiken_bank_accounts(company_slug)` — auto-
+         populated on the first send_faktura per company.
+      3. Miss → `fiken_client.list_bank_accounts`, pick the first
+         account where `inactive=False` and `type=="normal"`, cache
+         its bankAccountNumber.
+
+    Returns None when nothing is set / nothing resolves. The caller
+    then omits `bankAccountNumber` from the draft body and Fiken's
+    printed invoice falls back to whatever it would normally pick (or
+    blank).
+    """
+    if settings.fiken_bank_account_number:
+        return settings.fiken_bank_account_number
+
+    async with SessionLocal() as session:
+        cached = await session.get(FikenBankAccount, company_slug)
+    if cached is not None and cached.bank_account_number:
+        return cached.bank_account_number
+
+    try:
+        accounts = await fiken_client.list_bank_accounts(company_slug)
+    except Exception as err:  # noqa: BLE001
+        logger.exception(
+            "fiken: list_bank_accounts failed for slug=%s — draft will be "
+            "sent without a Kontonummer",
+            company_slug,
+        )
+        return None
+
+    chosen = next(
+        (
+            a
+            for a in accounts
+            if not a.get("inactive", False) and a.get("type") == "normal"
+        ),
+        None,
+    )
+    if chosen is None:
+        logger.warning(
+            "fiken: no active normal-type bank account found for slug=%s "
+            "— draft will be sent without a Kontonummer (set "
+            "FIKEN_BANK_ACCOUNT_NUMBER in .env to pin one explicitly)",
+            company_slug,
+        )
+        return None
+
+    number = (chosen.get("bankAccountNumber") or "").strip()
+    if not number:
+        logger.warning(
+            "fiken: matched bank account has no bankAccountNumber (%s)",
+            chosen,
+        )
+        return None
+
+    async with SessionLocal() as session:
+        await session.execute(
+            pg_insert(FikenBankAccount)
+            .values(
+                company_slug=company_slug,
+                bank_account_number=number,
+                name_when_cached=chosen.get("name") or number,
+            )
+            .on_conflict_do_update(
+                index_elements=["company_slug"],
+                set_={
+                    "bank_account_number": number,
+                    "name_when_cached": chosen.get("name") or number,
+                },
+            )
+        )
+        await session.commit()
+    return number
+
+
+# ============================================================
+# Brreg-driven customer enrichment
+# ============================================================
+#
+# Two paths land here:
+#
+#   _brreg_enrich_name(orgnr, fallback): used when Notion already has
+#     an Orgnr. Returns Brreg's official navn (so the Fiken auto-create
+#     gets a clean legal name instead of whatever the operator typed).
+#     Best-effort: Brreg failure → use the fallback.
+#
+#   _resolve_project_via_kunder_brreg(project_page): used when Notion
+#     has no Orgnr but the Project's Kunder relation has a name. Walks
+#     Project → Kunder, searches Brreg, applies the strict suffix-aware
+#     match, returns (orgnr, brreg_dict) on a clean win. Otherwise
+#     (None, None) — falls back to the placeholder path.
+#
+#   _update_fakturamottaker_in_notion(project_page, orgnr, brreg_name):
+#     post-creation writeback. Updates the existing Fakturamottaker title
+#     to Brreg's name (idempotent — skip if equal) and fills its Orgnr
+#     if blank; or creates a fresh Fakturamottaker row and links it to
+#     the Project when the Project had nothing linked.
+#
+# All three are best-effort: they log warnings + return on any Notion
+# error so the in-flight draft (already created in Fiken at this point)
+# stays the source of truth.
+
+
+async def _brreg_enrich_name(
+    orgnr: str, fallback_name: str | None
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Return Brreg's official `navn` for an Orgnr, plus the full payload.
+
+    Returns (best_name, brreg_dict) where:
+      - best_name = Brreg's navn on success; the fallback_name otherwise
+        (or None if both are missing).
+      - brreg_dict = the Brreg entity payload on success; None on miss.
+
+    Splitting the two return values lets the caller distinguish "we
+    have a Brreg record, write it back to Notion" from "Brreg miss,
+    just use this name to create the Fiken contact" — we don't want
+    to overwrite Notion data with a fallback name we made up.
+    """
+    enhet = await brreg_client.get_enhet(orgnr)
+    if not enhet:
+        return (fallback_name or None), None
+    brreg_navn = (enhet.get("navn") or "").strip() or None
+    if not brreg_navn:
+        return (fallback_name or None), None
+    return brreg_navn, enhet
+
+
+async def _resolve_project_via_kunder_brreg(
+    project_page: dict[str, Any],
+) -> tuple[str | None, dict[str, Any] | None]:
+    """For projects with no Orgnr: walk Project → Kunder → search Brreg.
+
+    Returns (orgnr_digits, brreg_dict) on a clean suffix-aware match,
+    else (None, None). Falls back silently on every degraded path:
+      - No Kunder relation on the project,
+      - Kunder row read failed,
+      - Kunder title blank,
+      - Brreg search returned 0 or 2+ clean matches.
+
+    The clean-match rule (case-insensitive, suffix-aware) lives in
+    brreg_client.pick_exact_match.
+    """
+    kunder_ids = notion_client.read_relation_ids(
+        project_page, PROJECTS_KUNDER_PROP
+    )
+    if not kunder_ids:
+        return None, None
+
+    # Walk the first Kunder row with a usable title. Operators usually
+    # link a project to one Kunder; a multi-link is rare but we cope.
+    for kunder_id in kunder_ids:
+        try:
+            kunder_page = await notion_client.get_page(kunder_id)
+        except Exception as err:  # noqa: BLE001
+            logger.info(
+                "fiken: skipping Kunder %s during Brreg resolve "
+                "(read failed: %s)",
+                kunder_id,
+                err,
+            )
+            continue
+        kunder_name = (
+            notion_client.extract_page_title(kunder_page) or ""
+        ).strip()
+        if not kunder_name:
+            continue
+
+        results = await brreg_client.search_enheter(kunder_name)
+        chosen = brreg_client.pick_exact_match(kunder_name, results)
+        if chosen is None:
+            logger.info(
+                "fiken: Brreg search for Kunder %r returned %d hit(s) but "
+                "no clean suffix-aware match — falling back to placeholder",
+                kunder_name,
+                len(results),
+            )
+            return None, None
+        orgnr = _normalize_orgnr(chosen.get("organisasjonsnummer"))
+        if not orgnr:
+            logger.warning(
+                "fiken: matched Brreg result for Kunder %r has no "
+                "organisasjonsnummer (%s)",
+                kunder_name,
+                chosen,
+            )
+            return None, None
+        logger.info(
+            "fiken: Brreg resolved Kunder %r → orgnr=%s navn=%r",
+            kunder_name,
+            orgnr,
+            chosen.get("navn"),
+        )
+        return orgnr, chosen
+    return None, None
+
+
+async def _update_fakturamottaker_in_notion(
+    project_page: dict[str, Any], orgnr: str, brreg_name: str
+) -> None:
+    """Idempotently align Notion's Fakturamottaker with Brreg's record.
+
+    Three sub-cases:
+      1. Project has a Fakturamottaker linked AND that row's Orgnr is
+         non-blank → only update the title if it differs from
+         brreg_name. (Don't fill Orgnr — we already had one.)
+      2. Project has a Fakturamottaker linked AND that row's Orgnr is
+         blank → fill Orgnr=orgnr AND update title to brreg_name.
+      3. Project has NO Fakturamottaker linked → create a new row in
+         FAKTURAMOTTAKER_DB_ID with title=brreg_name + Orgnr=orgnr,
+         then PATCH the Project's relation to point at it.
+
+    Best-effort: every Notion API error here logs WARN + returns. The
+    Fiken draft has already been created at this point; a failed
+    writeback just leaves Notion slightly stale.
+    """
+    project_page_id = project_page.get("id") or ""
+
+    fakt_ids = notion_client.read_relation_ids(
+        project_page, PROJECTS_FAKTURAMOTTAKER_PROP
+    )
+    if fakt_ids:
+        # Case 1 or 2 — update the existing row.
+        fakt_id = fakt_ids[0]
+        try:
+            fakt_page = await notion_client.get_page(fakt_id)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "fiken Brreg writeback: failed to GET Fakturamottaker "
+                "%s: %s",
+                fakt_id,
+                err,
+            )
+            return
+
+        current_title = (
+            notion_client.extract_page_title(fakt_page) or ""
+        ).strip()
+        current_orgnr = _normalize_orgnr(
+            notion_client.read_rich_text_prop(
+                fakt_page, FAKTURAMOTTAKER_PROPS["orgnr"]
+            )
+        )
+
+        # Title update (idempotent — skip if already equal).
+        if current_title != brreg_name:
+            try:
+                await notion_client.set_page_title(
+                    fakt_id,
+                    title=brreg_name,
+                    title_prop_name=FAKTURAMOTTAKER_PROPS["navn"],
+                )
+                logger.info(
+                    "fiken Brreg writeback: renamed Fakturamottaker %s "
+                    "%r → %r",
+                    fakt_id,
+                    current_title,
+                    brreg_name,
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning(
+                    "fiken Brreg writeback: failed to rename Fakturamottaker "
+                    "%s to %r: %s",
+                    fakt_id,
+                    brreg_name,
+                    err,
+                )
+
+        # Orgnr fill (only when blank — don't clobber an operator-set value).
+        if not current_orgnr and orgnr:
+            try:
+                await _set_fakturamottaker_orgnr(fakt_id, orgnr)
+                logger.info(
+                    "fiken Brreg writeback: filled Orgnr=%s on "
+                    "Fakturamottaker %s",
+                    orgnr,
+                    fakt_id,
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning(
+                    "fiken Brreg writeback: failed to fill Orgnr on "
+                    "Fakturamottaker %s: %s",
+                    fakt_id,
+                    err,
+                )
+        return
+
+    # Case 3 — no Fakturamottaker linked. Create one and link it. Skip
+    # silently if the engine doesn't know the Fakturamottaker DB id.
+    db_id = settings.fakturamottaker_db_id
+    if not db_id:
+        logger.info(
+            "fiken Brreg writeback: project %s has no Fakturamottaker "
+            "linked AND FAKTURAMOTTAKER_DB_ID is unset — skipping "
+            "creation. Set FAKTURAMOTTAKER_DB_ID in .env to enable the "
+            "Brreg-by-name writeback path.",
+            project_page_id,
+        )
+        return
+
+    try:
+        new_fakt_id = await notion_client.create_page_in_db(
+            db_id,
+            title=brreg_name,
+            title_prop_name=FAKTURAMOTTAKER_PROPS["navn"],
+            extra_properties={
+                FAKTURAMOTTAKER_PROPS["orgnr"]: {
+                    "rich_text": [{"text": {"content": orgnr}}]
+                },
+            },
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.warning(
+            "fiken Brreg writeback: failed to create Fakturamottaker "
+            "(navn=%r, orgnr=%s) in DB %s: %s",
+            brreg_name,
+            orgnr,
+            db_id,
+            err,
+        )
+        return
+    try:
+        await notion_client.set_relation(
+            project_page_id,
+            prop_name=PROJECTS_FAKTURAMOTTAKER_PROP,
+            target_ids=[new_fakt_id],
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.warning(
+            "fiken Brreg writeback: created Fakturamottaker %s but "
+            "failed to link it to Project %s: %s",
+            new_fakt_id,
+            project_page_id,
+            err,
+        )
+        return
+    logger.info(
+        "fiken Brreg writeback: created Fakturamottaker %s (navn=%r, "
+        "orgnr=%s) and linked to Project %s",
+        new_fakt_id,
+        brreg_name,
+        orgnr,
+        project_page_id,
+    )
+
+
+async def _set_fakturamottaker_orgnr(fakt_id: str, orgnr: str) -> None:
+    """PATCH the `Orgnr` rich_text property on a Fakturamottaker row.
+
+    Tiny helper because Notion's API expects a specific shape for
+    rich_text and we don't have a generic set-rich-text helper today.
+    Inlined here rather than in clients/notion.py because it's the
+    only caller.
+    """
+    props = {
+        FAKTURAMOTTAKER_PROPS["orgnr"]: {
+            "rich_text": [{"text": {"content": orgnr}}]
+        },
+    }
+    async with notion_client._client() as client:  # noqa: SLF001
+        response = await notion_client._with_retries(  # noqa: SLF001
+            lambda: client.patch(
+                f"/pages/{fakt_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{fakt_id} Orgnr",
+        )
+        notion_client._raise_for_status(response)  # noqa: SLF001
+
+
+# ============================================================
 # Top-level engine entrypoint
 # ============================================================
 
@@ -826,25 +1268,48 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
         result.note = "no eligible rows"
         return result
 
-    # 3. Build invoice lines (pure math, no I/O).
-    lines = _build_line_items(eligible, invoice_type=invoice_type)
+    # 3. Build invoice lines. Per-row math is pure; the kategori →
+    # productId lookup may hit Fiken on cache miss, so this is async.
+    lines = await _build_line_items(
+        eligible,
+        invoice_type=invoice_type,
+        company_slug=company_slug,
+    )
     if not lines:
         result.action = "skipped"
         result.note = "no priced rows"
         return result
     result.lines_created = len(lines)
 
-    # 4. Customer resolution. Project → Fakturamottaker → Orgnr.
+    # 4. Customer resolution. Project → Fakturamottaker → Orgnr, with
+    # Brreg fallbacks:
     #
-    # Missing Orgnr (no Fakturamottaker linked, or linked but Orgnr blank)
-    # used to hard-fail the task — Notion turned the project's sync dot red
-    # after 5 retries and the operator had no way to see why from Notion
-    # alone. New behavior: skip the contact lookup entirely, post the draft
-    # to Fiken WITHOUT a customerId, and let the operator pick or create
-    # one in Fiken's UI before clicking Send. The draft is the review
-    # artefact anyway; a missing customer is something Fiken's UI is built
-    # to handle.
+    #   - If Notion has no Orgnr but the Project has a Kunder relation
+    #     with a name → search Brreg, accept only a strict suffix-aware
+    #     match. On a clean win: recover the Orgnr, write the result
+    #     back into Notion (create or fill the Fakturamottaker row),
+    #     and proceed through the normal Orgnr path.
+    #   - When Orgnr IS present, the Fiken auto-create on a /contacts
+    #     miss uses Brreg's official navn instead of the Fakturamottaker
+    #     title (and PATCHes Notion's title to match — one-time
+    #     enrichment).
+    #   - Brreg is best-effort throughout: timeout / 5xx / no clean
+    #     match → fall back to today's "Mangler kunde" placeholder.
     orgnr, fakturamottaker_name = await _resolve_project_orgnr(project_page)
+
+    # Track the Brreg payload so we can write the official name back to
+    # Notion AFTER the Fiken draft is created. We only writeback when we
+    # actually got a Brreg payload — never with a made-up fallback name.
+    brreg_payload: dict[str, Any] | None = None
+
+    if not orgnr:
+        kunder_orgnr, brreg_via_kunder = await _resolve_project_via_kunder_brreg(
+            project_page
+        )
+        if kunder_orgnr and brreg_via_kunder is not None:
+            orgnr = kunder_orgnr
+            fakturamottaker_name = (brreg_via_kunder.get("navn") or "").strip()
+            brreg_payload = brreg_via_kunder
 
     customer_id: int | None = None
     customer_label = "<no customer linked>"
@@ -879,14 +1344,27 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
         # risk duplicates next time the same customer's Fakturamottaker
         # gets an Orgnr filled in.
         if customer_id is None:
+            # Brreg-by-orgnr enrichment: when we got here via the normal
+            # Orgnr path (not via Kunder→Brreg, which already gave us a
+            # brreg_payload), look up the official name now so the Fiken
+            # contact carries Brreg's record instead of the operator's
+            # potentially-stale Fakturamottaker title.
+            if brreg_payload is None:
+                brreg_name, brreg_payload = await _brreg_enrich_name(
+                    orgnr, fakturamottaker_name
+                )
+            else:
+                brreg_name = brreg_payload.get("navn") or fakturamottaker_name
             new_name = (
-                fakturamottaker_name or project_title or f"Kunde {orgnr}"
+                brreg_name or fakturamottaker_name or project_title
+                or f"Kunde {orgnr}"
             ).strip()
             logger.info(
                 "send_faktura: orgnr %s not in Fiken customers — "
-                "auto-creating Fiken contact %r",
+                "auto-creating Fiken contact %r (Brreg=%s)",
                 orgnr,
                 new_name,
+                "hit" if brreg_payload is not None else "miss",
             )
             try:
                 created = await fiken_client.create_contact(
@@ -953,39 +1431,46 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
 
     result.customer_match = customer_label
 
-    # 5. Build line payloads. Free-text lines (no productId) so we control
-    # the printed text entirely.
+    # 5. Build line payloads. Product-linked lines whenever we have a
+    # `productId` from the Kategori match; free-text fallback otherwise.
     #
-    # Field map:
-    #  - `description` (bold first line)   ← line.product_name
-    #     Kategori label (e.g. "Næring - Interiør"), or a fallback
-    #     composed from Navn / Beskrivelse when the row has no Kategori.
-    #  - `comment` (smaller sub-line)      ← line.comment
-    #     "Navn - Beskrivelse" so the customer sees the category up top
-    #     and the specific deliverable underneath.
-    #  - `incomeAccount` (kontonummer)     ← line.income_account
-    #     Derived from Kategori via FIKEN_KATEGORI_TO_ACCOUNT (3020 for
-    #     tjeneste, 3000 for vare, etc.). Defaults to 3020.
+    # Field map (product-linked, the happy path):
+    #  - `productId`     ← line.product_id (Fiken auto-fills incomeAccount
+    #                     from the product itself; we never send the account)
+    #  - `description`   ← line.description (Kategori label; mirrors the
+    #                     product name — Fiken would auto-fill the same
+    #                     value if we omitted it, so sending it is just
+    #                     belt-and-braces)
+    #  - `comment`       ← line.comment ("Navn - Beskrivelse", per-row context)
+    #  - `quantity`      ← line.quantity_fraction (Antall; 0.5 oppstart,
+    #                     remaining/gross slutt)
+    #  - `unitPrice`     ← line.unit_price_nok_ore (FULL Pris in øre, ALWAYS)
+    #  - `vatType`       ← "HIGH" (25% MVA; product carries its own vatType
+    #                     too, but we send ours for explicitness)
+    #  - `discount`      ← line.discount_percent (percent 0–100; omitted at 0)
     #
-    # Two scale notes:
-    #  - `unitPrice` on free-text lines is in ØRE (integer cents),
-    #    empirically verified — we send the un-discounted price here so
-    #    the printed invoice shows "Pris kr X / Rabatt Y% / Sum kr Z"
-    #    rather than just a pre-discounted unit price.
-    #  - `discount` on lines is PERCENT (0–100, decimals allowed). Fiken
-    #    applies it to the line's `unitPrice × quantity` to compute net.
-    #    Omitted when 0 — keeps the printed line cleaner.
+    # Free-text fallback (no productId match): same shape minus
+    # `productId`. Fiken will 400 with "incomeAccount is required for
+    # free-text lines (lines without a productId)". That's deliberate —
+    # the operator's prompt to add the missing product in Fiken.
     line_payloads: list[dict[str, Any]] = []
     for line in lines:
         payload: dict[str, Any] = {
-            "description": line.product_name,
-            "quantity": 1,
+            "description": line.description,
+            "comment": line.comment,
+            "quantity": line.quantity_fraction,
             "unitPrice": line.unit_price_nok_ore,
             "vatType": fiken_client.VAT_TYPE_25_PCT,
-            "incomeAccount": line.income_account,
         }
-        if line.comment:
-            payload["comment"] = line.comment
+        if line.product_id is not None:
+            payload["productId"] = line.product_id
+        else:
+            # Free-text line: Fiken REQUIRES incomeAccount, so send the
+            # default (3020 = services 25% VAT). Operator can change the
+            # account on the line in Fiken's UI, or add the missing
+            # Kategori product to Fiken so future drafts go through the
+            # product-linked path.
+            payload["incomeAccount"] = FIKEN_FREE_TEXT_INCOME_ACCOUNT
         if line.discount_percent > 0:
             payload["discount"] = line.discount_percent
         line_payloads.append(payload)
@@ -1004,6 +1489,12 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
         else settings.fiken_invoice_text_slutt
     ).strip() or None
 
+    # Auto-pick the company's bank account number so the printed invoice
+    # shows a Kontonummer (Fiken UI: "Kontonummer endre standard") instead
+    # of the blank placeholder. None → omit the field; Fiken uses its own
+    # default. Best-effort: log + continue when resolution fails.
+    bank_account_number = await _ensure_bank_account_number(company_slug)
+
     try:
         draft = await fiken_client.create_invoice_draft(
             company_slug,
@@ -1014,6 +1505,7 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
             lines=line_payloads,
             your_reference=your_reference,
             invoice_text=invoice_text,
+            bank_account_number=bank_account_number,
         )
     except Exception as err:  # noqa: BLE001
         logger.exception(
@@ -1155,6 +1647,27 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
                 project_page_id,
                 err,
             )
+
+    # Brreg writeback: now that the draft is created and Notion stamping
+    # is done, propagate Brreg's official record onto the Notion
+    # Fakturamottaker so the data converges over time. Best-effort —
+    # already-correct rows are no-ops, failures log + continue. Only
+    # runs when we actually got a Brreg payload (don't overwrite
+    # operator data with a fallback name).
+    if brreg_payload is not None and orgnr:
+        brreg_navn = (brreg_payload.get("navn") or "").strip()
+        if brreg_navn:
+            try:
+                await _update_fakturamottaker_in_notion(
+                    project_page, orgnr, brreg_navn
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning(
+                    "send_faktura: Brreg writeback to Notion failed for "
+                    "%s: %s (non-fatal)",
+                    project_page_id,
+                    err,
+                )
 
     logger.info(
         "✅ send_faktura: %s draft for %r — %d line(s), customer=%s, draft_id=%s",

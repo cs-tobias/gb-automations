@@ -122,15 +122,21 @@ def _oppgave(
 
 
 def test_eligible_rows_oppstart_only_ikke_fakturert():
+    """Bulletproof mode: only Utgår, Fakturert (already fully billed),
+    Fakturert 50% (already oppstartet on this run's mode), and
+    Korreksjonsrunde rows are skipped. Non-discipline rows like
+    'Klargjøre modell' or blank Type DO land.
+    """
     rows = [
         _oppgave(page_id="a"),  # Ikke fakturert → ✓
-        _oppgave(page_id="b", fakturert_status=FAKTURERT_STATUS_50),  # ✗
-        _oppgave(page_id="c", fakturert_status=FAKTURERT_STATUS_FULL),  # ✗
-        _oppgave(page_id="d", fakturert_status=FAKTURERT_STATUS_UTGAR),  # ✗
-        _oppgave(page_id="e", discipline="Klargjøre modell"),  # ✗ not discipline
+        _oppgave(page_id="b", fakturert_status=FAKTURERT_STATUS_50),  # ✗ already oppstartet
+        _oppgave(page_id="c", fakturert_status=FAKTURERT_STATUS_FULL),  # ✗ already fully billed
+        _oppgave(page_id="d", fakturert_status=FAKTURERT_STATUS_UTGAR),  # ✗ operator excluded
+        # Bulletproof: non-discipline Type still lands (no silent drop).
+        _oppgave(page_id="e", discipline="Klargjøre modell"),  # ✓
     ]
     eligible = engine._eligible_rows(rows, "oppstart")
-    assert [row["id"] for row in eligible] == ["a"]
+    assert sorted(row["id"] for row in eligible) == ["a", "e"]
 
 
 def test_eligible_rows_slutt_takes_ikke_and_50_percent():
@@ -163,6 +169,28 @@ def test_eligible_rows_skips_korreksjonsrunde():
     assert engine._eligible_rows(rows, "slutt") == []
 
 
+def test_eligible_rows_bulletproof_keeps_blank_and_unknown_types():
+    """Bulletproof regression: rows with blank Type or any unknown Type
+    label still land. The CEO's invariant is "only Utgår skips".
+    Korreksjonsrunde is the one narrow exception (admin sub-rows).
+    """
+    rows = [
+        _oppgave(page_id="blank", discipline=""),
+        _oppgave(page_id="klargjor", discipline="Klargjøre modell"),
+        _oppgave(page_id="rando", discipline="SomeNewTypeNobodyAddedYet"),
+    ]
+    assert sorted(r["id"] for r in engine._eligible_rows(rows, "oppstart")) == [
+        "blank",
+        "klargjor",
+        "rando",
+    ]
+    assert sorted(r["id"] for r in engine._eligible_rows(rows, "slutt")) == [
+        "blank",
+        "klargjor",
+        "rando",
+    ]
+
+
 def test_eligible_rows_rejects_bad_invoice_type():
     with pytest.raises(ValueError, match="invoice_type must be"):
         engine._eligible_rows([], "midt")
@@ -174,71 +202,125 @@ def test_eligible_rows_rejects_bad_invoice_type():
 
 
 def test_row_billable_oppstart_basic_50_percent():
-    """No rabatt — to_bill and unit_price are the same kr 5000.
-    Fiken receives unitPrice=5000, no discount field needed.
+    """No rabatt — to_bill = 5000 (half of gross). The contract is:
+    `unit_price` is always Pris (10_000), `quantity_fraction` is 0.5,
+    Fiken's `Antall × Pris × (1 − Rabatt%)` math lands on 5000.
     """
     row = _oppgave(page_id="a", pris=10_000.0)
-    to_bill, new_total, unit_price, discount_fraction = engine._row_billable_nok(
-        row, "oppstart"
-    )
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row, "oppstart")
     assert to_bill == 5000.0
     assert new_total == 5000.0
-    assert unit_price == 5000.0
+    assert unit_price == 10_000.0           # ALWAYS Pris
+    assert quantity_fraction == 0.5
     assert discount_fraction == 0.0
 
 
 def test_row_billable_oppstart_with_rabatt():
     """Rabatt 10% (Notion Percent format → 0.10) on 10000 NOK, oppstart:
-        unit_price = Pris × 0.5 = 5000   (sent to Fiken)
-        discount   = 10%                 (sent to Fiken)
-        to_bill    = gross × 0.5 = 4500  (Notion ledger / audit trail)
-    Fiken's UI shows "Pris kr 5000 / Rabatt 10% / Sum kr 4500" — the
-    customer sees the discount on the printed invoice instead of just
-    a pre-rabattert unit price.
+        unit_price        = Pris = 10_000          (sent to Fiken)
+        quantity_fraction = 0.5                    (sent to Fiken as Antall)
+        discount          = 10%                    (sent to Fiken)
+        to_bill           = gross × 0.5 = 4500     (Notion ledger / audit)
+    Fiken's printed invoice: Antall 0,5 | Pris kr 10 000 | Rabatt 10 % |
+    Sum kr 4500.
     """
     row = _oppgave(page_id="a", pris=10_000.0, rabatt_fraction=0.10)
-    to_bill, new_total, unit_price, discount_fraction = engine._row_billable_nok(
-        row, "oppstart"
-    )
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row, "oppstart")
     assert to_bill == 4500.0
     assert new_total == 4500.0
-    assert unit_price == 5000.0
+    assert unit_price == 10_000.0
+    assert quantity_fraction == 0.5
     assert discount_fraction == 0.10
 
 
 def test_row_billable_slutt_remainder_after_oppstart():
-    """Oppstart booked 7500 (50% of original 15K). Pris then renegotiated
-    down to 10000. Slutt run should bill 10000 − 7500 = 2500 (NOT 0,
-    NOT the original remainder). Pre-rabatt unit price equals post-rabatt
-    when Rabatt=0.
+    """Oppstart booked 7500 (50% of original 15K). Pris renegotiated
+    down to 10000. Slutt run should bill 10000 − 7500 = 2500. With
+    the new math:
+        gross             = 10_000
+        remaining         = 2_500
+        quantity_fraction = remaining / gross = 0.25
+        unit_price        = Pris = 10_000      (UNCHANGED across runs)
+    Fiken's line: Antall 0,25 | Pris kr 10 000 | Sum kr 2 500.
     """
     row = _oppgave(page_id="a", pris=10_000.0, billed_amount_nok=7500.0)
-    to_bill, new_total, unit_price, discount_fraction = engine._row_billable_nok(
-        row, "slutt"
-    )
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row, "slutt")
     assert to_bill == 2500.0
     assert new_total == 10_000.0
-    assert unit_price == 2500.0
+    assert unit_price == 10_000.0
+    assert quantity_fraction == 0.25
     assert discount_fraction == 0.0
 
 
-def test_row_billable_slutt_with_rabatt_inverts_to_unit_price():
-    """Slutt run, Rabatt 20%, fresh row (no prior oppstart): we want
-    Fiken to print "Pris kr X / Rabatt 20% / Sum kr 8000" where
-    post-rabatt Sum = 8000. Engine computes:
-        gross     = 10000 × 0.8 = 8000
-        to_bill   = 8000          (no prior billing)
-        unit_price = 8000 / (1 − 0.20) = 10000   (the full undiscounted Pris)
-    So Fiken displays Pris=10000, Rabatt=20%, Sum=8000.
+def test_row_billable_slutt_with_rabatt_uses_quantity_fraction():
+    """Slutt, Rabatt 20%, fresh row (no prior oppstart):
+        gross             = 8000  (= 10000 × 0.8)
+        remaining         = 8000
+        quantity_fraction = 8000 / 8000 = 1.0
+        unit_price        = Pris = 10_000  (full undiscounted)
+    Fiken prints: Antall 1 | Pris kr 10 000 | Rabatt 20 % | Sum kr 8000.
     """
     row = _oppgave(page_id="a", pris=10_000.0, rabatt_fraction=0.20)
-    to_bill, new_total, unit_price, discount_fraction = engine._row_billable_nok(
-        row, "slutt"
-    )
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row, "slutt")
     assert to_bill == 8000.0
     assert new_total == 8000.0
     assert unit_price == 10_000.0
+    assert quantity_fraction == 1.0
     assert discount_fraction == 0.20
+
+
+def test_row_billable_slutt_with_rabatt_after_oppstart():
+    """The composite case the v3 math is meant to handle cleanly: oppstart
+    booked half of the rabatted gross, slutt bills the rest, all without
+    the inverted-divide-by-(1-rabatt) hack the v2 math used.
+
+    Pris=10_000, Rabatt=15% → gross=8500. Oppstart booked 4250 (= half).
+    Slutt: remaining = 8500 − 4250 = 4250. quantity_fraction = 4250/8500
+    = 0.5. unit_price stays at Pris = 10_000. Fiken's `Antall × Pris ×
+    (1 − Rabatt)` = 0.5 × 10000 × 0.85 = 4250. ✓
+    """
+    row = _oppgave(
+        page_id="a",
+        pris=10_000.0,
+        rabatt_fraction=0.15,
+        billed_amount_nok=4250.0,
+    )
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row, "slutt")
+    assert to_bill == 4250.0
+    assert new_total == 8500.0
+    assert unit_price == 10_000.0
+    assert quantity_fraction == 0.5
+    assert discount_fraction == 0.15
 
 
 def test_row_billable_slutt_skips_when_remaining_zero_or_negative():
@@ -249,11 +331,22 @@ def test_row_billable_slutt_skips_when_remaining_zero_or_negative():
     assert engine._row_billable_nok(row, "slutt") is None
 
 
-def test_row_billable_skips_missing_or_zero_price():
-    row_no_price = _oppgave(page_id="a", pris=None)
-    row_zero = _oppgave(page_id="b", pris=0.0)
-    assert engine._row_billable_nok(row_no_price, "oppstart") is None
-    assert engine._row_billable_nok(row_zero, "oppstart") is None
+def test_row_billable_missing_or_zero_price_lands_as_kr_zero():
+    """Bulletproof: missing or zero Pris does NOT skip — the row lands
+    on the draft as a kr 0 line so the operator sees it and can fill
+    in the Pris (then re-click, or edit the line directly in Fiken).
+    """
+    for case in (
+        _oppgave(page_id="a", pris=None),
+        _oppgave(page_id="b", pris=0.0),
+    ):
+        result = engine._row_billable_nok(case, "oppstart")
+        assert result is not None
+        to_bill, new_total, unit_price, quantity_fraction, _ = result
+        assert to_bill == 0.0
+        assert new_total == 0.0
+        assert unit_price == 0.0
+        assert quantity_fraction == 0.5
 
 
 def test_row_billable_rabatt_uses_notion_percent_format():
@@ -262,21 +355,19 @@ def test_row_billable_rabatt_uses_notion_percent_format():
     value as the fraction 0.15 (NOT 15). Engine must treat it as a
     fraction directly. Pris=10000 + Rabatt=0.15 + oppstart →
     gross=8500 → to_bill=4250.
-
-    Earlier engine math divided the value by 100 again, producing
-    `0.15/100 = 0.0015 = 0.15%` discount, with the line landing at
-    NOK 4992 (`round(10000 × 0.9985 × 0.5)`) instead of the correct
-    NOK 4250.
     """
     row = _oppgave(page_id="a", pris=10_000.0, rabatt_fraction=0.15)
-    to_bill, new_total, unit_price, discount_fraction = engine._row_billable_nok(
-        row, "oppstart"
-    )
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row, "oppstart")
     assert to_bill == 4250.0
     assert new_total == 4250.0
-    # Pre-rabatt: Pris × 0.5 = 5000. The customer sees Pris kr 5000,
-    # Rabatt 15%, Sum kr 4250 — not just a pre-rabattert kr 4250.
-    assert unit_price == 5000.0
+    assert unit_price == 10_000.0          # Pris, unchanged
+    assert quantity_fraction == 0.5
     assert discount_fraction == 0.15
 
 
@@ -287,64 +378,120 @@ def test_row_billable_clamps_rabatt_to_valid_range():
     `150` into a Percent column gets stored as 1.5.
     """
     row_negative = _oppgave(page_id="a", pris=10_000.0, rabatt_fraction=-0.50)
-    to_bill, _, _, discount_fraction = engine._row_billable_nok(
-        row_negative, "oppstart"
-    )
+    (
+        to_bill,
+        _,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(row_negative, "oppstart")
     assert to_bill == 5000.0  # rabatt clamped to 0 → full price
+    assert unit_price == 10_000.0
+    assert quantity_fraction == 0.5
     assert discount_fraction == 0.0
 
+    # 100%+ rabatt → gross = 0 → row lands as a kr 0 line (bulletproof).
     row_huge = _oppgave(page_id="b", pris=10_000.0, rabatt_fraction=1.5)
-    assert engine._row_billable_nok(row_huge, "oppstart") is None  # gross=0
+    result = engine._row_billable_nok(row_huge, "oppstart")
+    assert result is not None
+    to_bill_huge, _, unit_price_huge, _, _ = result
+    assert to_bill_huge == 0.0
+    assert unit_price_huge == 10_000.0  # Pris unchanged; rabatt clamped to 100%
 
 
 # ---------------------------------------------------------------------------
-# _build_line_items — one line per Oppgave, NOK in øre
+# _build_line_items — one line per Oppgave; async because of product lookup
 # ---------------------------------------------------------------------------
+#
+# `_build_line_items` calls `_resolve_kategori_to_product_id` which hits
+# Fiken on cache miss. Tests monkeypatch that resolver with a tiny stub
+# so we don't list_products in unit tests. Default stub returns None
+# (no product match), exercising the free-text fallback path.
 
 
-def test_build_line_items_one_line_per_oppgave():
+def _stub_resolver(mapping: dict[str, int] | None = None):
+    """Return an async function suitable for monkeypatching
+    engine._resolve_kategori_to_product_id. The returned coroutine looks
+    up the kategori label in `mapping` and returns the productId or None.
+    """
+    table = mapping or {}
+
+    async def _stub(company_slug: str, kategori_label: str) -> int | None:
+        return table.get(kategori_label)
+
+    return _stub
+
+
+@pytest.mark.asyncio
+async def test_build_line_items_one_line_per_oppgave(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
     rows = [
         _oppgave(page_id=f"i{i}", name=f"Bilde {i}", pris=5000.0)
         for i in range(5)
     ]
     eligible = engine._eligible_rows(rows, "oppstart")
-    lines = engine._build_line_items(eligible, invoice_type="oppstart")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="oppstart", company_slug="probe"
+    )
     assert len(lines) == 5
     assert {l.discipline for l in lines} == {"interior"}
-    # No Kategori on these rows → product_name falls back to the Navn.
-    assert sorted(l.product_name for l in lines) == [
+    # No Kategori on these rows → description falls back to the Navn.
+    assert sorted(l.description for l in lines) == [
         f"Bilde {i}" for i in range(5)
     ]
-    # 50% of 5000 = 2500 NOK = 250 000 øre. No rabatt → unit_price ==
-    # amount, discount_percent = 0.
+    # Unit price is the FULL Pris (5000) in øre; quantity = 0.5 oppstart;
+    # amount_nok_ore is the post-rabatt NOK (= unit × quantity here, no
+    # rabatt) = 2500 NOK in øre = 250_000.
+    assert all(l.unit_price_nok_ore == 500_000 for l in lines)
+    assert all(l.quantity_fraction == 0.5 for l in lines)
     assert all(l.amount_nok_ore == 250_000 for l in lines)
-    assert all(l.unit_price_nok_ore == 250_000 for l in lines)
     assert all(l.discount_percent == 0.0 for l in lines)
-    # No kategori → default account.
-    assert all(l.income_account == "3020" for l in lines)
+    # No kategori → no product link → free-text fallback.
+    assert all(l.product_id is None for l in lines)
 
 
-def test_build_line_items_oppstart_with_rabatt_sends_undiscounted_unit_price():
-    """With Rabatt=15%, the line carries:
-        unit_price_nok_ore = round(Pris × 0.5) × 100 = 500_000  (kr 5000)
+@pytest.mark.asyncio
+async def test_build_line_items_oppstart_with_rabatt(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Pris=10000, Rabatt=15%, oppstart:
+        unit_price_nok_ore = 1_000_000      (full Pris in øre)
+        quantity_fraction  = 0.5
         discount_percent   = 15.0
-        amount_nok_ore     = round(gross × 0.5) × 100 = 425_000 (kr 4250)
-    so Fiken's printed invoice shows Pris/Rabatt/Sum instead of a
-    pre-rabattert unit price.
+        amount_nok_ore     = 425_000        (= 4250 NOK post-rabatt)
+    Fiken's printed line: Antall 0,5 | Pris kr 10 000 | Rabatt 15% |
+    Sum kr 4250.
     """
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
     rows = [_oppgave(page_id="a", name="Stue", pris=10_000.0, rabatt_fraction=0.15)]
     eligible = engine._eligible_rows(rows, "oppstart")
-    lines = engine._build_line_items(eligible, invoice_type="oppstart")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="oppstart", company_slug="probe"
+    )
     assert len(lines) == 1
-    assert lines[0].unit_price_nok_ore == 500_000
+    assert lines[0].unit_price_nok_ore == 1_000_000
+    assert lines[0].quantity_fraction == 0.5
     assert lines[0].discount_percent == 15.0
     assert lines[0].amount_nok_ore == 425_000
 
 
-def test_build_line_items_slutt_with_renegotiation():
-    """A row with billed_amount = 7500 (from a prior 50% of 15K Pris), Pris
-    now 10000 → slutt line should be 2500 NOK (= 250_000 øre).
+@pytest.mark.asyncio
+async def test_build_line_items_slutt_with_renegotiation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """billed_amount=7500 (from prior 50% of 15K Pris); Pris now 10000.
+    Slutt: remaining=2500, quantity_fraction=0.25, unit_price=Pris=10K.
+    Audit trail amount = 2500 NOK = 250_000 øre.
     """
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
     rows = [
         _oppgave(
             page_id="a",
@@ -355,25 +502,56 @@ def test_build_line_items_slutt_with_renegotiation():
         ),
     ]
     eligible = engine._eligible_rows(rows, "slutt")
-    lines = engine._build_line_items(eligible, invoice_type="slutt")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="slutt", company_slug="probe"
+    )
     assert len(lines) == 1
+    assert lines[0].unit_price_nok_ore == 1_000_000
+    assert lines[0].quantity_fraction == 0.25
     assert lines[0].amount_nok_ore == 250_000
     assert lines[0].new_billed_amount_nok == 10_000.0
 
 
-def test_build_line_items_skips_rows_without_price():
+@pytest.mark.asyncio
+async def test_build_line_items_bulletproof_lands_blank_price_as_kr_zero(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Bulletproof: rows with missing or zero Pris land as kr 0 lines.
+    The operator sees them on the draft and can fix Pris in Notion (then
+    re-click) or edit the line directly in Fiken's UI.
+    """
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
     rows = [
         _oppgave(page_id="ok", name="Stue", pris=5000.0),
         _oppgave(page_id="no_price", name="Kjøkken", pris=None),
         _oppgave(page_id="zero", name="Bad", pris=0.0),
     ]
     eligible = engine._eligible_rows(rows, "oppstart")
-    lines = engine._build_line_items(eligible, invoice_type="oppstart")
-    assert [l.oppgave_page_id for l in lines] == ["ok"]
+    lines = await engine._build_line_items(
+        eligible, invoice_type="oppstart", company_slug="probe"
+    )
+    # All three rows land; ok=kr 2500 (50% of 5000), the other two=kr 0.
+    by_id = {l.oppgave_page_id: l for l in lines}
+    assert set(by_id) == {"ok", "no_price", "zero"}
+    assert by_id["ok"].amount_nok_ore == 250_000
+    assert by_id["no_price"].amount_nok_ore == 0
+    assert by_id["zero"].amount_nok_ore == 0
+    # Unit price falls through: ok=5000 NOK (500_000 øre), others 0.
+    assert by_id["ok"].unit_price_nok_ore == 500_000
+    assert by_id["no_price"].unit_price_nok_ore == 0
+    assert by_id["zero"].unit_price_nok_ore == 0
 
 
-def test_build_line_items_skips_zero_remainder_on_slutt():
+@pytest.mark.asyncio
+async def test_build_line_items_skips_zero_remainder_on_slutt(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Renegotiation leaves nothing to bill → no line for that row."""
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
     rows = [
         _oppgave(
             page_id="a",
@@ -384,9 +562,15 @@ def test_build_line_items_skips_zero_remainder_on_slutt():
         _oppgave(page_id="b", pris=5000.0, fakturert_status=FAKTURERT_STATUS_IKKE),
     ]
     eligible = engine._eligible_rows(rows, "slutt")
-    lines = engine._build_line_items(eligible, invoice_type="slutt")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="slutt", company_slug="probe"
+    )
     assert [l.oppgave_page_id for l in lines] == ["b"]
-    assert lines[0].amount_nok_ore == 500_000  # full 5000 NOK
+    # Full 5000 NOK billed → unit_price 5000 × 100, quantity 1.0,
+    # amount_nok_ore 500_000.
+    assert lines[0].unit_price_nok_ore == 500_000
+    assert lines[0].quantity_fraction == 1.0
+    assert lines[0].amount_nok_ore == 500_000
 
 
 # ---------------------------------------------------------------------------
@@ -446,67 +630,37 @@ def test_line_comment_empty_when_all_blank():
 
 
 # ---------------------------------------------------------------------------
-# _resolve_kategori_and_account — first Kategori label drives the account
+# _resolve_kategori_label + product resolution (Kategori → Fiken product)
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_kategori_routes_tjeneste_to_3020():
-    """Known kategori 'Næring - Interiør' is a tjeneste → account 3020."""
-    row = _oppgave(page_id="a", kategori=["Næring - Interiør"])
-    kategori, account = engine._resolve_kategori_and_account(row)
-    assert kategori == "Næring - Interiør"
-    assert account == "3020"
-
-
-def test_resolve_kategori_routes_vare_to_3000():
-    """Known kategori 'Print' is a vare → account 3000."""
-    row = _oppgave(page_id="a", kategori=["Print"])
-    kategori, account = engine._resolve_kategori_and_account(row)
-    assert kategori == "Print"
-    assert account == "3000"
-
-
-def test_resolve_kategori_picks_first_when_multiple_selected():
-    """Multi-select can carry several labels — engine picks the first.
-    Notion preserves operator's selection order, so the first label is
-    the operator's primary intent.
+def test_resolve_kategori_label_picks_first_when_multiple():
+    """Multi-select can carry several labels — engine picks the first
+    (operator's selection order is preserved by Notion).
     """
     row = _oppgave(page_id="a", kategori=["Næring - Interiør", "Print"])
-    kategori, account = engine._resolve_kategori_and_account(row)
-    assert kategori == "Næring - Interiør"
-    assert account == "3020"
+    assert engine._resolve_kategori_label(row) == "Næring - Interiør"
 
 
-def test_resolve_kategori_unknown_label_defaults_to_3020():
-    """An unmapped kategori falls back to FIKEN_DEFAULT_INCOME_ACCOUNT
-    (3020) so we never block a draft on a missing dict entry — the
-    operator sees the WARN in logs and adds the kategori to the map.
-    """
-    row = _oppgave(page_id="a", kategori=["Bolig - Opparbeide Modell"])
-    kategori, account = engine._resolve_kategori_and_account(row)
-    assert kategori == "Bolig - Opparbeide Modell"
-    assert account == "3020"
-
-
-def test_resolve_kategori_blank_returns_none_and_default():
-    """Row with no kategori labels → (None, default account)."""
+def test_resolve_kategori_label_blank_returns_none():
     row = _oppgave(page_id="a")  # kategori defaults to []
-    kategori, account = engine._resolve_kategori_and_account(row)
-    assert kategori is None
-    assert account == "3020"
+    assert engine._resolve_kategori_label(row) is None
 
 
-# ---------------------------------------------------------------------------
-# _build_line_items — Kategori flows through to the line dataclass
-# ---------------------------------------------------------------------------
-
-
-def test_build_line_items_threads_kategori_into_product_name_and_account():
-    """End-to-end through _build_line_items: a row with Kategori
-    'Næring - Interiør' produces a line whose product_name = the
-    Kategori label, income_account = 3020, comment = "Navn - Beskrivelse",
-    and the amount fields are unaffected.
+@pytest.mark.asyncio
+async def test_resolve_kategori_to_product_id_via_stubbed_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """End-to-end through _build_line_items with a stubbed resolver:
+    Kategori 'Næring - Interiør' matches Fiken product id 4493261141.
+    Resulting line carries product_id=4493261141 AND the Kategori label
+    as description.
     """
+    monkeypatch.setattr(
+        engine,
+        "_resolve_kategori_to_product_id",
+        _stub_resolver({"Næring - Interiør": 4493261141}),
+    )
     rows = [
         _oppgave(
             page_id="a",
@@ -517,33 +671,51 @@ def test_build_line_items_threads_kategori_into_product_name_and_account():
         )
     ]
     eligible = engine._eligible_rows(rows, "oppstart")
-    lines = engine._build_line_items(eligible, invoice_type="oppstart")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="oppstart", company_slug="probe"
+    )
     assert len(lines) == 1
     line = lines[0]
-    assert line.product_name == "Næring - Interiør"
+    assert line.product_id == 4493261141
+    assert line.description == "Næring - Interiør"
     assert line.comment == "Kjøkken - Hovedbilde dag"
-    assert line.income_account == "3020"
-    # Unchanged amount path (50% of 10000 = 5000 NOK = 500_000 øre).
-    assert line.unit_price_nok_ore == 500_000
+    # Pris stays the same in øre; quantity_fraction = 0.5 for oppstart.
+    assert line.unit_price_nok_ore == 1_000_000
+    assert line.quantity_fraction == 0.5
     assert line.amount_nok_ore == 500_000
 
 
-def test_build_line_items_routes_print_to_3000():
-    """Kategori 'Print' → income_account 3000 (vare)."""
+@pytest.mark.asyncio
+async def test_build_line_items_kategori_with_no_product_falls_back_to_free_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When the Kategori label doesn't match any Fiken product, the line
+    is built as free-text: product_id=None, description=Kategori label.
+    Fiken will reject this with a 400 ("incomeAccount is required for
+    free-text lines"), which is the operator's prompt to add the missing
+    product in Fiken — but the line dataclass itself is well-formed and
+    survives engine-side post-build assertions.
+    """
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
     rows = [
         _oppgave(
             page_id="a",
             name="Plakat A1",
             description="20 stk",
             pris=4000.0,
-            kategori=["Print"],
+            kategori=["Bolig - Foo (unmapped)"],
         )
     ]
     eligible = engine._eligible_rows(rows, "oppstart")
-    lines = engine._build_line_items(eligible, invoice_type="oppstart")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="oppstart", company_slug="probe"
+    )
     assert len(lines) == 1
-    assert lines[0].product_name == "Print"
-    assert lines[0].income_account == "3000"
+    assert lines[0].product_id is None
+    assert lines[0].description == "Bolig - Foo (unmapped)"
+    assert lines[0].comment == "Plakat A1 - 20 stk"
 
 
 # ---------------------------------------------------------------------------
@@ -762,3 +934,264 @@ def test_invoice_text_oppstart_and_slutt_are_distinct():
         settings.fiken_invoice_text_oppstart
         != settings.fiken_invoice_text_slutt
     )
+
+
+# ---------------------------------------------------------------------------
+# _ensure_bank_account_number — shape check; full behavior via end-to-end
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_bank_account_number_exists_and_takes_company_slug():
+    import inspect
+
+    assert hasattr(engine, "_ensure_bank_account_number")
+    sig = inspect.signature(engine._ensure_bank_account_number)
+    assert list(sig.parameters) == ["company_slug"]
+
+
+def test_fiken_bank_account_number_setting_defaults_to_empty():
+    """Env override is opt-in. Empty default → engine auto-picks the
+    first active normal-type account from Fiken on first call.
+    """
+    from gb_automations.config import settings
+
+    assert hasattr(settings, "fiken_bank_account_number")
+    assert settings.fiken_bank_account_number == ""
+
+
+# ---------------------------------------------------------------------------
+# Brreg — pick_exact_match (pure helper; the load-bearing part of the new path)
+# ---------------------------------------------------------------------------
+
+
+def test_pick_exact_match_picks_query_plus_AS():
+    from gb_automations.clients import brreg
+
+    results = [
+        {"navn": "ENTUR AS", "organisasjonsnummer": "917422575"},
+        {"navn": "ENTUR LANDSFORENING", "organisasjonsnummer": "985515832"},
+        {"navn": "ENTURA HOLDING AS", "organisasjonsnummer": "914984106"},
+        {"navn": "ENTURA EIENDOMSDRIFT AS", "organisasjonsnummer": "992816295"},
+    ]
+    chosen = brreg.pick_exact_match("Entur", results)
+    assert chosen is not None
+    assert chosen["organisasjonsnummer"] == "917422575"
+
+
+def test_pick_exact_match_exact_equals_wins():
+    from gb_automations.clients import brreg
+
+    # Operator typed the full legal name including suffix → exact equals.
+    results = [{"navn": "EQUINOR ASA", "organisasjonsnummer": "923609016"}]
+    chosen = brreg.pick_exact_match("Equinor ASA", results)
+    assert chosen is not None
+    assert chosen["organisasjonsnummer"] == "923609016"
+
+
+def test_pick_exact_match_case_insensitive():
+    from gb_automations.clients import brreg
+
+    results = [{"navn": "ENTUR AS", "organisasjonsnummer": "917422575"}]
+    assert brreg.pick_exact_match("entur", results) is not None
+    assert brreg.pick_exact_match("ENTUR", results) is not None
+    assert brreg.pick_exact_match("  Entur  ", results) is not None
+
+
+def test_pick_exact_match_returns_none_when_no_clean_match():
+    """When no result is `Entur` or `Entur <suffix>`, return None — never
+    guess. Avoids creating the wrong customer for ambiguous searches.
+    """
+    from gb_automations.clients import brreg
+
+    results = [
+        {"navn": "ENTURA HOLDING AS", "organisasjonsnummer": "914984106"},
+        {"navn": "ENTURA EIENDOMSDRIFT AS", "organisasjonsnummer": "992816295"},
+    ]
+    assert brreg.pick_exact_match("Entur", results) is None
+
+
+def test_pick_exact_match_returns_none_on_multiple_clean_matches():
+    """Two results both match cleanly (e.g. 'Foo' has both 'FOO AS' and
+    'FOO ASA') → return None. We refuse to pick between them.
+    """
+    from gb_automations.clients import brreg
+
+    results = [
+        {"navn": "FOO AS", "organisasjonsnummer": "111111111"},
+        {"navn": "FOO ASA", "organisasjonsnummer": "222222222"},
+    ]
+    assert brreg.pick_exact_match("Foo", results) is None
+
+
+def test_pick_exact_match_returns_none_on_empty_inputs():
+    from gb_automations.clients import brreg
+
+    assert brreg.pick_exact_match("", []) is None
+    assert brreg.pick_exact_match("Entur", []) is None
+    assert (
+        brreg.pick_exact_match(
+            "", [{"navn": "ENTUR AS", "organisasjonsnummer": "1"}]
+        )
+        is None
+    )
+
+
+def test_pick_exact_match_covers_multiple_suffixes():
+    """Sanity check: a few uncommon suffixes from NORWEGIAN_ENTITY_SUFFIXES
+    also match. Keeps the suffix list honest if someone tightens it later.
+    """
+    from gb_automations.clients import brreg
+
+    cases = [
+        ("Statkraft", "STATKRAFT SF"),  # SF not in suffix list → should NOT match
+        ("Norsk Hydro", "NORSK HYDRO ASA"),
+        ("Foo", "FOO ANS"),
+        ("Bar", "BAR DA"),
+        ("Baz", "BAZ ENK"),
+        ("Quux", "QUUX NUF"),
+    ]
+    for query, name in cases:
+        results = [{"navn": name, "organisasjonsnummer": "X"}]
+        match = brreg.pick_exact_match(query, results)
+        if name.split()[-1] in brreg.NORWEGIAN_ENTITY_SUFFIXES:
+            assert match is not None, f"expected {name!r} to match for {query!r}"
+        else:
+            assert match is None, f"{name!r} should NOT match for {query!r}"
+
+
+# ---------------------------------------------------------------------------
+# Brreg engine helpers — shape checks
+# ---------------------------------------------------------------------------
+
+
+def test_brreg_helpers_exist_in_engine():
+    import inspect
+
+    assert hasattr(engine, "_brreg_enrich_name")
+    assert list(inspect.signature(engine._brreg_enrich_name).parameters) == [
+        "orgnr",
+        "fallback_name",
+    ]
+
+    assert hasattr(engine, "_resolve_project_via_kunder_brreg")
+    assert list(
+        inspect.signature(engine._resolve_project_via_kunder_brreg).parameters
+    ) == ["project_page"]
+
+    assert hasattr(engine, "_update_fakturamottaker_in_notion")
+    assert list(
+        inspect.signature(engine._update_fakturamottaker_in_notion).parameters
+    ) == ["project_page", "orgnr", "brreg_name"]
+
+
+def test_notion_client_writeback_helpers_exist():
+    """The engine's Brreg writeback path leans on three new Notion
+    helpers. Shape check catches a future accidental rename.
+    """
+    import inspect
+
+    from gb_automations.clients import notion as n
+
+    assert hasattr(n, "create_page_in_db")
+    params = inspect.signature(n.create_page_in_db).parameters
+    assert "db_id" in params
+    assert "title" in params
+
+    assert hasattr(n, "set_page_title")
+    assert "page_id" in inspect.signature(n.set_page_title).parameters
+
+    assert hasattr(n, "set_relation")
+    params = inspect.signature(n.set_relation).parameters
+    assert "prop_name" in params
+    assert "target_ids" in params
+
+
+def test_fakturamottaker_props_includes_navn_for_writeback():
+    """The Brreg writeback needs to know which column is the title on
+    the Fakturamottaker DB so it can update it. Pinning the constant
+    here catches an accidental rename.
+    """
+    from gb_automations.config import FAKTURAMOTTAKER_PROPS
+
+    assert FAKTURAMOTTAKER_PROPS.get("navn") == "Navn"
+    assert FAKTURAMOTTAKER_PROPS.get("orgnr") == "Orgnr"
+
+
+# ---------------------------------------------------------------------------
+# Bulletproof regressions — pin the CEO's invariant
+# ---------------------------------------------------------------------------
+#
+# "Only Utgår skips" (plus the narrow Korreksjonsrunde admin-row exception
+# and the genuine 'nothing left to bill' cases). The CEO needs to trust
+# that every Oppgave he sees in Notion will land on the draft.
+
+
+@pytest.mark.asyncio
+async def test_bulletproof_non_discipline_type_lands_on_draft(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A row whose Type is not in {Interiør, Eksteriør, Animasjon, Annet}
+    — including blank Type — still produces an invoice line. Previously
+    the engine silently dropped these, which was the CEO's prod bug.
+    """
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
+    rows = [
+        _oppgave(page_id="weird", name="Custom thing", discipline="", pris=5000.0),
+        _oppgave(
+            page_id="klargjor",
+            name="Klargjøre modell",
+            discipline="Klargjøre modell",
+            pris=2000.0,
+        ),
+    ]
+    eligible = engine._eligible_rows(rows, "oppstart")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="oppstart", company_slug="probe"
+    )
+    assert sorted(l.oppgave_page_id for l in lines) == ["klargjor", "weird"]
+
+
+def test_bulletproof_free_text_default_account_constant_exists():
+    """Engine sends `incomeAccount = FIKEN_FREE_TEXT_INCOME_ACCOUNT` on
+    free-text lines (when no Fiken product matches the Kategori). Without
+    the default Fiken 400s the entire draft. 3020 = services @ 25% VAT.
+    """
+    from gb_automations.config import FIKEN_FREE_TEXT_INCOME_ACCOUNT
+
+    assert FIKEN_FREE_TEXT_INCOME_ACCOUNT == "3020"
+
+
+@pytest.mark.asyncio
+async def test_bulletproof_negative_remainder_still_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The ONLY case the engine still silently skips is the over-billed
+    one: slutt run where Pris was renegotiated down below Fakturert
+    beløp. Skipping is intentional — Notion's Budsjett vs Fakturert sum
+    rollups surface the discrepancy; the engine's job isn't to issue
+    credit notes inline. Pin so a future change doesn't accidentally
+    re-introduce a row with a kr 0 (or worse, negative) line.
+    """
+    monkeypatch.setattr(
+        engine, "_resolve_kategori_to_product_id", _stub_resolver()
+    )
+    rows = [
+        # Over-billed: oppstart booked 7500, then operator dropped Pris
+        # to 5000. Slutt has remaining = -2500.
+        _oppgave(
+            page_id="overbill",
+            pris=5000.0,
+            billed_amount_nok=7500.0,
+            fakturert_status=FAKTURERT_STATUS_50,
+        ),
+        # Clean slutt row for sanity (lands).
+        _oppgave(page_id="ok", pris=5000.0, fakturert_status=FAKTURERT_STATUS_IKKE),
+    ]
+    eligible = engine._eligible_rows(rows, "slutt")
+    lines = await engine._build_line_items(
+        eligible, invoice_type="slutt", company_slug="probe"
+    )
+    # `ok` lands; over-billed row stays off the draft.
+    assert [l.oppgave_page_id for l in lines] == ["ok"]

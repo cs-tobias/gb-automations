@@ -356,123 +356,52 @@ async def list_products(company_slug: str) -> list[dict[str, Any]]:
     return rows
 
 
-# ============================================================
-# Writes — products + invoice drafts
-# ============================================================
+async def list_bank_accounts(company_slug: str) -> list[dict[str, Any]]:
+    """`GET /companies/{slug}/bankAccounts` — paginated.
 
+    Returns every bank account the company has registered in Fiken (each
+    carries `bankAccountId`, `bankAccountNumber`, `accountCode`, `name`,
+    `type` ("normal" | "tax" | ...), `inactive` bool). The engine reads
+    this to auto-pick the first active normal account when sending a
+    draft, so the printed invoice shows a real Kontonummer instead of a
+    blank field.
 
-# Norwegian chart-of-accounts code for "Salgsinntekt tjenester, høy
-# mva-sats" — kontonummer 3020 (sales of services at 25% VAT). Goldbox
-# bills architectural visualization services, so every product the
-# engine creates books to this account. NOT 3000 (which is "varer" =
-# goods). Hardcoded because it's the same forever for a services
-# business; if Goldbox ever needs a different code (export-exempt,
-# non-VAT, etc.) this becomes a settings variable.
-INCOME_ACCOUNT_SERVICES_VAT = "3020"
-
-
-async def create_product(
-    company_slug: str,
-    *,
-    name: str,
-    product_number: str,
-    unit_price: float,
-    vat_type: str = VAT_TYPE_25_PCT,
-    active: bool = True,
-    income_account: str = INCOME_ACCOUNT_SERVICES_VAT,
-) -> dict[str, Any]:
-    """`POST /companies/{slug}/products` — create a product.
-
-    `product_number` is the stable identifier we use to find this product
-    again (e.g. `goldbox-interior`). `unit_price` is NOK (decimal). The
-    response carries `productId` (Fiken's numeric id); the engine caches it
-    in `FikenProductCache` so subsequent runs PUT the price update directly.
-
-    `income_account` is the Norwegian kontonummer the revenue from this
-    product books to — Fiken requires it on every product. Defaults to
-    3000 (taxable services).
+    Path is `/bankAccounts` (camelCase) — verified empirically. The
+    `/bank-accounts` (kebab-case) form returns an unparseable response.
     """
-    body = {
-        "name": name,
-        "productNumber": product_number,
-        "unitPrice": unit_price,
-        "vatType": vat_type,
-        "active": active,
-        "incomeAccount": income_account,
-    }
+    rows: list[dict[str, Any]] = []
+    page = 0
     async with await _client() as client:
-        response = await _with_retries(
-            lambda: client.post(
-                f"/companies/{company_slug}/products", json=body
-            ),
-            op_name="create_product",
-        )
-        _raise_for_status(response)
-        # Fiken returns 201 Created with NO body and the new resource id
-        # in the Location header (`/api/v2/companies/{slug}/products/{id}`).
-        # Some tenants also return the full JSON. Handle both: try JSON
-        # first, fall back to parsing the Location header. Either way the
-        # engine ends up with a dict carrying productId.
-        try:
-            data = response.json()
-            if isinstance(data, dict) and data:
-                return data
-        except Exception:
-            pass
-        location = response.headers.get("Location") or ""
-        product_id = location.rsplit("/", 1)[-1] if location else ""
-        return {
-            "productId": product_id,
-            "productNumber": product_number,
-            "Location": location,
-        }
+        while True:
+            response = await _with_retries(
+                lambda p=page: client.get(
+                    f"/companies/{company_slug}/bankAccounts",
+                    params={"page": p, "pageSize": 100},
+                ),
+                op_name="list_bank_accounts",
+            )
+            _raise_for_status(response)
+            data = _unwrap_list(response.json())
+            if not data:
+                break
+            rows.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+    return rows
 
 
-async def update_product(
-    company_slug: str,
-    product_id: str,
-    *,
-    name: str,
-    unit_price: float,
-    vat_type: str = VAT_TYPE_25_PCT,
-    income_account: str = INCOME_ACCOUNT_SERVICES_VAT,
-    active: bool = True,
-) -> dict[str, Any]:
-    """`PUT /companies/{slug}/products/{id}` — full update.
+# ============================================================
+# Writes — invoice drafts
+# ============================================================
 
-    Fiken validates the PUT body against the full product schema —
-    `name`, `vatType`, `incomeAccount` are all required on every call,
-    not just the fields the caller changed. So this wrapper always
-    sends the full set. Caller must pass current values for the fields
-    that aren't being changed (the engine reads them from its own
-    FikenProductCache or computes the defaults).
 
-    Returns the response (may be empty body + Location header — we
-    don't depend on the body shape here, the engine just needs the
-    PUT to succeed).
-    """
-    body: dict[str, Any] = {
-        "name": name,
-        "unitPrice": unit_price,
-        "vatType": vat_type,
-        "incomeAccount": income_account,
-        "active": active,
-    }
-    async with await _client() as client:
-        response = await _with_retries(
-            lambda: client.put(
-                f"/companies/{company_slug}/products/{product_id}", json=body
-            ),
-            op_name="update_product",
-        )
-        _raise_for_status(response)
-        try:
-            data = response.json()
-            if isinstance(data, dict) and data:
-                return data
-        except Exception:
-            pass
-        return {"productId": product_id, "name": name}
+# NOTE: previous versions of this file exported `create_product` /
+# `update_product` and a `INCOME_ACCOUNT_SERVICES_VAT = "3020"` constant.
+# Both went away when the engine switched to operator-managed Fiken
+# products (Kategori name match → productId on the line; account routes
+# from the product itself, not from the app). Reintroduce only if a new
+# use case truly needs auto-managed products.
 
 
 async def get_invoice_draft(
@@ -508,6 +437,7 @@ async def create_invoice_draft(
     currency: str = "NOK",
     your_reference: str | None = None,
     invoice_text: str | None = None,
+    bank_account_number: str | None = None,
 ) -> dict[str, Any]:
     """`POST /companies/{slug}/invoices/drafts` — create a DRAFT invoice.
 
@@ -548,12 +478,28 @@ async def create_invoice_draft(
         is the field the Fiken UI reads — alternatives `comment` /
         `message` / `paymentText` are silently dropped on POST.
 
-    `lines` shape:
-        [{"description": "Interiør", "quantity": 2.5,
-          "unitAmount": 250000,  # NOK øre (integer cents)
+    `lines` shape (per the new product-linked engine path):
+        [{"productId": 1234,            # Fiken numeric id; account auto-fills
+          "description": "Næring - Interiør",  # mirrors product name
+          "comment": "Kjøkken - Hovedbilde dag",  # smaller sub-line
+          "quantity": 0.5,              # Antall (fraction OK)
+          "unitPrice": 1000000,         # NOK øre (integer cents) — full Pris
           "vatType": "HIGH",
-          "productId": 1234}    # optional
-        , ...]
+          "discount": 15.0},            # optional; percent
+        ...]
+
+    Free-text lines (no `productId`) require `incomeAccount` — Fiken 400s
+    with "incomeAccount is required for free-text lines (lines without a
+    productId)" otherwise. The engine reserves free-text only as the
+    fallback when a kategori has no matching Fiken product, and treats
+    that 400 as a clean surface for the operator to add the missing
+    product before re-clicking.
+
+    `bank_account_number` (Fiken field `bankAccountNumber`) populates the
+    Kontonummer on the printed invoice. Omitted when blank/None →
+    Fiken's UI shows "Kontonummer endre standard" (i.e. blank). Field
+    name pinned empirically: `bankAccountCode` and `bankAccountId` are
+    silently dropped on POST; only `bankAccountNumber` round-trips.
 
     Returns the created draft (carries `draftId` for the URL writeback
     onto the Notion project).
@@ -572,6 +518,8 @@ async def create_invoice_draft(
         body["yourReference"] = your_reference
     if invoice_text:
         body["invoiceText"] = invoice_text
+    if bank_account_number:
+        body["bankAccountNumber"] = bank_account_number
 
     async with await _client() as client:
         response = await _with_retries(
@@ -605,7 +553,6 @@ __all__ = [
     "list_companies",
     "list_contacts",
     "list_products",
-    "create_product",
-    "update_product",
+    "list_bank_accounts",
     "create_invoice_draft",
 ]

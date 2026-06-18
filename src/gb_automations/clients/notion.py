@@ -1239,6 +1239,113 @@ async def set_project_draft_url(
 
 
 # ============================================================
+# Generic page writeback helpers (used by the Brreg enrichment path)
+# ============================================================
+#
+# These three helpers are the minimum the Fiken engine needs to create a
+# Fakturamottaker row from a Brreg lookup and link it to the Project.
+# Intentionally generic (db_id, title_prop_name, …) so they can be
+# repurposed by future flows without copy-paste.
+
+
+async def create_page_in_db(
+    db_id: str,
+    *,
+    title: str,
+    title_prop_name: str = "Navn",
+    extra_properties: dict[str, Any] | None = None,
+) -> str:
+    """Create a new page in a Notion database. Returns the new page id.
+
+    `title` lands on the property named by `title_prop_name` (Goldbox
+    convention is `Navn` for every DB's title column). `extra_properties`
+    is merged into the body's `properties` block as-is — callers are
+    responsible for the right shape (e.g. `{"Orgnr": {"rich_text":
+    [{"text": {"content": "123…"}}]}}`).
+
+    Idempotency: this WILL create a duplicate row if called twice with
+    the same title. The Fiken engine guards against that upstream by
+    only calling this when there's no existing Fakturamottaker to fill.
+    """
+    if not db_id:
+        raise RuntimeError("db_id is required for create_page_in_db")
+    properties: dict[str, Any] = {
+        title_prop_name: {
+            "title": [{"text": {"content": title}}],
+        },
+    }
+    if extra_properties:
+        properties.update(extra_properties)
+
+    body = {
+        "parent": {"database_id": db_id},
+        "properties": properties,
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.post("/pages", json=body),
+            op_name=f"POST /pages (database_id={db_id})",
+        )
+        _raise_for_status(response)
+        data = response.json()
+    new_id = data.get("id") or ""
+    if not new_id:
+        raise RuntimeError(
+            f"Notion create_page_in_db returned no page id: {data}"
+        )
+    return new_id
+
+
+async def set_page_title(
+    page_id: str, *, title: str, title_prop_name: str = "Navn"
+) -> None:
+    """Idempotently set the title of a page.
+
+    No read-before-write here — Notion's PATCH is itself idempotent at
+    the API level (same body = no change). Callers that want to avoid
+    even the round-trip can compare to the live title themselves.
+    """
+    props = {
+        title_prop_name: {
+            "title": [{"text": {"content": title}}],
+        },
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{page_id} title={title_prop_name}",
+        )
+        _raise_for_status(response)
+
+
+async def set_relation(
+    page_id: str, *, prop_name: str, target_ids: list[str]
+) -> None:
+    """Set a relation property to point at the given page ids (replaces
+    the existing list entirely; pass empty list to clear).
+
+    Used by the Fiken engine to wire a newly-created Fakturamottaker row
+    into the Project's `Fakturamottaker` relation. No dedup against the
+    current value — Notion will accept a no-op PATCH cleanly.
+    """
+    props = {
+        prop_name: {
+            "relation": [{"id": page_id_} for page_id_ in target_ids],
+        },
+    }
+    async with _client() as client:
+        response = await _with_retries(
+            lambda: client.patch(
+                f"/pages/{page_id}", json={"properties": props}
+            ),
+            op_name=f"PATCH /pages/{page_id} relation={prop_name}",
+        )
+        _raise_for_status(response)
+
+
+# ============================================================
 # Phase 2.5 — Deliverable Status + Ferdig helpers
 # ============================================================
 

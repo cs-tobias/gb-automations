@@ -99,6 +99,16 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("KORREKSJONER_DB_ID"),
     )
+    # Notion `Fakturamottaker` DB — the billing-recipient catalogue, one
+    # row per legal entity (carrying Orgnr + the official Brreg name).
+    # The Fiken engine READS this DB through the Project's Fakturamottaker
+    # relation, and WRITES to it when the Brreg-by-name fallback resolves
+    # a new customer for a project that had no Fakturamottaker linked.
+    # Empty → the Brreg-by-name writeback path is disabled (the engine
+    # falls through to the "Mangler kunde" placeholder instead). The
+    # Brreg-by-orgnr enrichment still works regardless because it just
+    # updates an existing Fakturamottaker row's title.
+    fakturamottaker_db_id: str = ""
     # Optional: live mirror of the durable sync queue so the client can watch
     # what's queued / processing / failed in Notion. If empty, the mirror is a
     # no-op (the Postgres queue still works, observable via /debug/queue).
@@ -417,6 +427,16 @@ class Settings(BaseSettings):
         "Sluttfaktura: Gjenstående beløp etter eventuell oppstartsfaktura. "
         "Takk for at du valgte Goldbox."
     )
+    # Optional override for the Kontonummer (bank account number) sent on
+    # every Fiken draft so the printed invoice has a payment account
+    # populated. When empty (default), the engine auto-picks the FIRST
+    # active normal-type account from `list_bank_accounts` on the first
+    # send_faktura per company and caches it in `fiken_bank_accounts`.
+    # Goldbox-style single-account setups don't need to touch this; a
+    # multi-account company sets this to pin a specific account number
+    # (the same format Fiken's UI shows: "36061538997", no spaces, no
+    # IBAN — empirically pinned as `bankAccountNumber` on the draft body).
+    fiken_bank_account_number: str = ""
 
 
 settings = Settings()
@@ -495,18 +515,26 @@ COMPANIES_PROPS = {
 # to its Fakturamottaker (billing recipient) row. The Fiken creation engine
 # reads this in ONE hop — no more Project → Kunder → Fakturamottaker walk.
 # Kunder may still exist on the Projects DB for contact / view purposes,
-# but it's no longer load-bearing for invoicing. Letting operators set
-# Fakturamottaker per project means a project can bill a different entity
-# than the parent Kunder uses by default (e.g. property-management company
-# invoices a sub-LLC for one specific building).
+# AND is read by the Brreg-by-name fallback when the project has no Orgnr
+# on its Fakturamottaker (see _resolve_project_via_kunder_brreg in the
+# Fiken engine). Letting operators set Fakturamottaker per project means
+# a project can bill a different entity than the parent Kunder uses by
+# default (e.g. property-management company invoices a sub-LLC for one
+# specific building).
 PROJECTS_FAKTURAMOTTAKER_PROP = "Fakturamottaker"
+PROJECTS_KUNDER_PROP = "Kunder"
 
 
-# Properties on the Fakturamottaker DB. Only the Orgnr is read by the
-# Fiken creation engine — Fakturamottaker rows carry additional address
-# / billing-recipient fields that this app doesn't touch.
+# Properties on the Fakturamottaker DB.
+#   `orgnr` (rich_text) — Norwegian organization number; primary key for
+#     the Fiken contact match.
+#   `navn`  (title)     — display name. Read AND written by the engine:
+#     when Brreg resolves an Orgnr to an official `navn` and that name
+#     differs from the Fakturamottaker title, the engine PATCHes the
+#     row so Notion converges on Brreg's record over time.
 FAKTURAMOTTAKER_PROPS = {
     "orgnr": "Orgnr",   # rich_text — Norwegian organization number
+    "navn": "Navn",     # title    — display name (engine-writable)
 }
 
 
@@ -700,32 +728,29 @@ OPPGAVER_PROPS = {
     "billed_amount": "Fakturert beløp",     # number (NOK)
     "billed_status": "Fakturert status",    # single_select
     # Multi-select on the Oppgave naming the Fiken product / service
-    # category. The first selected label drives the invoice line's
-    # `description` (what shows as the product name in Fiken) AND its
-    # `incomeAccount` (3000 / 3020 etc., via FIKEN_KATEGORI_TO_ACCOUNT).
+    # category. The first selected label is the engine's lookup key
+    # against Fiken's product catalogue: it picks the Fiken product
+    # whose `name` matches the label exactly and sends `productId` on
+    # the invoice line. Fiken's product carries the account (3000 /
+    # 3020 / etc.) and product name; we don't track either in the app.
     # Multi-select shape preserved from Goldbox's existing usage; engine
     # picks the first label.
     "kategori": "Oppgave kategori",         # multi_select
 }
 
 
-# Maps the Oppgaver `Oppgave kategori` multi-select labels to Norwegian
-# chart-of-accounts codes (kontonummer). 3020 = "Salgsinntekt tjenester,
-# høy mva-sats" (services at 25% VAT — the historical default for every
-# Goldbox invoice line); 3000 = "Salgsinntekt varer, høy mva-sats" (goods
-# at 25% VAT). Both still book at 25% MVA (`HIGH`); only the income
-# account differs so the accountant can split tjeneste vs vare revenue.
+# Income account (kontonummer) sent on Fiken FREE-TEXT lines (lines
+# where the Kategori didn't match a Fiken product, so we couldn't link
+# productId). Fiken rejects free-text lines without an `incomeAccount`
+# (HTTP 400 `incomeAccount is required for free-text lines (lines
+# without a productId)`), so the engine sends this default to keep the
+# draft creatable in the no-Kategori-match case.
 #
-# Goldbox will add more kategoris over time (e.g. "Næring -
-# Snittillustrasjon", "Bolig - Opparbeide modell") — extend this dict
-# and they immediately route to the right account on the next draft.
-# Unknown labels fall back to FIKEN_DEFAULT_INCOME_ACCOUNT and log a
-# WARN so the operator sees the gap.
-FIKEN_KATEGORI_TO_ACCOUNT: dict[str, str] = {
-    "Næring - Interiør": "3020",
-    "Print": "3000",
-}
-FIKEN_DEFAULT_INCOME_ACCOUNT = "3020"
+# 3020 = "Salgsinntekt tjenester, høy mva-sats" (services at 25% VAT).
+# The operator can change the account on the line in Fiken's UI after
+# the draft is created, OR add a matching Fiken product so future
+# drafts go through the product-linked path.
+FIKEN_FREE_TEXT_INCOME_ACCOUNT = "3020"
 
 
 # The four option names that may appear in the `Fakturert status`

@@ -714,27 +714,41 @@ class FikenInvoiceLine(Base):
     )
 
 
-class FikenProductCache(Base):
-    """Fiken product per (company_slug, discipline). Keeps the product
-    catalogue in sync with Notion's per-row prices so invoice lines can
-    link to a real product (richer Fiken-side reports) rather than only
-    free-text lines.
+class FikenProductByKategori(Base):
+    """Maps a Notion `Oppgave kategori` multi-select label to a Fiken
+    product id, cached per `company_slug`.
 
-    The creation engine ensures one Fiken product exists per discipline
-    (Interiør / Eksteriør / Animasjon / Annet) and updates its unitPrice
-    when a new Notion price is seen. Distinct from FikenInvoice/Line: this
-    is "what does the catalogue look like", not "what got billed".
+    The Fiken creation engine looks up the Kategori label in this cache
+    on each invoice line; on miss it lists Fiken's products, finds the
+    one whose `name` matches the label, and upserts the mapping. Send
+    faktura then includes `productId` on the line so Fiken's `description`
+    and `incomeAccount` auto-fill from the product itself — operators
+    manage the catalogue + account routing in Fiken's UI without the
+    engine knowing anything about kontonummer.
+
+    On a name-match miss the engine sends the line free-text with the
+    Kategori label as `description`. Fiken rejects free-text lines with
+    no `incomeAccount` (400 `incomeAccount is required for free-text
+    lines …`), so the row surfaces as a failure with a clear message —
+    the operator adds the missing product in Fiken before re-clicking.
+
+    `name_when_cached` records the Fiken product name at insertion time
+    so an operator-renamed product in Fiken is visible in the cache row
+    on the next debug pull (the engine still uses the cached id, which
+    survives a Fiken-side rename).
     """
 
-    __tablename__ = "fiken_product_cache"
+    __tablename__ = "fiken_product_by_kategori"
 
     company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
-    discipline: Mapped[str] = mapped_column(String(32), primary_key=True)
+    kategori_label: Mapped[str] = mapped_column(String(128), primary_key=True)
     fiken_product_id: Mapped[str] = mapped_column(String(32), nullable=False)
-    product_number: Mapped[str] = mapped_column(String(64), nullable=False)
-    last_unit_price_ore: Mapped[int] = mapped_column(Integer, nullable=False)
+    name_when_cached: Mapped[str] = mapped_column(String(128), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 
@@ -760,6 +774,43 @@ class FikenPlaceholderContact(Base):
     company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
     fiken_contact_id: Mapped[str] = mapped_column(String(32), nullable=False)
     name_when_created: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class FikenBankAccount(Base):
+    """One row per Fiken company_slug: the `bankAccountNumber` we send on
+    every draft so the printed invoice shows a Kontonummer (not blank).
+
+    Auto-resolved on first send_faktura per company — the engine calls
+    `fiken_client.list_bank_accounts(company_slug)`, picks the first
+    active normal-type account, and caches its bankAccountNumber here.
+    Subsequent runs read the cache; no per-deploy config needed.
+
+    The operator can override via `FIKEN_BANK_ACCOUNT_NUMBER` env var.
+    When set, the cache is bypassed entirely and the env value flows
+    through. Useful when the company has multiple accounts and the
+    operator wants to pin one explicitly.
+
+    Self-heal: if Fiken rejects the cached number (deleted on Fiken's
+    side, made inactive), we re-resolve on the next run. The engine
+    treats a 400 from create_invoice_draft mentioning the bank account
+    as the signal to evict the cache row and re-pick.
+
+    Field empirically pinned: `bankAccountNumber` is the field Fiken
+    accepts and echoes back on draft creation; `bankAccountCode` and
+    `bankAccountId` are silently dropped.
+    """
+
+    __tablename__ = "fiken_bank_accounts"
+
+    company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bank_account_number: Mapped[str] = mapped_column(String(32), nullable=False)
+    name_when_cached: Mapped[str] = mapped_column(String(128), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
