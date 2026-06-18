@@ -52,7 +52,7 @@ from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import (
-    enqueue_fiken_invoice_create,
+    enqueue_send_faktura,
     enqueue_frame_comment_sync,
     enqueue_frame_file_status_sync,
     enqueue_frame_leveranse_sync,
@@ -887,87 +887,58 @@ async def _notion_project_status_impl(request: Request) -> Response:
 
 
 # ============================================================
-# /webhooks/notion/fiken-create-invoice — Notion button receiver
+# /webhooks/notion/send-faktura — Notion button receiver
 # ============================================================
 
 
-@router.post("/notion/fiken-create-invoice")
-async def notion_fiken_create_invoice(request: Request) -> Response:
-    """Notion button receiver: "Opprett oppstartsfaktura" / "Opprett
-    sluttfaktura" on a Project row.
+@router.post("/notion/send-faktura")
+async def notion_send_faktura(request: Request) -> Response:
+    """Notion button receiver: "Send faktura" on a Project row.
 
-    Wired as two buttons on the Projects DB, each with a static body
-    distinguishing the run:
-        {"invoice_type": "oppstart"}
-        {"invoice_type": "slutt"}
-    plus Notion's standard `{"data": {"id": "{{page.id}}", ...}}` envelope.
+    One button per project — no oppstart/slutt argument. The worker
+    reads the project's `Faktura status` to decide whether this click
+    bills 50% (status = "Til oppstartsfaktura") or the remainder
+    (status = "Til avslutningsfaktura"). The "what to bill" picker is
+    on the Oppgaver themselves (each row's `Fakturert status` select).
 
     Same minimal shape as /webhooks/notion/project-status: bearer check,
-    body parse, ENQUEUE a `fiken_invoice_create` task, return 200. All
-    real work (Notion reads, Fiken POSTs, Notion stampbacks) runs on
-    the queue worker — keeps us safely under Notion's auto-pause
-    threshold for slow receivers.
+    body parse, ENQUEUE a `send_faktura` task, return 200. All real work
+    (Notion reads, Fiken POSTs, Notion stampbacks) runs on the queue
+    worker — keeps us safely under Notion's auto-pause threshold for
+    slow receivers.
 
     Auth: same `NOTION_WEBHOOK_SECRET` every other Notion automation
     uses. Like the other Notion-automation receivers, this returns
     HTTP 200 for EVERY code path including auth/JSON failure — Notion
     auto-pauses on any non-2xx, and the threshold is undocumented.
     """
-    with request_scope("fiken-create"):
-        return await _notion_fiken_create_invoice_impl(request)
+    with request_scope("send-faktura"):
+        return await _notion_send_faktura_impl(request)
 
 
-async def _notion_fiken_create_invoice_impl(request: Request) -> Response:
+async def _notion_send_faktura_impl(request: Request) -> Response:
     if not _verify_bearer(request.headers.get("Authorization")):
         logger.warning(
-            "Notion fiken-create-invoice auth failed (NOTION_WEBHOOK_SECRET set: %s)",
+            "Notion send-faktura auth failed (NOTION_WEBHOOK_SECRET set: %s)",
             bool(settings.notion_webhook_secret),
         )
-        _record_notion_automation_hit("fiken-create-invoice", "auth_failed")
+        _record_notion_automation_hit("send-faktura", "auth_failed")
         return _json({"action": "skipped", "reason": "auth failed"})
 
     raw_body = await request.body()
     try:
         payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
-        logger.warning("fiken-create-invoice: invalid JSON body")
-        _record_notion_automation_hit("fiken-create-invoice", "invalid_json")
+        logger.warning("send-faktura: invalid JSON body")
+        _record_notion_automation_hit("send-faktura", "invalid_json")
         return _json({"action": "skipped", "reason": "invalid JSON"})
 
     data = payload.get("data") or {}
     page_id = (data.get("id") or "").strip()
     if not page_id:
-        logger.warning("fiken-create-invoice: no page id in payload")
-        _record_notion_automation_hit("fiken-create-invoice", "no_page_id")
+        logger.warning("send-faktura: no page id in payload")
+        _record_notion_automation_hit("send-faktura", "no_page_id")
         return _json({"action": "skipped", "reason": "no page id"})
-
-    # invoice_type can come from EITHER:
-    #   - body top-level: {"invoice_type": "oppstart"} — used when Notion's
-    #     button UI exposes a custom-body field (some plans/versions do);
-    #   - URL query string: ?invoice_type=oppstart — used when the body
-    #     field isn't exposed in Notion's button editor. The operator then
-    #     bakes the type into the webhook URL itself (one button per type).
-    # Query takes precedence over body (more explicit; the URL is right
-    # there in Notion's automation UI).
-    invoice_type = (
-        request.query_params.get("invoice_type")
-        or payload.get("invoice_type")
-        or ""
-    ).strip().lower()
-    if invoice_type not in ("oppstart", "slutt"):
-        logger.warning(
-            "fiken-create-invoice: invalid invoice_type %r in payload (page %s)",
-            invoice_type,
-            page_id,
-        )
-        _record_notion_automation_hit("fiken-create-invoice", "bad_invoice_type")
-        return _json(
-            {
-                "page_id": page_id,
-                "action": "skipped",
-                "reason": "invoice_type must be 'oppstart' or 'slutt'",
-            }
-        )
 
     # Parent-DB sanity check — same as project-status. Cheap string
     # compare; doesn't hit Notion. Skipped when PROJECTS_DB_ID is unset
@@ -977,33 +948,26 @@ async def _notion_fiken_create_invoice_impl(request: Request) -> Response:
     payload_db = parent.replace("-", "").lower()
     if target_db and payload_db != target_db:
         logger.info(
-            "fiken-create-invoice: page %s parent DB %s does not match "
+            "send-faktura: page %s parent DB %s does not match "
             "PROJECTS_DB_ID — skipping",
             page_id,
             parent,
         )
-        _record_notion_automation_hit("fiken-create-invoice", "wrong_parent_db")
+        _record_notion_automation_hit("send-faktura", "wrong_parent_db")
         return _json(
             {"page_id": page_id, "action": "skipped", "reason": "wrong parent DB"}
         )
 
-    inserted = await enqueue_fiken_invoice_create(page_id, invoice_type)
+    inserted = await enqueue_send_faktura(page_id)
     queue_worker.wake()
     action = "queued" if inserted else "already_queued"
     logger.info(
-        "📥 fiken-create-invoice %s for %s (%s)",
+        "📥 send-faktura %s for %s",
         "enqueued" if inserted else "already_queued",
         page_id,
-        invoice_type,
     )
-    _record_notion_automation_hit("fiken-create-invoice", action)
-    return _json(
-        {
-            "page_id": page_id,
-            "invoice_type": invoice_type,
-            "action": action,
-        }
-    )
+    _record_notion_automation_hit("send-faktura", action)
+    return _json({"page_id": page_id, "action": action})
 
 
 async def _notion_webhook_impl(request: Request) -> Response:

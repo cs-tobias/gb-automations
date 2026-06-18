@@ -692,11 +692,18 @@ class FikenInvoiceLine(Base):
     fiken_invoice_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     oppgave_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     discipline: Mapped[str] = mapped_column(String(32), nullable=False)
-    # Fraction billed on THIS invoice for this Oppgave (e.g. 0.5 on oppstart,
-    # 0.5 on the slutt that follows). The sum of fractions across an
-    # Oppgave's lines should be ≤ 1 at all times.
-    fraction: Mapped[float] = mapped_column(nullable=False)
-    # NOK price * 100, captured at creation. Integer to avoid float drift.
+    # NOK amount actually billed on THIS invoice line, in øre (integer cents)
+    # so float drift is impossible. The cumulative sum across all of an
+    # Oppgave's lines equals what Notion's `Fakturert beløp` holds (modulo
+    # the øre→NOK conversion). v1 stored a fraction here; v2 stores the
+    # absolute amount because Pris is mutable (operators can renegotiate
+    # between oppstart and slutt) — a fraction would be meaningless once
+    # the underlying Pris changes.
+    billed_amount_ore: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Mirrors billed_amount_ore — kept under both column names while v1
+    # callers still reference unit_price_ore. New writes set both to the
+    # same value; eventual cleanup is to drop unit_price_ore once nothing
+    # reads it.
     unit_price_ore: Mapped[int] = mapped_column(Integer, nullable=False)
     inserted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -728,6 +735,36 @@ class FikenProductCache(Base):
     last_unit_price_ore: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class FikenPlaceholderContact(Base):
+    """One row per Fiken company_slug: the contactId of the "Mangler kunde"
+    (missing-customer) placeholder we link drafts to when the project's
+    Fakturamottaker has no Orgnr yet.
+
+    Auto-created on first sighting — the engine creates a Fiken contact
+    with name = settings.fiken_placeholder_contact_name and no Orgnr,
+    then caches the id here so subsequent missing-Orgnr runs reuse the
+    same contact instead of cluttering Fiken with one orphan customer
+    per run.
+
+    Single source of truth: there is exactly one placeholder per company.
+    Renaming the placeholder in Fiken is harmless — we key on the cached
+    id, not the name. If the operator deletes it in Fiken the cache row
+    self-heals on next use (404 → create + upsert).
+    """
+
+    __tablename__ = "fiken_placeholder_contacts"
+
+    company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fiken_contact_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    name_when_created: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 
@@ -825,13 +862,12 @@ SYNC_TASK_TYPES = (
     "leveranse_status_recheck",
     "toggl_project_sync",
     "toggl_hours_sync",
-    # Fiken Phase A. `fiken_invoice_create` is fired by the per-project
-    # Notion buttons (Opprett oppstartsfaktura / Opprett sluttfaktura);
-    # gmail_thread_id carries f"{project_page_id}:{invoice_type}" so
-    # oppstart and slutt for the same project can be active at once.
-    # `fiken_poll` is the scheduled global singleton — at most one active
-    # ever, mirroring toggl_hours_sync.
-    "fiken_invoice_create",
+    # Fiken Phase B (v2). `send_faktura` is fired by the per-project
+    # "Send faktura" Notion button; gmail_thread_id is the project_page_id
+    # alone (the engine reads the project's `Faktura status` to decide
+    # oppstart vs slutt). `fiken_poll` is the scheduled global singleton
+    # — at most one active ever, mirroring toggl_hours_sync.
+    "send_faktura",
     "fiken_poll",
 )
 
@@ -921,7 +957,7 @@ class SyncTask(Base):
             "'oppgave_done_sync',"
             "'leveranse_status_recheck','toggl_project_sync',"
             "'toggl_hours_sync','project_status_dispatch',"
-            "'fiken_invoice_create','fiken_poll')",
+            "'fiken_invoice_create','send_faktura','fiken_poll')",
             name="ck_sync_tasks_task_type",
         ),
         # At most one ACTIVE (pending/in_progress) row per thread — this is the
@@ -1115,18 +1151,18 @@ class SyncTask(Base):
                 "status IN ('pending','in_progress') AND task_type = 'toggl_hours_sync'"
             ),
         ),
-        # Fiken Phase A — At most one ACTIVE fiken_invoice_create per
-        # (project, invoice_type). The enqueue helper packs
-        # f"{project_page_id}:{invoice_type}" into gmail_thread_id so the
-        # SAME project can have an oppstart AND a slutt task in flight
-        # simultaneously (different keys), while a double-click on the
-        # same button collapses to one row.
+        # Fiken Phase B (v2) — At most one ACTIVE send_faktura per project.
+        # The enqueue helper stuffs project_page_id alone into
+        # gmail_thread_id (no oppstart/slutt suffix — the engine reads
+        # the project's `Faktura status` to decide), so any double-click
+        # of the "Send faktura" button while the previous run is in
+        # flight collapses to one row.
         Index(
-            "uq_sync_tasks_active_fiken_invoice_create",
+            "uq_sync_tasks_active_send_faktura",
             "gmail_thread_id",
             unique=True,
             postgresql_where=text(
-                "status IN ('pending','in_progress') AND task_type = 'fiken_invoice_create'"
+                "status IN ('pending','in_progress') AND task_type = 'send_faktura'"
             ),
         ),
         # Fiken Phase A — At most one ACTIVE fiken_poll ever (global

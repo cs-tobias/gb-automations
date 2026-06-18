@@ -506,6 +506,8 @@ async def create_invoice_draft(
     lines: list[dict[str, Any]],
     invoice_type: str = "invoice",
     currency: str = "NOK",
+    your_reference: str | None = None,
+    invoice_text: str | None = None,
 ) -> dict[str, Any]:
     """`POST /companies/{slug}/invoices/drafts` — create a DRAFT invoice.
 
@@ -514,11 +516,14 @@ async def create_invoice_draft(
 
     Customer linking: pass `customer_id` (Fiken's numeric contactId,
     resolved by caller from the Notion Orgnr → /contacts lookup). If
-    None, the field is OMITTED from the body — Fiken's docs say
-    customerId is required, but we've also seen drafts created without
-    a customer that the operator fills in by hand in Fiken's UI. If
-    Fiken 400s on the missing field, the engine surfaces it and we
-    revisit the design.
+    None, the field is OMITTED from the body — and Fiken WILL 400
+    ("'customerId' er påkrevd"). The engine (sync_fiken_invoice.py)
+    never sends None: when Notion has no Orgnr it links to a shared
+    "Mangler kunde" placeholder contact instead, so the draft stays
+    creatable and the operator picks the real customer in Fiken's UI
+    before clicking Send. The None branch here is preserved as a
+    defensive escape hatch for ad-hoc callers (debug routes, scripts)
+    that explicitly want to surface Fiken's required-field error.
 
     Required Fiken fields we always send:
       - issueDate (YYYY-MM-DD)
@@ -526,7 +531,22 @@ async def create_invoice_draft(
       - type ("invoice" / "cash" / "creditNote"; we always send "invoice")
       - lines (per-discipline rows from sync_fiken_invoice)
       - REFERENCE_FIELD ("ourReference" — what the Make replacement
-        poller matches the project on)
+        poller matches the project on; we send the Notion project name)
+
+    Optional:
+      - `your_reference` ("yourReference") — deres referanse, i.e. the
+        customer-side PO / mark on the invoice. Goldbox reads this off
+        the Project's `Faktura merkes` rich_text. Omitted from the body
+        when blank/None.
+      - `invoice_text` ("invoiceText") — the draft-level "Kommentar" in
+        Fiken's UI (a free-text note shown above the line items on the
+        printed invoice). Goldbox sends a different default for oppstart
+        vs slutt invoices (see settings.fiken_invoice_text_*). Omitted
+        from the body when blank/None, in which case Fiken falls back to
+        the company-level default ("endre standard" in the UI). Empirical:
+        verified by direct probe (`PROBE-invoiceText` test) that this
+        is the field the Fiken UI reads — alternatives `comment` /
+        `message` / `paymentText` are silently dropped on POST.
 
     `lines` shape:
         [{"description": "Interiør", "quantity": 2.5,
@@ -548,6 +568,10 @@ async def create_invoice_draft(
     }
     if customer_id is not None:
         body["customerId"] = customer_id
+    if your_reference:
+        body["yourReference"] = your_reference
+    if invoice_text:
+        body["invoiceText"] = invoice_text
 
     async with await _client() as client:
         response = await _with_retries(

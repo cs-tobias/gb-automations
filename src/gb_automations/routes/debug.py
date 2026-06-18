@@ -1136,28 +1136,23 @@ async def debug_fiken() -> dict[str, Any]:
 @router.post("/fiken/create-draft")
 async def debug_fiken_create_draft(
     project_page_id: str = Query(..., description="Notion Project page id"),
-    invoice_type: str = Query(
-        ...,
-        description="'oppstart' or 'slutt'",
-        pattern="^(oppstart|slutt)$",
-    ),
 ) -> dict[str, Any]:
-    """Manually enqueue a fiken_invoice_create task — bypasses the Notion
-    button (and its bearer auth) so the engine can be exercised from a
-    laptop without configuring Notion automations first.
+    """Manually enqueue a send_faktura task — bypasses the Notion button
+    (and its bearer auth) so the engine can be exercised from a laptop
+    without configuring Notion automations first.
 
     Same code path as the webhook: enqueue + wake worker + return
-    immediately. The actual work happens on the queue worker; poll
-    `/debug/queue` to see when it finishes.
+    immediately. The worker reads the project's `Faktura status` to
+    decide oppstart vs slutt; set it on the project before calling this
+    endpoint. Poll `/debug/queue` to see when the task finishes.
     """
     from gb_automations.jobs import queue_worker
-    from gb_automations.sync.queue import enqueue_fiken_invoice_create
+    from gb_automations.sync.queue import enqueue_send_faktura
 
-    inserted = await enqueue_fiken_invoice_create(project_page_id, invoice_type)
+    inserted = await enqueue_send_faktura(project_page_id)
     queue_worker.wake()
     return {
         "project_page_id": project_page_id,
-        "invoice_type": invoice_type,
         "action": "queued" if inserted else "already_queued",
     }
 
@@ -1165,62 +1160,77 @@ async def debug_fiken_create_draft(
 @router.get("/fiken/inspect")
 async def debug_fiken_inspect(
     project_page_id: str = Query(..., description="Notion Project page id"),
-    invoice_type: str = Query(
-        "oppstart",
-        description="'oppstart' or 'slutt'",
-        pattern="^(oppstart|slutt)$",
-    ),
 ) -> dict[str, Any]:
     """Dump exactly what the Fiken creation engine sees under this project.
 
-    For each Oppgave returned by `oppgaver_for_project`, shows every value
-    the eligibility filter checks (raw Type label, normalized discipline,
-    Pris, the four checkbox/andel columns) and why the row passed or
-    failed. The goal is to never have to guess what Notion is sending —
-    if the engine says "no eligible Oppgaver", this endpoint tells you
-    which check ate them.
+    Reads the project's `Faktura status` to determine the run mode
+    (oppstart / slutt / skipped), then for each Oppgave returned by
+    `oppgaver_for_project` shows every value the eligibility filter
+    checks (raw Type, normalized discipline, Pris, Rabatt, Fakturert
+    beløp, Fakturert status) and why the row passed or failed. The
+    goal is to never have to guess what Notion is sending — if the
+    engine says "no eligible Oppgaver", this endpoint tells you which
+    check ate them.
 
     Doesn't enqueue anything, doesn't touch Fiken — pure read.
     """
     from gb_automations.clients import notion as notion_client
-    from gb_automations.config import DISCIPLINE_KEYS, OPPGAVER_PROPS
-    from gb_automations.sync.sync_fiken_invoice import (
-        _row_fraction_for_invoice_type,
+    from gb_automations.config import (
+        DISCIPLINE_KEYS,
+        FAKTURA_STATUS_TO_INVOICE_TYPE,
+        FAKTURERT_STATUS_FULL,
+        FAKTURERT_STATUS_IKKE,
+        FAKTURERT_STATUS_50,
+        FAKTURERT_STATUS_UTGAR,
+        OPPGAVER_PROPS,
+        PROJECTS_FAKTURA_STATUS_PROP,
     )
+    from gb_automations.sync.sync_fiken_invoice import _row_billable_nok
+
+    project_page = await notion_client.get_page(project_page_id)
+    faktura_status = notion_client.read_select_name(
+        project_page, PROJECTS_FAKTURA_STATUS_PROP
+    )
+    invoice_type = FAKTURA_STATUS_TO_INVOICE_TYPE.get(faktura_status or "")
 
     rows = await notion_client.oppgaver_for_project(project_page_id)
     inspected: list[dict[str, Any]] = []
-    checkbox_prop = (
-        OPPGAVER_PROPS["should_invoice_at_start"]
-        if invoice_type == "oppstart"
-        else OPPGAVER_PROPS["should_invoice_at_end"]
-    )
 
     for row in rows:
         raw_type = notion_client.task_discipline(row)
         canonical = DISCIPLINE_KEYS.get((raw_type or "").strip().lower())
-        ticked = notion_client.read_checkbox_prop(row, checkbox_prop)
-        fakturert = notion_client.read_multi_select_names(
-            row, OPPGAVER_PROPS["billed_status"]
+        fakturert_status = (
+            notion_client.read_select_name(row, OPPGAVER_PROPS["billed_status"])
+            or FAKTURERT_STATUS_IKKE
         )
         price = notion_client.read_number_prop(row, OPPGAVER_PROPS["price_per_row"])
-        remainder = _row_fraction_for_invoice_type(row, invoice_type)
+        discount = notion_client.read_number_prop(row, OPPGAVER_PROPS["discount_pct"])
+        billed = notion_client.read_number_prop(row, OPPGAVER_PROPS["billed_amount"])
 
-        # The exact same gate the engine uses — keep this aligned with
-        # _eligible_rows in sync_fiken_invoice.py.
         reasons: list[str] = []
         if canonical is None:
             reasons.append(f"Type {raw_type!r} not a recognized discipline")
-        if not ticked:
-            reasons.append(f"{checkbox_prop!s} not ticked")
-        if remainder <= 0.0:
+        if fakturert_status in (FAKTURERT_STATUS_FULL, FAKTURERT_STATUS_UTGAR):
+            reasons.append(f"Fakturert status = {fakturert_status!r}")
+        if invoice_type == "oppstart" and fakturert_status != FAKTURERT_STATUS_IKKE:
             reasons.append(
-                f"already billed for this side (Fakturert={fakturert})"
+                f"oppstart needs Fakturert status = {FAKTURERT_STATUS_IKKE!r}, "
+                f"got {fakturert_status!r}"
             )
+        if invoice_type == "slutt" and fakturert_status not in (
+            FAKTURERT_STATUS_IKKE,
+            FAKTURERT_STATUS_50,
+        ):
+            reasons.append(f"slutt skips Fakturert status = {fakturert_status!r}")
+
+        billable: tuple[float, float] | None = None
+        if invoice_type and not reasons:
+            billable = _row_billable_nok(row, invoice_type)
+            if billable is None:
+                reasons.append("Pris missing or nothing left to bill")
+
         eligible = not reasons
 
-        # Build the title from the row's title-typed property (whatever
-        # its name happens to be — Notion only has one title per row).
         title = ""
         for prop in (row.get("properties") or {}).values():
             if prop.get("type") == "title" and prop.get("title"):
@@ -1233,9 +1243,11 @@ async def debug_fiken_inspect(
             "raw_Type": raw_type,
             "normalized_discipline": canonical,
             "Pris": price,
-            "Skal_ticked": ticked,
-            "Fakturert_labels": fakturert,
-            "remainder_for_this_run": remainder,
+            "Rabatt_pct": discount,
+            "Fakturert_belop": billed,
+            "Fakturert_status": fakturert_status,
+            "to_bill_nok": billable[0] if billable else None,
+            "new_billed_total_nok": billable[1] if billable else None,
             "eligible": eligible,
             "skipped_because": reasons,
             "archived": bool(row.get("archived")),
@@ -1244,8 +1256,8 @@ async def debug_fiken_inspect(
 
     return {
         "project_page_id": project_page_id,
-        "invoice_type": invoice_type,
-        "checkbox_prop_read": checkbox_prop,
+        "project_faktura_status": faktura_status,
+        "resolved_invoice_type": invoice_type,
         "total_rows": len(rows),
         "eligible_count": sum(1 for r in inspected if r["eligible"]),
         "rows": inspected,

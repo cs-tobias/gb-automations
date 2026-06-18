@@ -387,6 +387,29 @@ class Settings(BaseSettings):
     # + projects_db_id. Flip to true once the personal-account smoke test
     # passes.
     sync_fiken: bool = False
+    # Display name for the auto-created Fiken contact the engine links a
+    # draft to when the project's Fakturamottaker has no Orgnr. One per
+    # company_slug, cached in `fiken_placeholder_contacts`. Rename
+    # whenever — the cache keys on contactId, not on the name. The
+    # operator picks/edits the real customer in Fiken before clicking
+    # Send on the draft.
+    fiken_placeholder_contact_name: str = "Mangler kunde"
+    # Top-level draft "Kommentar" on the Fiken invoice — the text that
+    # appears as a general note above the line items on the printed
+    # invoice (Fiken API field: `invoiceText`). One default per invoice
+    # mode; engine picks at draft-creation time based on the project's
+    # `Faktura status`. Empty string in either field → engine omits the
+    # invoiceText field entirely and Fiken falls back to the company-
+    # level default ("endre standard" in the UI). Edit these in .env
+    # without redeploying; the engine reads `settings.…` live each run.
+    fiken_invoice_text_oppstart: str = (
+        "Oppstartsfaktura: 50 % av avtalt beløp for oppstart av prosjektet. "
+        "Resterende beløp faktureres ved levering."
+    )
+    fiken_invoice_text_slutt: str = (
+        "Sluttfaktura: Gjenstående beløp etter eventuell oppstartsfaktura. "
+        "Takk for at du valgte Goldbox."
+    )
 
 
 settings = Settings()
@@ -461,11 +484,15 @@ COMPANIES_PROPS = {
 }
 
 
-# The relation property on the Projects DB that links a project to its
-# Kunder (Companies) row. Read-only for the Fiken creation engine; the
-# engine walks Project → Kunder → Fakturamottaker → Orgnr to resolve the
-# Fiken customer.
-PROJECTS_KUNDER_PROP = "Kunder"
+# The relation property on the Projects DB that links a project DIRECTLY
+# to its Fakturamottaker (billing recipient) row. The Fiken creation engine
+# reads this in ONE hop — no more Project → Kunder → Fakturamottaker walk.
+# Kunder may still exist on the Projects DB for contact / view purposes,
+# but it's no longer load-bearing for invoicing. Letting operators set
+# Fakturamottaker per project means a project can bill a different entity
+# than the parent Kunder uses by default (e.g. property-management company
+# invoices a sub-LLC for one specific building).
+PROJECTS_FAKTURAMOTTAKER_PROP = "Fakturamottaker"
 
 
 # Properties on the Fakturamottaker DB. Only the Orgnr is read by the
@@ -646,71 +673,135 @@ OPPGAVER_PROPS = {
     # sub-items are enabled; default label "Parent item"). Korreksjonsrunde
     # sub-rows point at their deliverable.
     "parent": "Parent item",
-    # Fiken billing columns (only meaningful on deliverable rows). `Pris`
-    # drives the invoice line's unitAmount. The two `Skal …` checkboxes
-    # are the "pick which rows to bill" UX (user ticks before clicking
-    # the project-level Opprett-faktura button). `Fakturert` is the
-    # multi-select carrying the row's billing state — engine-written
-    # after a successful draft creation. See FAKTURERT_LABELS below for
-    # the four option names + their state-machine semantics.
-    "price_per_row": "Pris",                              # number (NOK)
-    "should_invoice_at_start": "Skal oppstartsfaktureres",  # checkbox
-    "should_invoice_at_end": "Skal sluttfaktureres",      # checkbox
-    "billed_status": "Fakturert",                         # multi_select
+    # Fiken billing columns (only meaningful on deliverable rows).
+    #   Pris             — current agreed full price (NOK). Mutable; the
+    #                      engine reads it live each run, so renegotiation
+    #                      between oppstart and slutt propagates correctly
+    #                      (remaining = gross − Fakturert beløp).
+    #   Rabatt           — per-row discount as percent 0–100. Applied
+    #                      before the oppstart/slutt split. Blank = 0%.
+    #   Fakturert beløp  — engine-written running total of NOK actually
+    #                      invoiced on this row. Notion is the invoice
+    #                      ledger — a Project rollup of this column is
+    #                      the displayed "Fakturert sum" on the project.
+    #   Fakturert status — single_select picking what the engine does
+    #                      with this row on the next click. See
+    #                      FAKTURERT_STATUS_* below for the option names
+    #                      and state machine.
+    "price_per_row": "Pris",                # number (NOK)
+    "discount_pct": "Rabatt",               # number (percent 0–100)
+    "billed_amount": "Fakturert beløp",     # number (NOK)
+    "billed_status": "Fakturert status",    # single_select
+    # Multi-select on the Oppgave naming the Fiken product / service
+    # category. The first selected label drives the invoice line's
+    # `description` (what shows as the product name in Fiken) AND its
+    # `incomeAccount` (3000 / 3020 etc., via FIKEN_KATEGORI_TO_ACCOUNT).
+    # Multi-select shape preserved from Goldbox's existing usage; engine
+    # picks the first label.
+    "kategori": "Oppgave kategori",         # multi_select
 }
 
 
-# The four option names that may appear in the `Fakturert` multi-select
-# on an Oppgaver row. Engine reads them to decide eligibility, writes
-# them after billing.
+# Maps the Oppgaver `Oppgave kategori` multi-select labels to Norwegian
+# chart-of-accounts codes (kontonummer). 3020 = "Salgsinntekt tjenester,
+# høy mva-sats" (services at 25% VAT — the historical default for every
+# Goldbox invoice line); 3000 = "Salgsinntekt varer, høy mva-sats" (goods
+# at 25% VAT). Both still book at 25% MVA (`HIGH`); only the income
+# account differs so the accountant can split tjeneste vs vare revenue.
+#
+# Goldbox will add more kategoris over time (e.g. "Næring -
+# Snittillustrasjon", "Bolig - Opparbeide modell") — extend this dict
+# and they immediately route to the right account on the next draft.
+# Unknown labels fall back to FIKEN_DEFAULT_INCOME_ACCOUNT and log a
+# WARN so the operator sees the gap.
+FIKEN_KATEGORI_TO_ACCOUNT: dict[str, str] = {
+    "Næring - Interiør": "3020",
+    "Print": "3000",
+}
+FIKEN_DEFAULT_INCOME_ACCOUNT = "3020"
+
+
+# The four option names that may appear in the `Fakturert status`
+# single_select on an Oppgaver row. Engine reads them to decide
+# eligibility, writes them after a successful draft creation.
 #
 # State machine:
-#   (empty)                                — never billed; both Skal-* eligible
-#   oppstart                               — 50% billed on a startup invoice; slutt eligible
-#   oppstart + slutt                       — fully billed across two invoices (50/50)
-#   slutt_full                             — fully billed on a single slutt invoice (no oppstart)
-#   kreditert                              — a credit note has voided this row; engine never re-bills
-#                                            (Phase B reads only; Phase C will write this when the
-#                                            poller sees a credit note in Fiken)
+#   Ikke fakturert (default)  — never billed; both oppstart + slutt eligible
+#   Fakturert 50%             — oppstart booked half the gross; only slutt eligible
+#   Fakturert                 — fully invoiced (either via the 50/50 path or
+#                                a single slutt run); engine never re-bills
+#   Utgår                     — operator opted this row out; engine skips
+#                                in BOTH modes. Manual-only label; engine
+#                                never writes it.
+FAKTURERT_STATUS_PROP = OPPGAVER_PROPS["billed_status"]
+FAKTURERT_STATUS_IKKE = "Ikke fakturert"
+FAKTURERT_STATUS_50 = "Fakturert 50%"
+FAKTURERT_STATUS_FULL = "Fakturert"
+FAKTURERT_STATUS_UTGAR = "Utgår"
+
+# Statuses that mean "skip this row in every mode."
+#   Fakturert → already fully billed; nothing left to invoice.
+#   Utgår     → operator excluded; respect it.
+FAKTURERT_STATUSES_SKIP = frozenset({
+    FAKTURERT_STATUS_FULL,
+    FAKTURERT_STATUS_UTGAR,
+})
+
+
+# Project-side billing mode. The single "Send faktura" button on the
+# Project reads `Faktura status` to decide whether this click is a
+# startup invoice (50% of every eligible row) or a finalizing one
+# (the remainder of every row not in `Fakturert` / `Utgår`).
 #
-# Engine NEVER writes `kreditert` — operator (or Phase C) sets it
-# manually when a draft is cancelled or credit-noted in Fiken.
-FAKTURERT_LABEL_OPPSTART = "Oppstartsfakturert"
-FAKTURERT_LABEL_SLUTT = "Sluttfakturert"
-FAKTURERT_LABEL_SLUTT_FULL = "Sluttfakturert (full)"
-FAKTURERT_LABEL_KREDITERT = "Kreditert"
+# State machine:
+#   Til oppstartsfaktura   — next click bills 50% of every eligible row;
+#                             engine flips to `Oppstart fakturert` on done.
+#   Til avslutningsfaktura — next click bills the remainder of every
+#                             eligible row; engine flips to `Fakturert` on
+#                             done.
+#   Til fakturering        — exact synonym of `Til avslutningsfaktura`.
+#                             The CEO uses this shorter wording on Notion;
+#                             both names are accepted so the team can pick
+#                             whichever reads better and the engine maps
+#                             both to the same `slutt` invoice_type.
+#   Oppstart fakturert     — terminal post-state after a successful oppstart
+#                             run. Re-clicking is a no-op until the operator
+#                             flips back to a billable state.
+#   Fakturert              — terminal post-state after a successful slutt
+#                             run. Re-clicking is a no-op.
+PROJECTS_FAKTURA_STATUS_PROP = "Faktura status"
+# Deres referanse (yourReference on the Fiken invoice). rich_text on the
+# Project. Optional — engine omits the field when blank.
+PROJECTS_FAKTURA_MERKES_PROP = "Faktura merkes"
+FAKTURA_STATUS_TIL_OPPSTART = "Til oppstartsfaktura"
+FAKTURA_STATUS_TIL_AVSLUTNING = "Til avslutningsfaktura"
+FAKTURA_STATUS_TIL_FAKTURERING = "Til fakturering"
+FAKTURA_STATUS_OPPSTART_DONE = "Oppstart fakturert"
+FAKTURA_STATUS_FULL_DONE = "Fakturert"
 
-FAKTURERT_LABELS_ALL = (
-    FAKTURERT_LABEL_OPPSTART,
-    FAKTURERT_LABEL_SLUTT,
-    FAKTURERT_LABEL_SLUTT_FULL,
-    FAKTURERT_LABEL_KREDITERT,
-)
-
-# "Any slutt-side label is present" — used by the eligibility filter to
-# decide a row has already been finally-billed (either split or single).
-FAKTURERT_LABELS_SLUTT_DONE = (
-    FAKTURERT_LABEL_SLUTT,
-    FAKTURERT_LABEL_SLUTT_FULL,
-)
-
-
-# Properties added to the Projects DB for the Fiken integration.
-# `last_draft_url` is engine-written after each successful draft creation
-# so the user can jump straight to the draft in Fiken's UI.
-#
-# Oppstart/slutt split is hardcoded — oppstart always bills 50%, slutt
-# bills the remainder (100% on its own / 50% if oppstart ran first).
-# Simpler operator UX than a per-project percentage; one click does the
-# right thing.
-PROJECTS_FIKEN_PROPS = {
-    # One URL per invoice side. Each Fiken draft is recorded under its
-    # own column so clicking "slutt" doesn't overwrite the link to the
-    # earlier "oppstart" draft. Engine writes the side that just ran;
-    # the other side stays untouched.
-    "oppstart_draft_url": "Oppstartsfaktura",  # url
-    "slutt_draft_url": "Sluttfaktura",         # url
+# Maps the project-side mode to the canonical invoice_type key the
+# engine uses internally. Both `Til avslutningsfaktura` and `Til
+# fakturering` resolve to "slutt" — same engine behavior, two operator-
+# friendly names. Add more keys here if the team adopts more synonyms.
+FAKTURA_STATUS_TO_INVOICE_TYPE = {
+    FAKTURA_STATUS_TIL_OPPSTART: "oppstart",
+    FAKTURA_STATUS_TIL_AVSLUTNING: "slutt",
+    FAKTURA_STATUS_TIL_FAKTURERING: "slutt",
 }
+
+
+# Single URL property on the Projects DB that engine-writes after each
+# successful draft creation, pointing at the draft in Fiken's UI.
+#
+# Why one URL, not two (oppstart/slutt) like we had before: the URL
+# targets a Fiken DRAFT specifically (/foretak/{slug}/fakturautkast/{uuid}).
+# Once the operator clicks Send in Fiken's UI the draft becomes a real
+# invoice with a different URL (/fakturaer/<id>) and the draft URL goes
+# 404. So the column is never a permanent "invoice link" — it's a
+# "draft pending review" link. The most recent draft is the only one
+# that matters; the slutt run just overwrites the slot. After Send,
+# the URL stops working, which IS the signal that the draft graduated.
+PROJECTS_DRAFT_URL_PROP = "Faktura utkast"
 
 
 # Names of the properties on the Korreksjoner database — individual feedback

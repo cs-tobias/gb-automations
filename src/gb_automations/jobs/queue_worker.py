@@ -490,52 +490,40 @@ async def _process_project_status_dispatch(
     )
 
 
-async def _process_fiken_invoice_create(
+async def _process_send_faktura(
     claimed: _Claimed, progress: str
 ) -> None:
-    """Run a fiken_invoice_create task: create a DRAFT invoice in Fiken
-    for a Notion Project's ticked Oppgaver.
-
-    The enqueue helper packs `f"{project_page_id}:{invoice_type}"` into
-    gmail_thread_id so the same project can have BOTH an oppstart and
-    a slutt task in flight at once (different keys). Parse it back here.
+    """Run a send_faktura task: create a DRAFT invoice in Fiken for a
+    Notion Project. The engine reads the project's `Faktura status` to
+    decide oppstart vs slutt; the task itself carries only the
+    project_page_id.
 
     Engine: `sync/sync_fiken_invoice.py::create_fiken_invoice`.
     """
-    project_page_id = claimed.project_page_id
-    raw = claimed.gmail_thread_id or ""
-    if ":" in raw:
-        _, invoice_type = raw.rsplit(":", 1)
-    else:
-        invoice_type = ""
+    project_page_id = claimed.project_page_id or claimed.gmail_thread_id
     retry_note = f" (retry {claimed.attempts}/{MAX_ATTEMPTS})" if claimed.attempts > 1 else ""
     logger.info(
-        "▶ task %s — fiken %s draft for %s%s",
+        "▶ task %s — send_faktura draft for %s%s",
         progress,
-        invoice_type or "?",
         project_page_id,
         retry_note,
     )
 
     await queue_mirror.refresh_project_dot(
-        project_page_id, progress=progress, subject=f"Fiken {invoice_type} draft"
+        project_page_id, progress=progress, subject="Send faktura draft"
     )
 
     outcome_error: str | None = None
     try:
         if not project_page_id:
-            raise ValueError("fiken_invoice_create task has no project_page_id")
-        if invoice_type not in ("oppstart", "slutt"):
-            raise ValueError(
-                f"fiken_invoice_create: unparseable gmail_thread_id {raw!r}"
-            )
-        result = await create_fiken_invoice(project_page_id, invoice_type)
+            raise ValueError("send_faktura task has no project_page_id")
+        result = await create_fiken_invoice(project_page_id)
         if result.action == "failed":
-            outcome_error = result.note or "fiken invoice creation failed"
+            outcome_error = result.note or "send_faktura: invoice creation failed"
     except Exception as err:
         log_api_error(
             logger,
-            f"fiken_invoice_create crashed for {project_page_id}",
+            f"send_faktura crashed for {project_page_id}",
             err,
         )
         outcome_error = describe_error(err)
@@ -545,10 +533,10 @@ async def _process_fiken_invoice_create(
         claimed.attempts,
         outcome_error,
         progress=progress,
-        label=f"{project_page_id}:{invoice_type}",
+        label=str(project_page_id),
     )
     await queue_mirror.refresh_project_dot(
-        project_page_id, progress=progress, subject=f"Fiken {invoice_type} draft"
+        project_page_id, progress=progress, subject="Send faktura draft"
     )
 
 
@@ -1002,8 +990,8 @@ async def _process(claimed: _Claimed, progress: str) -> None:
     if claimed.task_type == "project_status_dispatch":
         await _process_project_status_dispatch(claimed, progress)
         return
-    if claimed.task_type == "fiken_invoice_create":
-        await _process_fiken_invoice_create(claimed, progress)
+    if claimed.task_type == "send_faktura":
+        await _process_send_faktura(claimed, progress)
         return
     if claimed.task_type == "toggl_project_sync":
         await _process_toggl_project_sync(claimed, progress)

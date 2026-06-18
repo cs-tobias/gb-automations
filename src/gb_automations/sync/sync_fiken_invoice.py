@@ -1,49 +1,74 @@
-"""Notion-button → Fiken-draft creation engine (Phase B).
+"""Notion-button → Fiken-draft creation engine (Phase B, v2).
 
-Worker entrypoint for a `fiken_invoice_create` task. Drains a click of the
-per-project "Opprett oppstartsfaktura" / "Opprett sluttfaktura" Notion
-button. For an `oppstart` task:
+Worker entrypoint for a `send_faktura` task. The single per-project
+"Send faktura" Notion button enqueues one of these; the engine reads
+the project's `Faktura status` to decide the mode and acts on every
+Oppgave under the project that isn't excluded.
 
-    1. Read the live Project page (title only — oppstart split is
-       hardcoded at 50%).
-    2. List the project's Oppgaver, keep deliverable rows (`Type` ∈
-       DISCIPLINE_KEYS) where `Skal oppstartsfaktureres` is ticked and
-       `Oppstartsfakturert andel` < 1.
-    3. Resolve the Fiken customer (project title → Fiken contact `name`
-       case-insensitive). On no match, fail loudly so the operator either
-       renames the Fiken contact or hand-creates the draft.
-    4. Group eligible rows by (discipline, Pris) — same discipline at
-       different prices become two lines so the audit is honest. Quantity
-       per line = count × fraction.
-    5. Ensure a Fiken product exists for each discipline (FikenProductCache
-       holds the mapping). If the cached unit price differs from the
-       Notion-side price we PUT the update; if no product exists we
-       create one.
-    6. POST a DRAFT invoice. Drafts are NOT sent — the user reviews and
-       clicks Send in Fiken's UI.
-    7. Persist the audit trail to Postgres (FikenInvoice + one
-       FikenInvoiceLine per Oppgave billed). Stamp each Oppgave in Notion
-       with the new `Oppstartsfakturert andel` and clear the Skal-checkbox.
-       Write the draft URL onto the Project.
+Algorithm:
 
-For a `slutt` task the eligibility filter is "Skal sluttfaktureres ticked
-AND remainder > 0", where remainder = `1 - Oppstartsfakturert andel`. The
-quantity per line is `sum(remainders) × 1.0` (no further split — slutt
-bills the rest). The same audit + stamping path applies, using the slutt
-columns.
+    1. Read the live Project page. Map `Faktura status` to an
+       invoice_type:
+         - "Til oppstartsfaktura"   → "oppstart"
+         - "Til avslutningsfaktura" → "slutt"
+         - anything else            → skipped (re-clicking after the
+                                       run is finished is a no-op).
+    2. Read all Oppgaver under the project. A row is eligible iff:
+         - Type is a recognized discipline (Klargjøre modell /
+           Korreksjonsrunde / blank are skipped — internal tasks).
+         - `Fakturert status` is NOT in {"Fakturert", "Utgår"}.
+         - For oppstart: `Fakturert status == "Ikke fakturert"`.
+         - For slutt: `Fakturert status ∈ {"Ikke fakturert",
+           "Fakturert 50%"}`.
+    3. Per row, compute the NOK amount to bill on this run. `Pris` is
+       the current agreed full price and is MUTABLE — operators can
+       renegotiate between oppstart and slutt and the slutt run picks
+       up the new value. `Rabatt` is a percent (0–100) subtracted before
+       the split.
+         gross     = Pris × (1 − Rabatt / 100)
+         already   = Fakturert beløp   (the running total Notion holds)
+         remaining = gross − already
+         oppstart  → to_bill = round(gross × 0.5)     (50% of fresh gross)
+         slutt     → to_bill = round(remaining)        (whatever is left)
+       Rows with no Pris or to_bill ≤ 0 are skipped (renegotiation can
+       leave nothing to invoice — that's a clean skip, not a 0-line draft).
+    4. Resolve the Fiken customer:
+         Project → Fakturamottaker → Orgnr → /contacts match
+         (auto-creates a Fiken contact when no Orgnr match exists).
+         If Notion has no Orgnr at all (operator forgot, or the
+         Fakturamottaker isn't linked yet) the draft is linked to a
+         shared "Mangler kunde" placeholder contact (auto-created on
+         first use, cached per company_slug) — operator picks the real
+         customer in Fiken's draft UI before clicking Send. Missing
+         Orgnr is not a failure.
+    5. POST a DRAFT invoice (drafts are NOT sent — the operator reviews
+       and clicks Send in Fiken's UI). One line per Oppgave; description
+       = "{Navn} — {Beskrivelse}" (collapses to just Navn when Beskrivelse
+       is blank). `ourReference` = project name (Vår referanse).
+       `yourReference` = project `Faktura merkes` (Deres referanse).
+    6. Persist the audit trail (FikenInvoice + FikenInvoiceLine — one
+       row per Oppgave actually billed; each line carries the NOK amount
+       sent so the cumulative billed-per-row is reconstructable).
+    7. Stamp each billed Oppgave in Notion: bump `Fakturert beløp` by
+       to_bill, set `Fakturert status` to "Fakturert 50%" (oppstart)
+       or "Fakturert" (slutt). Flip the Project `Faktura status` to
+       "Oppstart fakturert" or "Fakturert". Write the draft URL onto
+       the side-specific Project column.
 
-Idempotency:
-  - Re-clicking the same button with no eligible rows logs "nothing to
-    bill" and returns without touching Fiken (no zero-line draft, no
-    Notion stamps).
-  - The button webhook's dedup index collapses double-clicks during the
-    in-flight window to one task.
+Idempotency / re-click safety:
+  - The dedup index on the `send_faktura` task type collapses concurrent
+    double-clicks during the in-flight window to one task.
+  - Once the engine flips the Project `Faktura status` past the billable
+    states, the next click is a clean skip (no Fiken POST).
+  - The audit trail is the source of truth for "what was billed when" —
+    each FikenInvoiceLine carries the NOK amount.
 
-Out of scope (v1):
+Out of scope (v2):
   - Cancelling / deleting drafts (operator does it in Fiken UI).
   - Auto-send (drafts stay drafts until user clicks Send in Fiken).
-  - Reading the draft back into Notion before send (the Fiken→Notion
-    poller in Phase C catches it once sent).
+  - Reading the draft back into Notion before send (Phase C poller).
+  - Kategori-based product mapping (client hasn't finalized the kategori
+    options yet — the discipline → product mapping stays for now).
 """
 
 from __future__ import annotations
@@ -58,35 +83,41 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from gb_automations.clients import fiken as fiken_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
-    COMPANIES_PROPS,
     DISCIPLINE_KEYS,
+    FAKTURA_STATUS_FULL_DONE,
+    FAKTURA_STATUS_OPPSTART_DONE,
+    FAKTURA_STATUS_TO_INVOICE_TYPE,
+    FAKTURERT_STATUS_50,
+    FAKTURERT_STATUS_FULL,
+    FAKTURERT_STATUS_IKKE,
+    FAKTURERT_STATUS_UTGAR,
     FAKTURAMOTTAKER_PROPS,
-    FAKTURERT_LABEL_KREDITERT,
-    FAKTURERT_LABEL_OPPSTART,
-    FAKTURERT_LABEL_SLUTT,
-    FAKTURERT_LABEL_SLUTT_FULL,
-    FAKTURERT_LABELS_SLUTT_DONE,
+    FIKEN_DEFAULT_INCOME_ACCOUNT,
+    FIKEN_KATEGORI_TO_ACCOUNT,
+    OPPGAVER_DESC_PROP,
     OPPGAVER_PROPS,
-    PROJECTS_FIKEN_PROPS,
-    PROJECTS_KUNDER_PROP,
+    PROJECTS_FAKTURA_MERKES_PROP,
+    PROJECTS_FAKTURA_STATUS_PROP,
+    PROJECTS_FAKTURAMOTTAKER_PROP,
     settings,
 )
 from gb_automations.db import SessionLocal
 from gb_automations.models import (
     FikenInvoice,
     FikenInvoiceLine,
+    FikenPlaceholderContact,
     FikenProductCache,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# Per-discipline Fiken product number stems. The engine uses these as the
-# stable Fiken-side identifier (productNumber) — distinct from the
-# numeric productId Fiken auto-assigns and which the cache stores.
-# Outside the discipline set → no product mapping (the row is then
-# emitted as a free-text line; this should not happen given the
-# eligibility filter, but it's defensive).
+# Per-discipline Fiken product number stems. Used as the stable Fiken-side
+# productNumber (distinct from the numeric productId Fiken auto-assigns
+# and which the cache stores). Free-text invoice lines don't actually link
+# to a productId today (so the customer sees the row Navn instead of a
+# generic "Interiør"), but the catalogue mirror keeps these registered so
+# the price-by-discipline analytics in Fiken stay populated.
 FIKEN_DISCIPLINE_PRODUCT_NUMBERS = {
     "interior": "goldbox-interior",
     "exterior": "goldbox-exterior",
@@ -94,9 +125,9 @@ FIKEN_DISCIPLINE_PRODUCT_NUMBERS = {
     "other": "goldbox-other",
 }
 
-# Display names used on the Fiken invoice line. Norwegian to match what
-# the customer sees on the printed invoice; the discipline keys are
-# canonical (English) for code consistency.
+# Display names used as the Fiken catalogue product name. Norwegian to
+# match what the customer sees on the printed invoice; the canonical
+# discipline keys are English for code consistency.
 FIKEN_DISCIPLINE_DISPLAY_NAMES = {
     "interior": "Interiør",
     "exterior": "Eksteriør",
@@ -106,40 +137,59 @@ FIKEN_DISCIPLINE_DISPLAY_NAMES = {
 
 # Hardcoded oppstart split. The brief locked in 50/50; making it
 # configurable added an Oppstartsandel % field on every project that
-# nobody actually wanted to think about per-click. One button = always
-# 50%. Slutt always bills the remainder (1 - whatever oppstart booked).
+# nobody actually wanted to think about per-click.
 OPPSTART_FRACTION = 0.5
 
-# Default payment terms (days from issue date) on a Fiken draft. Fiken
-# requires this field on every draft. The operator can edit it in Fiken's
-# UI before sending if a particular customer has different terms.
+# Default payment terms (days from issue date) on a Fiken draft.
+# Operator can edit it in Fiken's UI before sending.
 DEFAULT_DAYS_UNTIL_DUE_DATE = 14
 
 
 @dataclass
 class InvoiceLine:
-    """One Fiken invoice line. One per eligible Oppgave — no grouping.
+    """One Fiken invoice line — one per eligible Oppgave.
 
-    The Oppgave's `Navn` is the description so the customer sees what
-    each line is for. The discipline is kept for the audit trail and
-    to pick the right Fiken product (incomeAccount routing).
+    Two amount-shaped fields by design: `unit_price_nok_ore` is what we
+    send to Fiken's `unitPrice` (un-discounted — Fiken applies `discount`
+    on its side so the customer sees "Pris kr 5000 / Rabatt 15% / Sum
+    kr 4250" on the printed invoice). `amount_nok_ore` is what was
+    actually billed *after* Fiken applies the discount, used for the
+    audit trail and the `Fakturert beløp` stampback in Notion.
+
+    Fiken line text comes in two pieces by design:
+      - `product_name` (→ Fiken `description`): the bold first line on
+        the printed invoice. Sourced from the Oppgave's `Oppgave kategori`
+        multi_select (first label) — e.g. "Næring - Interiør", "Print".
+        Falls back to "Navn — Beskrivelse" when no Kategori is set.
+      - `comment` (→ Fiken `comment`): the smaller sub-line below the
+        product name. "Navn - Beskrivelse" (or just Navn when Beskrivelse
+        is blank), so the customer reads "what category they're paying
+        for" up top and "exactly which deliverable" right beneath.
+
+    `income_account` is derived from the Kategori too via
+    `FIKEN_KATEGORI_TO_ACCOUNT` (3020 for tjeneste, 3000 for vare, etc.).
+    Defaults to 3020 with a WARN when Kategori is missing or unknown.
     """
 
     discipline: str            # canonical key, e.g. "interior"
-    description: str           # the Oppgave's Navn — what shows on the invoice
-    quantity: float            # billable fraction for this row (e.g. 0.5)
-    unit_price_ore: int        # NOK øre (integer cents) — captured at run time
-    oppgave_page_id: str       # the single row this line came from
-    fraction: float            # alias of quantity, kept for audit clarity
+    product_name: str          # → Fiken `description` (main bold line)
+    comment: str               # → Fiken `comment` (sub-line)
+    income_account: str        # → Fiken `incomeAccount` (kontonummer)
+    unit_price_nok_ore: int    # full undiscounted price in øre → Fiken `unitPrice`
+    discount_percent: float    # 0–100 → Fiken `discount` (per-line, percent)
+    amount_nok_ore: int        # post-discount net billed on this line, in øre
+    oppgave_page_id: str
+    # Convenience: the running-total this row will land at after the
+    # stampback (caller computes already + this_run before passing on).
+    new_billed_amount_nok: float
 
 
 @dataclass
 class InvoiceCreateResult:
     project_page_id: str
-    invoice_type: str
+    invoice_type: str | None = None  # filled once Faktura status is read
     action: str = "ok"  # ok | skipped | failed
     note: str | None = None
-    # Counters surfaced in worker logs.
     eligible_rows: int = 0
     lines_created: int = 0
     fiken_invoice_id: str | None = None
@@ -155,187 +205,287 @@ class InvoiceCreateResult:
 
 def _normalize_discipline(raw: str | None) -> str | None:
     """Map a raw `Type` label (e.g. "Interiør") to a canonical key
-    ("interior"). Returns None when the label isn't a recognized
-    discipline (Klargjøre modell, Korreksjonsrunde, blank — all of which
-    the eligibility filter should already have dropped, but defensive).
+    ("interior"). Returns None for non-discipline rows.
     """
     if not raw:
         return None
     return DISCIPLINE_KEYS.get(raw.strip().lower())
 
 
-def _row_fraction_for_invoice_type(
-    row: dict[str, Any], invoice_type: str
-) -> float:
-    """Return how much of this row CAN still be billed on the next
-    invoice of `invoice_type`. Reads the row's `Fakturert` multi-select.
-
-    Oppstart eligibility (fraction > 0):
-      - row has NO Fakturert label yet (never billed).
-
-    Slutt eligibility (fraction > 0):
-      - row has no slutt-side label (Sluttfakturert or
-        Sluttfakturert (full));
-      - and no Kreditert.
-
-    A row with Kreditert is always 0 — credit-noted rows must not bill
-    again.
-
-    Fraction returned is the *cap* before the engine's OPPSTART_FRACTION
-    (0.5) gets applied — for slutt it's the remainder (0.5 if oppstart
-    ran, 1.0 if it didn't).
-    """
-    labels = notion_client.read_multi_select_names(
-        row, OPPGAVER_PROPS["billed_status"]
-    )
-    if FAKTURERT_LABEL_KREDITERT in labels:
-        return 0.0
-
-    if invoice_type == "oppstart":
-        # Already billed in any way → no oppstart room.
-        if (
-            FAKTURERT_LABEL_OPPSTART in labels
-            or FAKTURERT_LABEL_SLUTT in labels
-            or FAKTURERT_LABEL_SLUTT_FULL in labels
-        ):
-            return 0.0
-        return 1.0
-
-    if invoice_type == "slutt":
-        # Already slutt-billed (either via "Sluttfakturert" or
-        # "Sluttfakturert (full)") → no room. Otherwise: remainder is
-        # 0.5 if oppstart ran, 1.0 if it didn't.
-        if any(lbl in labels for lbl in FAKTURERT_LABELS_SLUTT_DONE):
-            return 0.0
-        if FAKTURERT_LABEL_OPPSTART in labels:
-            return 1.0 - OPPSTART_FRACTION
-        return 1.0
-
-    raise ValueError(f"invoice_type must be oppstart|slutt, got {invoice_type!r}")
-
-
 def _eligible_rows(
     rows: list[dict[str, Any]], invoice_type: str
-) -> list[tuple[dict[str, Any], float]]:
+) -> list[dict[str, Any]]:
     """Filter Notion rows to those eligible for this invoice run.
 
-    Two-pass picker semantics:
+    A row passes iff:
+      - `Type` is a recognized discipline (deliverable, not internal task).
+      - `Fakturert status` is NOT one of {Fakturert, Utgår} — those are
+        "skip, no matter what."
+      - For oppstart: `Fakturert status == "Ikke fakturert"`.
+      - For slutt:    `Fakturert status ∈ {"Ikke fakturert", "Fakturert 50%"}`.
 
-      1. PARTIAL mode — if ANY discipline row has the matching
-         `Skal …faktureres` checkbox ticked, use only the ticked
-         rows. Lets the operator stagger billing ("invoice these 3
-         now, hold the rest for next month").
-      2. BILL-ALL mode — if NO row has the checkbox ticked, fall back
-         to "bill everything that still has billing room." Lets the
-         operator click "Opprett sluttfaktura" on a wrapped-up project
-         without ticking 20 boxes first.
-
-    A row passes regardless of mode only if:
-      - Type is a recognized discipline (Klargjøre modell /
-        Korreksjonsrunde / blank are skipped).
-      - Has billing room left (`_row_fraction_for_invoice_type > 0`).
-
-    Returns list of (row, max_fraction_available). The caller decides
-    how much of `max_fraction_available` to actually bill.
+    Blank `Fakturert status` (operator never set it) is treated as
+    "Ikke fakturert" so the engine is forgiving on freshly-cloned templates.
     """
-    if invoice_type == "oppstart":
-        checkbox_key = "should_invoice_at_start"
-    elif invoice_type == "slutt":
-        checkbox_key = "should_invoice_at_end"
-    else:
-        raise ValueError(f"invoice_type must be oppstart|slutt, got {invoice_type!r}")
-    checkbox_prop = OPPGAVER_PROPS[checkbox_key]
-
-    # First pass: collect every discipline row with billing room, plus
-    # whether it's ticked. Two list comprehensions over the same pass
-    # would be redundant; we hold both and decide mode below.
-    candidates: list[tuple[dict[str, Any], float, bool]] = []
+    if invoice_type not in ("oppstart", "slutt"):
+        raise ValueError(
+            f"invoice_type must be oppstart|slutt, got {invoice_type!r}"
+        )
+    out: list[dict[str, Any]] = []
     for row in rows:
         discipline = notion_client.task_discipline(row)
-        canonical = _normalize_discipline(discipline)
-        if not canonical:
+        if not _normalize_discipline(discipline):
             continue
-        max_fraction = _row_fraction_for_invoice_type(row, invoice_type)
-        if max_fraction <= 0.0:
+        status = (
+            notion_client.read_select_name(row, OPPGAVER_PROPS["billed_status"])
+            or FAKTURERT_STATUS_IKKE
+        )
+        if status in (FAKTURERT_STATUS_FULL, FAKTURERT_STATUS_UTGAR):
             continue
-        ticked = notion_client.read_checkbox_prop(row, checkbox_prop)
-        candidates.append((row, max_fraction, ticked))
+        if invoice_type == "oppstart":
+            if status != FAKTURERT_STATUS_IKKE:
+                continue
+        else:  # slutt
+            if status not in (FAKTURERT_STATUS_IKKE, FAKTURERT_STATUS_50):
+                continue
+        out.append(row)
+    return out
 
-    any_ticked = any(ticked for _, _, ticked in candidates)
-    if any_ticked:
-        return [(row, frac) for row, frac, ticked in candidates if ticked]
-    # Bill-all fallback: no explicit picks → bill every row with room.
-    return [(row, frac) for row, frac, _ in candidates]
+
+def _row_billable_nok(
+    row: dict[str, Any], invoice_type: str
+) -> tuple[float, float, float, float] | None:
+    """Compute the per-row billing amounts.
+
+    Returns a 4-tuple
+        (to_bill_nok, new_billed_total_nok, unit_price_nok, discount_fraction)
+    or None when the row should be skipped (no Pris, or renegotiation
+    pushed remaining ≤ 0). All NOK values are decimals; the integer-øre
+    conversion happens in the caller.
+
+    Two ways to view "what's owed":
+        post-rabatt:   gross = Pris × (1 − Rabatt)
+        pre-rabatt:    unit_price = Pris (×  oppstart fraction when oppstart)
+
+    The post-rabatt number drives the run amount and the Notion ledger
+    (`Fakturert beløp`). The pre-rabatt number is the `unitPrice` we send
+    to Fiken — Fiken applies the rabatt on its side so the customer sees
+    "Pris kr X / Rabatt Y% / Sum kr Z" on the printed invoice rather
+    than just a pre-discounted unit price.
+
+    Math:
+        gross         = Pris × (1 − Rabatt)        # Rabatt is a fraction (0.15 = 15%)
+        already       = Fakturert beløp (running total Notion holds)
+        remaining     = gross − already
+        oppstart  →   to_bill    = round(gross × 0.5)        # 50% of fresh gross
+                      unit_price = round(Pris × 0.5)         # 50% of fresh full price
+        slutt     →   to_bill    = round(remaining)          # whatever is left
+                      unit_price = round(remaining / (1 − Rabatt))
+                                                              # pre-rabatt amount
+                                                              # that yields the same
+                                                              # remaining post-rabatt
+        new_total     = already + to_bill
+
+    Notes on the slutt unit_price derivation: at slutt time the row may
+    have been partially billed at oppstart, so the "this run's pre-rabatt
+    price" is whatever pre-rabatt amount Fiken would have to apply
+    Rabatt% to in order to land at our intended `remaining`. That's the
+    inverse: `unit_price = remaining / (1 − Rabatt)`. When Rabatt is 0
+    this collapses to `unit_price = remaining`, matching the no-discount
+    path.
+    """
+    price_nok = notion_client.read_number_prop(
+        row, OPPGAVER_PROPS["price_per_row"]
+    )
+    if price_nok is None or price_nok <= 0:
+        logger.warning(
+            "fiken send-faktura: row %s has no Pris set — skipping",
+            row.get("id"),
+        )
+        return None
+    # Rabatt: Notion's "Percent" number format returns the value as a
+    # fraction (0.15 for 15%), NOT as a percent integer (15). The Oppgaver
+    # `Rabatt` column is modeled as Percent so operators see the `%` suffix
+    # in Notion's UI — the engine just consumes the fraction directly. If
+    # someone later flips the column to plain Number they'll see this
+    # under-discount and have to flip it back.
+    discount_fraction = (
+        notion_client.read_number_prop(row, OPPGAVER_PROPS["discount_pct"])
+        or 0.0
+    )
+    discount_fraction = max(0.0, min(float(discount_fraction), 1.0))
+    gross = float(price_nok) * (1.0 - discount_fraction)
+
+    already = (
+        notion_client.read_number_prop(row, OPPGAVER_PROPS["billed_amount"])
+        or 0.0
+    )
+    already = max(0.0, float(already))
+
+    if invoice_type == "oppstart":
+        to_bill = round(gross * OPPSTART_FRACTION)
+        unit_price = round(float(price_nok) * OPPSTART_FRACTION)
+    else:
+        to_bill = round(gross - already)
+        # Pre-rabatt amount that yields `to_bill` post-rabatt. Rabatt=1.0
+        # is impossible here (clamped, and gross would be 0 → already
+        # caught), so the division is safe.
+        unit_price = (
+            round(to_bill / (1.0 - discount_fraction))
+            if discount_fraction < 1.0
+            else to_bill
+        )
+    if to_bill <= 0:
+        logger.info(
+            "fiken send-faktura: row %s has nothing left to bill "
+            "(gross=%.2f, already=%.2f, to_bill=%.2f) — skipping",
+            row.get("id"),
+            gross,
+            already,
+            to_bill,
+        )
+        return None
+    return (
+        float(to_bill),
+        already + float(to_bill),
+        float(unit_price),
+        discount_fraction,
+    )
+
+
+def _resolve_kategori_and_account(row: dict[str, Any]) -> tuple[str | None, str]:
+    """Read `Oppgave kategori` (multi_select) and resolve to
+    (kategori_label, income_account).
+
+    Multi-select: a row CAN carry multiple kategoris, but a Fiken line
+    has one description + one income account. The engine picks the FIRST
+    selected label (Notion preserves the operator's selection order).
+    Unknown / unmapped labels and missing kategori both fall back to
+    `FIKEN_DEFAULT_INCOME_ACCOUNT` (3020) with a WARN log so the gap is
+    visible.
+
+    Returns (None, default_account) when no Kategori is set — caller
+    then composes the line description from Navn/Beskrivelse instead.
+    """
+    labels = notion_client.read_multi_select_names(
+        row, OPPGAVER_PROPS["kategori"]
+    )
+    if not labels:
+        return None, FIKEN_DEFAULT_INCOME_ACCOUNT
+    first = labels[0]
+    account = FIKEN_KATEGORI_TO_ACCOUNT.get(first)
+    if account is None:
+        logger.warning(
+            "fiken send-faktura: row %s has Oppgave kategori %r which is "
+            "not in FIKEN_KATEGORI_TO_ACCOUNT — defaulting to account %s "
+            "(add the kategori to the map in config.py to route it explicitly)",
+            row.get("id"),
+            first,
+            FIKEN_DEFAULT_INCOME_ACCOUNT,
+        )
+        account = FIKEN_DEFAULT_INCOME_ACCOUNT
+    return first, account
+
+
+def _line_product_name(row: dict[str, Any], kategori: str | None) -> str:
+    """Compose the bold first-line product name shown on the Fiken invoice.
+
+    Returns the Kategori label when present (e.g. "Næring - Interiør").
+    When Kategori is missing, falls back to the legacy shape so existing
+    rows without a Kategori still produce a readable line:
+        Navn — Beskrivelse   (both set)
+        Navn                  (Beskrivelse blank)
+        Beskrivelse           (Navn blank; unlikely in practice)
+        discipline display    (all blank)
+    """
+    if kategori:
+        return kategori
+    title = (notion_client.extract_page_title(row) or "").strip()
+    description = (
+        notion_client.read_rich_text_prop(row, OPPGAVER_DESC_PROP) or ""
+    ).strip()
+    if title and description:
+        return f"{title} — {description}"
+    if title:
+        return title
+    if description:
+        return description
+    canonical = _normalize_discipline(notion_client.task_discipline(row))
+    if canonical:
+        return FIKEN_DISCIPLINE_DISPLAY_NAMES.get(canonical, canonical.title())
+    return ""
+
+
+def _line_comment(row: dict[str, Any]) -> str:
+    """Compose the smaller `comment` sub-line shown below the product name.
+
+    Format: "Navn - Beskrivelse" when both are present, just Navn when
+    Beskrivelse is blank, just Beskrivelse when Navn is blank. Empty
+    string when both blank — the line has no sub-text and Fiken renders
+    just the product name.
+    """
+    title = (notion_client.extract_page_title(row) or "").strip()
+    description = (
+        notion_client.read_rich_text_prop(row, OPPGAVER_DESC_PROP) or ""
+    ).strip()
+    if title and description:
+        return f"{title} - {description}"
+    if title:
+        return title
+    if description:
+        return description
+    return ""
 
 
 def _build_line_items(
-    eligible: list[tuple[dict[str, Any], float]],
-    *,
-    invoice_type: str,
+    eligible: list[dict[str, Any]], *, invoice_type: str
 ) -> list[InvoiceLine]:
-    """Compose Fiken invoice lines from the eligible rows — ONE line
-    per Oppgave (no grouping). Each line's description is the Oppgave's
-    Navn so the customer sees what each charge is for on the invoice.
+    """Compose Fiken invoice lines from eligible rows — ONE line per
+    Oppgave. Per-line amount is the NOK already computed by
+    `_row_billable_nok`. Free-text lines (no productId) so the customer
+    sees the Oppgave's Navn (or Navn — Beskrivelse) rather than a
+    generic discipline name.
 
-    Rules:
-      - Quantity per line:
-          oppstart → min(max_fraction, OPPSTART_FRACTION) — 0.5 for a
-                     fresh row, capped by what's left to bill.
-          slutt    → max_fraction — the full remainder (0.5 if oppstart
-                     already happened, 1.0 if not).
-      - Unit price snapped to NOK øre (integer cents). Round half away
-        from zero to avoid systematic under-billing on .5-øre tails.
-
-    Rows without a `Pris` set produce a WARN and are skipped — the audit
-    must be honest about why a row was dropped, not silently default to 0.
-
-    Stable order: by Oppgave page id (preserves the order Notion
-    returned them in, which preserves the team's hand-ordering).
+    Skips rows missing a Pris or whose remaining is ≤ 0 (renegotiation
+    leftover). Stable order: preserves the order Notion returned them.
     """
-    fraction_cap = (
-        OPPSTART_FRACTION if invoice_type == "oppstart" else 1.0
-    )
-
     lines: list[InvoiceLine] = []
-    for row, max_fraction in eligible:
-        discipline_raw = notion_client.task_discipline(row)
-        canonical = _normalize_discipline(discipline_raw)
+    for row in eligible:
+        canonical = _normalize_discipline(notion_client.task_discipline(row))
         if not canonical:
-            continue  # eligibility filter should have caught this
-        price_nok = notion_client.read_number_prop(
-            row, OPPGAVER_PROPS["price_per_row"]
-        )
-        if price_nok is None or price_nok <= 0:
-            logger.warning(
-                "fiken_invoice_create: row %s has no Pris set — skipping",
-                row.get("id"),
-            )
             continue
-        unit_price_ore = int(round(price_nok * 100))
-        billable_fraction = min(max_fraction, fraction_cap)
-        if billable_fraction <= 0.0:
+        amounts = _row_billable_nok(row, invoice_type)
+        if amounts is None:
             continue
-        description = (
-            (notion_client.extract_page_title(row) or "").strip()
-            or FIKEN_DISCIPLINE_DISPLAY_NAMES.get(canonical, canonical.title())
-        )
+        to_bill_nok, new_total_nok, unit_price_nok, discount_fraction = amounts
+        amount_ore = int(round(to_bill_nok * 100))
+        unit_price_ore = int(round(unit_price_nok * 100))
+        if amount_ore <= 0:
+            continue
+        kategori, income_account = _resolve_kategori_and_account(row)
+        product_name = _line_product_name(
+            row, kategori
+        ) or FIKEN_DISCIPLINE_DISPLAY_NAMES.get(canonical, canonical.title())
+        comment = _line_comment(row)
         lines.append(
             InvoiceLine(
                 discipline=canonical,
-                description=description,
-                quantity=billable_fraction,
-                unit_price_ore=unit_price_ore,
+                product_name=product_name,
+                comment=comment,
+                income_account=income_account,
+                unit_price_nok_ore=unit_price_ore,
+                discount_percent=round(discount_fraction * 100.0, 4),
+                amount_nok_ore=amount_ore,
                 oppgave_page_id=row.get("id", ""),
-                fraction=billable_fraction,
+                new_billed_amount_nok=new_total_nok,
             )
         )
     return lines
 
 
 def _normalize_orgnr(raw: str | None) -> str:
-    """Strip every non-digit so '123 456 789' and '123-456-789' compare
-    equal to '123456789'. Returns "" if the input is empty/None or
-    contains no digits.
+    """Strip every non-digit so '123 456 789' compares equal to '123456789'.
+    Returns "" if input is empty or contains no digits.
     """
     if not raw:
         return ""
@@ -343,67 +493,62 @@ def _normalize_orgnr(raw: str | None) -> str:
 
 
 # ============================================================
-# Notion-side: walk Project → Kunder → Fakturamottaker → Orgnr
+# Notion-side: read Fakturamottaker → Orgnr off the project (one hop)
 # ============================================================
 
 
 async def _resolve_project_orgnr(
     project_page: dict[str, Any],
 ) -> tuple[str | None, str | None]:
-    """Walk Project → Kunder → Fakturamottaker → Orgnr.
+    """Read the project's direct `Fakturamottaker` relation → Orgnr.
 
-    Returns `(orgnr_digits_only, kunder_title)`. `kunder_title` is the
-    Notion Kunder row's title (the customer's display name) — used by
-    the engine to auto-create a Fiken contact when no matching customer
-    exists yet. Either tuple slot can be None if the corresponding
-    Notion read failed; the engine handles each independently.
+    Returns (orgnr_digits_only, fakturamottaker_title). The title is the
+    Notion Fakturamottaker row's name (the billing entity) — used by the
+    engine to auto-create a Fiken contact when no matching customer
+    exists yet. That name is what the customer will see on the invoice,
+    so it should be the billing entity, not a parent Kunder.
+
+    The earlier two-hop walk (Project → Kunder → Fakturamottaker) is gone:
+    operators now set Fakturamottaker directly on each Project so the
+    billing recipient can differ from the parent Kunder (e.g. a property-
+    management company billing a per-building sub-LLC). Kunder may still
+    exist on the Projects DB for contact / view purposes; the engine no
+    longer reads it.
     """
-    kunder_ids = notion_client.read_relation_ids(project_page, PROJECTS_KUNDER_PROP)
-    if not kunder_ids:
+    fakt_ids = notion_client.read_relation_ids(
+        project_page, PROJECTS_FAKTURAMOTTAKER_PROP
+    )
+    if not fakt_ids:
         return None, None
 
-    # A project SHOULD link to one Kunder; if more, walk the first that
-    # yields an org number. Forgiving read; Notion's UI doesn't enforce
-    # cardinality either.
-    first_kunder_name: str | None = None
-    for kunder_id in kunder_ids:
+    first_fakt_name: str | None = None
+    for fakt_id in fakt_ids:
         try:
-            kunder_page = await notion_client.get_page(kunder_id)
+            fakt_page = await notion_client.get_page(fakt_id)
         except Exception as err:  # noqa: BLE001
             logger.info(
-                "fiken: skipping Kunder %s (read failed: %s)", kunder_id, err
+                "fiken: skipping Fakturamottaker %s (read failed: %s)",
+                fakt_id,
+                err,
             )
             continue
-        kunder_name = (
-            notion_client.extract_page_title(kunder_page) or ""
+        fakt_name = (
+            notion_client.extract_page_title(fakt_page) or ""
         ).strip() or None
-        if first_kunder_name is None:
-            first_kunder_name = kunder_name
+        if first_fakt_name is None:
+            first_fakt_name = fakt_name
 
-        fakt_ids = notion_client.read_relation_ids(
-            kunder_page, COMPANIES_PROPS["fakturamottaker"]
+        raw = notion_client.read_rich_text_prop(
+            fakt_page, FAKTURAMOTTAKER_PROPS["orgnr"]
         )
-        for fakt_id in fakt_ids:
-            try:
-                fakt_page = await notion_client.get_page(fakt_id)
-            except Exception as err:  # noqa: BLE001
-                logger.info(
-                    "fiken: skipping Fakturamottaker %s (read failed: %s)",
-                    fakt_id,
-                    err,
-                )
-                continue
-            raw = notion_client.read_rich_text_prop(
-                fakt_page, FAKTURAMOTTAKER_PROPS["orgnr"]
-            )
-            normalized = _normalize_orgnr(raw)
-            if normalized:
-                return normalized, kunder_name or first_kunder_name
-    return None, first_kunder_name
+        normalized = _normalize_orgnr(raw)
+        if normalized:
+            return normalized, fakt_name
+    return None, first_fakt_name
 
 
 # ============================================================
-# Product cache + customer resolution (Fiken-side IO)
+# Product cache (Fiken-side IO)
 # ============================================================
 
 
@@ -412,18 +557,14 @@ async def _ensure_fiken_product(
     discipline: str,
     unit_price_ore: int,
 ) -> dict[str, Any] | None:
-    """Ensure a Fiken product exists for this discipline at the given
-    unit price. Returns the product dict (carries `productId`) or None
-    when discipline is outside the catalog.
+    """Adopt or create the Fiken product for this discipline. Mirrors the
+    pre-v2 implementation — the per-line `productId` link still isn't
+    sent on free-text lines (so the customer sees the row description,
+    not the generic discipline name), but keeping the catalogue mirror
+    in step lets Fiken's per-product reports stay correct.
 
-    Adoption-by-productNumber: if a product with our productNumber
-    exists in Fiken (set up by hand or from a prior run before the
-    cache was populated), we adopt it instead of duplicating.
-
-    Price drift: when the cached price differs from the new one, PUT
-    the update so Fiken's catalogue reflects current pricing. The
-    invoice line ALSO carries unitAmount, so even if the PUT fails
-    the draft still has the right price.
+    Returns the product dict (carries `productId`) or None when discipline
+    is outside the catalogue.
     """
     product_number = FIKEN_DISCIPLINE_PRODUCT_NUMBERS.get(discipline)
     if not product_number:
@@ -437,7 +578,6 @@ async def _ensure_fiken_product(
         )
 
     if cached is None:
-        # First sighting — adopt-or-create.
         existing = await fiken_client.list_products(company_slug)
         adopted = next(
             (p for p in existing if (p.get("productNumber") or "") == product_number),
@@ -480,7 +620,6 @@ async def _ensure_fiken_product(
             await session.commit()
         return adopted
 
-    # Cached — check for price drift.
     if cached.last_unit_price_ore != unit_price_ore:
         try:
             await fiken_client.update_product(
@@ -490,9 +629,6 @@ async def _ensure_fiken_product(
                 unit_price=unit_price,
             )
         except fiken_client.FikenAPIError as err:
-            # Don't block the invoice — the line carries unitAmount so
-            # the draft is still correct. Log loudly so the operator
-            # fixes the catalogue drift out of band.
             logger.warning(
                 "fiken: failed to PUT product %s price update: %s",
                 cached.fiken_product_id,
@@ -522,60 +658,157 @@ async def _ensure_fiken_product(
 
 
 # ============================================================
+# Placeholder customer ("Mangler kunde") — one per Fiken company
+# ============================================================
+
+
+async def _ensure_placeholder_contact(company_slug: str) -> int | None:
+    """Return the cached placeholder-contact id for `company_slug`, creating
+    the Fiken contact on first call.
+
+    Used when the project has no Orgnr to resolve a real customer with —
+    we link the draft to a single shared "Mangler kunde" contact so the
+    operator can pick or create the real customer in Fiken's UI before
+    clicking Send. One placeholder per company_slug, cached in
+    `fiken_placeholder_contacts`.
+
+    Returns the integer contactId or None on Fiken errors. The caller is
+    expected to treat None as "fail the task" — a placeholder we can't
+    create or read is the only way this path still hard-fails.
+    """
+    placeholder_name = settings.fiken_placeholder_contact_name
+
+    async with SessionLocal() as session:
+        cached = await session.get(FikenPlaceholderContact, company_slug)
+
+    if cached is not None:
+        try:
+            return int(cached.fiken_contact_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "fiken: cached placeholder contactId %r is not an int — "
+                "re-creating",
+                cached.fiken_contact_id,
+            )
+
+    # Cache miss (or unparseable cached id). Create the Fiken contact
+    # with no Orgnr. customer=True so it shows up in list_contacts and
+    # can be selected from Fiken's draft UI.
+    try:
+        created = await fiken_client.create_contact(
+            company_slug,
+            name=placeholder_name,
+            organization_number=None,
+            customer=True,
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.exception(
+            "fiken: failed to create placeholder contact %r for slug=%s",
+            placeholder_name,
+            company_slug,
+        )
+        return None
+
+    raw_id = created.get("contactId") or created.get("id")
+    try:
+        new_id = int(raw_id) if raw_id is not None else None
+    except (TypeError, ValueError):
+        new_id = None
+    if new_id is None:
+        logger.warning(
+            "fiken: created placeholder contact carries no contactId/id "
+            "(%s) — Fiken's response shape changed?",
+            created,
+        )
+        return None
+
+    async with SessionLocal() as session:
+        await session.execute(
+            pg_insert(FikenPlaceholderContact)
+            .values(
+                company_slug=company_slug,
+                fiken_contact_id=str(new_id),
+                name_when_created=placeholder_name,
+            )
+            .on_conflict_do_update(
+                index_elements=["company_slug"],
+                set_={
+                    "fiken_contact_id": str(new_id),
+                    "name_when_created": placeholder_name,
+                },
+            )
+        )
+        await session.commit()
+    return new_id
+
+
+# ============================================================
 # Top-level engine entrypoint
 # ============================================================
 
 
-async def create_fiken_invoice(
-    project_page_id: str, invoice_type: str
-) -> InvoiceCreateResult:
-    """Worker entrypoint for a `fiken_invoice_create` task.
+async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
+    """Worker entrypoint for a `send_faktura` task.
 
-    See the module docstring for the full algorithm. Returns a dataclass
-    the worker handler reads to decide `done` vs. `failed`.
-
-    Any exception that surfaces means "retry with backoff"; an `action`
-    of "failed" without an exception means "terminal misconfig — don't
-    retry into the same brick wall" (e.g. Fiken rejected the draft —
-    the operator must fix something before the retry helps).
-
-    Observability: each run logs a one-line summary to docker logs
-    (look for the ✅/↻ prefix). The Project's `Siste fiken-utkast` URL
-    property is also written on success.
+    Returns a dataclass the worker handler reads to decide done vs.
+    failed. Any exception means "retry with backoff"; an `action` of
+    "failed" without an exception means "terminal misconfig — don't
+    retry into the same brick wall" (e.g. no Orgnr in Notion — operator
+    must fix before retry helps).
     """
-    result = InvoiceCreateResult(
-        project_page_id=project_page_id, invoice_type=invoice_type
-    )
-    if invoice_type not in ("oppstart", "slutt"):
-        result.action = "failed"
-        result.note = f"unknown invoice_type {invoice_type!r}"
-        return result
+    result = InvoiceCreateResult(project_page_id=project_page_id)
+
     if not settings.fiken_company_slug:
         result.action = "failed"
         result.note = "FIKEN_COMPANY_SLUG is not configured"
         return result
     company_slug = settings.fiken_company_slug
 
-    # 1. Read live project page.
+    # 1. Read live project page + map Faktura status → invoice_type.
     try:
         project_page = await notion_client.get_page(project_page_id)
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "fiken_invoice_create: failed to GET project %s", project_page_id
+            "send_faktura: failed to GET project %s", project_page_id
         )
         result.action = "failed"
         result.note = f"Notion get_page (project): {err}"
         return result
 
     project_title = (notion_client.extract_page_title(project_page) or "").strip()
+    faktura_status = notion_client.read_select_name(
+        project_page, PROJECTS_FAKTURA_STATUS_PROP
+    )
+    invoice_type = FAKTURA_STATUS_TO_INVOICE_TYPE.get(faktura_status or "")
+    if not invoice_type:
+        logger.info(
+            "send_faktura: project %r has Faktura status %r — not a "
+            "billable state, skipping",
+            project_title or project_page_id,
+            faktura_status,
+        )
+        result.action = "skipped"
+        result.note = (
+            f"Faktura status {faktura_status!r} is not a billable state "
+            "(expected 'Til oppstartsfaktura' or 'Til avslutningsfaktura')"
+        )
+        return result
+    result.invoice_type = invoice_type
 
-    # 2. Read all Oppgaver under this project.
+    # Deres referanse, optional.
+    your_reference = (
+        notion_client.read_rich_text_prop(
+            project_page, PROJECTS_FAKTURA_MERKES_PROP
+        )
+        or ""
+    ).strip() or None
+
+    # 2. Read all Oppgaver under this project + filter.
     try:
         rows = await notion_client.oppgaver_for_project(project_page_id)
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "fiken_invoice_create: failed to list oppgaver for %s",
-            project_page_id,
+            "send_faktura: failed to list oppgaver for %s", project_page_id
         )
         result.action = "failed"
         result.note = f"Notion oppgaver_for_project: {err}"
@@ -585,7 +818,7 @@ async def create_fiken_invoice(
     result.eligible_rows = len(eligible)
     if not eligible:
         logger.info(
-            "fiken_invoice_create: no eligible Oppgaver for %s (%s) — nothing to bill",
+            "send_faktura: no eligible Oppgaver for %s (%s) — nothing to bill",
             invoice_type,
             project_title or project_page_id,
         )
@@ -596,145 +829,181 @@ async def create_fiken_invoice(
     # 3. Build invoice lines (pure math, no I/O).
     lines = _build_line_items(eligible, invoice_type=invoice_type)
     if not lines:
-        # Every eligible row was missing a Pris (logged WARN per row).
         result.action = "skipped"
         result.note = "no priced rows"
         return result
     result.lines_created = len(lines)
 
-    # 4. Customer resolution. Fiken's API requires a numeric customerId
-    # on every draft (the "type the org number, Fiken auto-fills" thing
-    # is UI-only). So:
-    #   1. Read Orgnr + Kunder name from Notion (Project → Kunder →
-    #      Fakturamottaker → Orgnr).
-    #   2. GET /contacts and find the one with matching organizationNumber.
-    #   3. If no match: auto-create a Fiken contact using the Kunder
-    #      row's name + the Orgnr. Operator can fill address/email in
-    #      Fiken later. This makes the engine self-healing — first
-    #      invoice for a new customer Just Works.
-    #   4. If no Orgnr in Notion at all: hard fail. We can't post a
-    #      draft without a customer, and we have no way to identify one.
-    orgnr, kunder_name = await _resolve_project_orgnr(project_page)
+    # 4. Customer resolution. Project → Fakturamottaker → Orgnr.
+    #
+    # Missing Orgnr (no Fakturamottaker linked, or linked but Orgnr blank)
+    # used to hard-fail the task — Notion turned the project's sync dot red
+    # after 5 retries and the operator had no way to see why from Notion
+    # alone. New behavior: skip the contact lookup entirely, post the draft
+    # to Fiken WITHOUT a customerId, and let the operator pick or create
+    # one in Fiken's UI before clicking Send. The draft is the review
+    # artefact anyway; a missing customer is something Fiken's UI is built
+    # to handle.
+    orgnr, fakturamottaker_name = await _resolve_project_orgnr(project_page)
+
     customer_id: int | None = None
-    customer_label = orgnr or "<no orgnr>"
-    if not orgnr:
-        logger.warning(
-            "fiken_invoice_create: project %r has no Orgnr in its "
-            "Kunder → Fakturamottaker chain — link a Fakturamottaker "
-            "with an Orgnr before retrying",
-            project_title,
-        )
-        result.action = "failed"
-        result.note = "no Orgnr in Notion (Project → Kunder → Fakturamottaker)"
-        return result
+    customer_label = "<no customer linked>"
 
-    try:
-        contacts = await fiken_client.list_contacts(
-            company_slug, customer=True
-        )
-    except Exception as err:  # noqa: BLE001
-        logger.exception(
-            "fiken_invoice_create: list_contacts failed for slug=%s",
-            company_slug,
-        )
-        result.action = "failed"
-        result.note = f"Fiken list_contacts: {err}"
-        return result
+    if orgnr:
+        try:
+            contacts = await fiken_client.list_contacts(
+                company_slug, customer=True
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.exception(
+                "send_faktura: list_contacts failed for slug=%s", company_slug
+            )
+            result.action = "failed"
+            result.note = f"Fiken list_contacts: {err}"
+            return result
 
-    target = orgnr  # already digits-only from _resolve_project_orgnr
-    for contact in contacts:
-        candidate = _normalize_orgnr(contact.get("organizationNumber"))
-        if candidate and candidate == target:
-            raw_id = contact.get("contactId") or contact.get("id")
+        target = orgnr  # already digits-only
+        for contact in contacts:
+            candidate = _normalize_orgnr(contact.get("organizationNumber"))
+            if candidate and candidate == target:
+                raw_id = contact.get("contactId") or contact.get("id")
+                try:
+                    customer_id = int(raw_id) if raw_id is not None else None
+                except (TypeError, ValueError):
+                    customer_id = None
+                customer_label = contact.get("name") or orgnr
+                break
+
+        # Auto-create on miss — only when we HAVE an Orgnr to attach.
+        # An auto-created contact with no Orgnr would clutter Fiken and
+        # risk duplicates next time the same customer's Fakturamottaker
+        # gets an Orgnr filled in.
+        if customer_id is None:
+            new_name = (
+                fakturamottaker_name or project_title or f"Kunde {orgnr}"
+            ).strip()
+            logger.info(
+                "send_faktura: orgnr %s not in Fiken customers — "
+                "auto-creating Fiken contact %r",
+                orgnr,
+                new_name,
+            )
+            try:
+                created = await fiken_client.create_contact(
+                    company_slug,
+                    name=new_name,
+                    organization_number=orgnr,
+                    customer=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.exception(
+                    "send_faktura: failed to auto-create Fiken contact "
+                    "(orgnr=%s, name=%r)",
+                    orgnr,
+                    new_name,
+                )
+                result.action = "failed"
+                result.note = f"Fiken create_contact: {err}"
+                return result
+            raw_id = created.get("contactId") or created.get("id")
             try:
                 customer_id = int(raw_id) if raw_id is not None else None
             except (TypeError, ValueError):
                 customer_id = None
-            customer_label = contact.get("name") or orgnr
-            break
-
-    if customer_id is None:
-        # No matching customer in Fiken — auto-create one from the
-        # Notion Kunder row.
-        new_name = (kunder_name or project_title or f"Kunde {orgnr}").strip()
-        logger.info(
-            "fiken_invoice_create: orgnr %s not in Fiken customers — "
-            "auto-creating Fiken contact %r",
-            orgnr,
-            new_name,
+            customer_label = f"{new_name} (auto-created)"
+            if customer_id is None:
+                logger.warning(
+                    "send_faktura: auto-created contact carries no "
+                    "contactId/id (%s) — Fiken's response shape changed?",
+                    created,
+                )
+                result.action = "failed"
+                result.note = "auto-created Fiken contact has no contactId"
+                return result
+    else:
+        # No Orgnr on Notion side. Link the draft to a shared "Mangler
+        # kunde" placeholder contact (auto-created on first use, cached
+        # per company_slug). Fiken's API rejects drafts with no
+        # customerId, so linking to a placeholder is the only path that
+        # keeps the draft creatable. The operator picks or creates the
+        # real customer in Fiken's draft UI before clicking Send. The
+        # Fakturamottaker name (if any) goes in the log so the operator
+        # knows which Notion row needs an Orgnr later.
+        placeholder_id = await _ensure_placeholder_contact(company_slug)
+        if placeholder_id is None:
+            result.action = "failed"
+            result.note = (
+                "could not create or read the placeholder Fiken contact "
+                f"({settings.fiken_placeholder_contact_name!r})"
+            )
+            return result
+        customer_id = placeholder_id
+        customer_label = (
+            f"{settings.fiken_placeholder_contact_name} (placeholder)"
         )
-        try:
-            created = await fiken_client.create_contact(
-                company_slug,
-                name=new_name,
-                organization_number=orgnr,
-                customer=True,
-            )
-        except Exception as err:  # noqa: BLE001
-            logger.exception(
-                "fiken_invoice_create: failed to auto-create Fiken contact "
-                "(orgnr=%s, name=%r)",
-                orgnr,
-                new_name,
-            )
-            result.action = "failed"
-            result.note = f"Fiken create_contact: {err}"
-            return result
-        raw_id = created.get("contactId") or created.get("id")
-        try:
-            customer_id = int(raw_id) if raw_id is not None else None
-        except (TypeError, ValueError):
-            customer_id = None
-        customer_label = f"{new_name} (auto-created)"
-        if customer_id is None:
-            logger.warning(
-                "fiken_invoice_create: auto-created contact carries no "
-                "contactId/id (%s) — Fiken's response shape changed?",
-                created,
-            )
-            result.action = "failed"
-            result.note = "auto-created Fiken contact has no contactId"
-            return result
+        logger.info(
+            "send_faktura: project %r has no Orgnr (Fakturamottaker=%r) — "
+            "linking draft to placeholder contact %r (id=%s); pick the real "
+            "customer in Fiken before sending",
+            project_title,
+            fakturamottaker_name,
+            settings.fiken_placeholder_contact_name,
+            placeholder_id,
+        )
 
     result.customer_match = customer_label
 
-    # 5. Build line payloads — free-text lines, no productId.
+    # 5. Build line payloads. Free-text lines (no productId) so we control
+    # the printed text entirely.
     #
-    # Why no productId: when a line carries productId, Fiken's UI
-    # displays the PRODUCT name (e.g. "Interiør") instead of the line
-    # description (the Oppgave's Navn we want to show). Free-text lines
-    # render the description as-is. We carry the discipline through the
-    # incomeAccount field on the line directly, so the booking still
-    # routes to the right ledger account.
+    # Field map:
+    #  - `description` (bold first line)   ← line.product_name
+    #     Kategori label (e.g. "Næring - Interiør"), or a fallback
+    #     composed from Navn / Beskrivelse when the row has no Kategori.
+    #  - `comment` (smaller sub-line)      ← line.comment
+    #     "Navn - Beskrivelse" so the customer sees the category up top
+    #     and the specific deliverable underneath.
+    #  - `incomeAccount` (kontonummer)     ← line.income_account
+    #     Derived from Kategori via FIKEN_KATEGORI_TO_ACCOUNT (3020 for
+    #     tjeneste, 3000 for vare, etc.). Defaults to 3020.
     #
-    # Field names sent on each line:
-    #   - description   per-Oppgave Navn from Notion
-    #   - quantity      decimal (Fiken accepts floats)
-    #   - unitPrice     INTEGER ØRE for free-text lines. Yes — the field
-    #                   is called "unitPrice" in BOTH directions but its
-    #                   scale differs by line type: lines linked to a
-    #                   productId use unitPrice=kroner (because the
-    #                   product carries its own scale), free-text lines
-    #                   use unitPrice=øre. Empirically observed: sending
-    #                   13500 on a free-text line displayed as 135,00 NOK
-    #                   in Fiken's UI (i.e. Fiken treated 13500 as øre).
-    #                   So we send the unit_price_ore we've been carrying
-    #                   internally, no conversion.
-    #   - vatType       "HIGH" for 25% MVA
-    #   - incomeAccount "3020" (services) — routes the booking
+    # Two scale notes:
+    #  - `unitPrice` on free-text lines is in ØRE (integer cents),
+    #    empirically verified — we send the un-discounted price here so
+    #    the printed invoice shows "Pris kr X / Rabatt Y% / Sum kr Z"
+    #    rather than just a pre-discounted unit price.
+    #  - `discount` on lines is PERCENT (0–100, decimals allowed). Fiken
+    #    applies it to the line's `unitPrice × quantity` to compute net.
+    #    Omitted when 0 — keeps the printed line cleaner.
     line_payloads: list[dict[str, Any]] = []
     for line in lines:
         payload: dict[str, Any] = {
-            "description": line.description,
-            "quantity": round(line.quantity, 4),
-            "unitPrice": line.unit_price_ore,
+            "description": line.product_name,
+            "quantity": 1,
+            "unitPrice": line.unit_price_nok_ore,
             "vatType": fiken_client.VAT_TYPE_25_PCT,
-            "incomeAccount": fiken_client.INCOME_ACCOUNT_SERVICES_VAT,
+            "incomeAccount": line.income_account,
         }
+        if line.comment:
+            payload["comment"] = line.comment
+        if line.discount_percent > 0:
+            payload["discount"] = line.discount_percent
         line_payloads.append(payload)
 
     # 6. POST the draft.
     issue_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    # Draft-level "Kommentar" (Fiken UI) → `invoiceText` field. Picked
+    # per invoice_type so oppstart and slutt show a different default
+    # note on the printed invoice. Both texts are editable via env vars
+    # (settings.fiken_invoice_text_{oppstart,slutt}); empty string in
+    # either → engine omits the field and Fiken falls back to the
+    # company-level default ("endre standard" in the UI).
+    invoice_text = (
+        settings.fiken_invoice_text_oppstart
+        if invoice_type == "oppstart"
+        else settings.fiken_invoice_text_slutt
+    ).strip() or None
+
     try:
         draft = await fiken_client.create_invoice_draft(
             company_slug,
@@ -743,10 +1012,12 @@ async def create_fiken_invoice(
             days_until_due_date=DEFAULT_DAYS_UNTIL_DUE_DATE,
             reference=project_title or project_page_id,
             lines=line_payloads,
+            your_reference=your_reference,
+            invoice_text=invoice_text,
         )
     except Exception as err:  # noqa: BLE001
         logger.exception(
-            "fiken_invoice_create: draft POST failed for %s", project_page_id
+            "send_faktura: draft POST failed for %s", project_page_id
         )
         result.action = "failed"
         result.note = f"Fiken create_invoice_draft: {err}"
@@ -758,18 +1029,15 @@ async def create_fiken_invoice(
     )
     if not draft_id:
         logger.warning(
-            "fiken_invoice_create: Fiken accepted the draft but the response "
+            "send_faktura: Fiken accepted the draft but the response "
             "carries no draftId/id: %s",
             draft,
         )
     result.fiken_invoice_id = draft_id or None
 
-    # Build the URL Fiken's web UI uses. The POST response only carries
-    # the numeric draftId, but the UI's draft page is keyed on `uuid`
-    # (`/foretak/{slug}/fakturautkast/{uuid}`). Fetch the draft once to
-    # read its uuid. Best-effort: if the GET fails, fall back to the
-    # numeric-id URL (which 404s in the UI but at least preserves the id
-    # in the Notion field for debugging).
+    # The POST response carries only the numeric draftId, but Fiken's UI
+    # paths the draft on its `uuid`. Fetch once to read the uuid; degrade
+    # to None on failure (the audit trail still preserves the draft_id).
     draft_url: str | None = None
     if draft_id:
         try:
@@ -783,7 +1051,7 @@ async def create_fiken_invoice(
                 )
         except Exception as err:  # noqa: BLE001
             logger.warning(
-                "fiken_invoice_create: GET draft %s for uuid failed: %s",
+                "send_faktura: GET draft %s for uuid failed: %s",
                 draft_id,
                 err,
             )
@@ -823,8 +1091,8 @@ async def create_fiken_invoice(
                         fiken_invoice_id=draft_id,
                         oppgave_page_id=line.oppgave_page_id,
                         discipline=line.discipline,
-                        fraction=line.fraction,
-                        unit_price_ore=line.unit_price_ore,
+                        billed_amount_ore=line.amount_nok_ore,
+                        unit_price_ore=line.amount_nok_ore,
                     )
                     .on_conflict_do_nothing(
                         index_elements=[
@@ -836,66 +1104,60 @@ async def create_fiken_invoice(
                 )
             await session.commit()
 
-    # 8. Stamp each billed Oppgave in Notion + write draft URL on Project.
-    # Note: this is the LAST step — if it fails partway, the audit trail
-    # above tells the next run what was already done so we don't double-bill.
-    #
-    # For oppstart runs: add label `Oppstartsfakturert`.
-    # For slutt runs: add `Sluttfakturert` if the row already had
-    #   `Oppstartsfakturert` (50/50 split), else `Sluttfakturert (full)`
-    #   (single invoice billing the whole row).
-    # We re-read the row immediately before writing so concurrent edits
-    # in Notion between this engine's start and now don't get clobbered
-    # (e.g. an operator added `Kreditert` mid-run).
+    # 8. Stamp each billed Oppgave + Project + draft URL.
+    # The audit trail (step 7) ALREADY persisted what was billed, so a
+    # failure here is a "Notion is out of sync but Fiken + Postgres
+    # agree" condition the operator can repair by hand.
+    new_oppgave_status = (
+        FAKTURERT_STATUS_50 if invoice_type == "oppstart" else FAKTURERT_STATUS_FULL
+    )
     for line in lines:
-        opg_id = line.oppgave_page_id
-        if not opg_id:
+        if not line.oppgave_page_id:
             continue
         try:
-            opg = await notion_client.get_page(opg_id)
-            existing = notion_client.read_multi_select_names(
-                opg, OPPGAVER_PROPS["billed_status"]
-            )
-            if invoice_type == "oppstart":
-                label_to_add = FAKTURERT_LABEL_OPPSTART
-            else:
-                # Slutt: depend on whether oppstart already happened.
-                if FAKTURERT_LABEL_OPPSTART in existing:
-                    label_to_add = FAKTURERT_LABEL_SLUTT
-                else:
-                    label_to_add = FAKTURERT_LABEL_SLUTT_FULL
-            await notion_client.set_oppgave_billing_state(
-                opg_id,
-                invoice_type=invoice_type,
-                label_to_add=label_to_add,
-                existing_labels=existing,
+            await notion_client.set_oppgave_billed(
+                line.oppgave_page_id,
+                status=new_oppgave_status,
+                billed_amount_nok=line.new_billed_amount_nok,
             )
         except Exception as err:  # noqa: BLE001
-            # The draft is already in Fiken and the audit trail is
-            # persisted; failing here just means a row's label isn't
-            # written yet. Operator can fix by hand. Don't fail the
-            # whole task.
             logger.warning(
-                "fiken_invoice_create: failed to stamp Oppgave %s: %s",
-                opg_id,
+                "send_faktura: failed to stamp Oppgave %s: %s",
+                line.oppgave_page_id,
                 err,
             )
+
+    new_project_status = (
+        FAKTURA_STATUS_OPPSTART_DONE
+        if invoice_type == "oppstart"
+        else FAKTURA_STATUS_FULL_DONE
+    )
+    try:
+        await notion_client.set_project_faktura_status(
+            project_page_id, status=new_project_status
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.warning(
+            "send_faktura: failed to flip project %s Faktura status to %r: %s",
+            project_page_id,
+            new_project_status,
+            err,
+        )
 
     if draft_url:
         try:
             await notion_client.set_project_draft_url(
-                project_page_id, invoice_type=invoice_type, url=draft_url
+                project_page_id, url=draft_url
             )
         except Exception as err:  # noqa: BLE001
             logger.warning(
-                "fiken_invoice_create: failed to write last_draft_url on %s: %s",
+                "send_faktura: failed to write draft URL on %s: %s",
                 project_page_id,
                 err,
             )
 
     logger.info(
-        "✅ fiken_invoice_create: %s draft for %r — %d line(s), "
-        "customer=%s, draft_id=%s",
+        "✅ send_faktura: %s draft for %r — %d line(s), customer=%s, draft_id=%s",
         invoice_type,
         project_title or project_page_id,
         len(lines),

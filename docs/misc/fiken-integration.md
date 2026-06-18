@@ -1,8 +1,50 @@
-# Fiken integration — research + v1 plan
+# Fiken integration — research + plan
 
-Status: **not started** (June 2026). This doc captures the scoping research and the v1 implementation plan so we don't re-discover any of it later. Fiken is the last system in the long-term "everything into Notion" vision (see [docs/reference/client-brief.md](../reference/client-brief.md)) that hasn't been touched.
+Status: **Phase B v2 shipped** (June 2026) — single-button label-driven invoice creation. Phase C (read-back poller) still **not started**.
 
-The client brief's Fiken section is **literally empty** — no captured requirements. The scope below was locked in over a scoping conversation with the user (June 2026); revisit before starting v2.
+This doc captures the original Fiken→Notion research (sections below) so we don't re-discover any of it later; the Phase B engine notes are inline next.
+
+## Phase B v2 — Notion → Fiken invoice creation (live)
+
+**Button**: one "Send faktura" on the Projects DB. The Project's `Faktura status` (Notion `status` property type) holding `Til oppstartsfaktura` / `Til avslutningsfaktura` (or its synonym `Til fakturering`) decides whether the engine bills 50% of every eligible Oppgave or the remainder. After a successful run the engine flips Faktura status to `Oppstart fakturert` / `Fakturert` and the next click is a clean skip.
+
+**Per-Oppgave billing label**: each row's `Fakturert status` (Notion `status` property type) picks whether it's included. Options: `Ikke fakturert` (default, eligible for both modes), `Fakturert 50%` (engine-written after oppstart; slutt eligible), `Fakturert` (engine-written after slutt — skipped on every future run), `Utgår` (operator-only — skipped in every mode).
+
+**Notion is the invoice ledger.** Each Oppgave carries `Pris` (mutable — operators can renegotiate between oppstart and slutt), `Rabatt` (Notion `Percent` format — operator types `15` for 15%, Notion's API returns the fraction `0.15`, engine consumes directly), and `Fakturert beløp` (running total of NOK actually billed, engine-written). The slutt run computes `remaining = Pris × (1 − Rabatt) − Fakturert beløp`, so a renegotiated Pris flows through correctly: oppstart at 15 K Pris bills 7.5 K → operator drops Pris to 10 K → slutt bills 2.5 K (not the original 7.5 K). A project-level rollup of `Fakturert beløp` is the displayed "Fakturert sum." **Rabatt is forwarded to Fiken on the line itself** via the per-line `discount` field (percent), so the printed invoice shows "Pris kr X / Rabatt Y% / Sum kr Z" rather than a pre-discounted unit price. For a slutt run the engine sends the inverted pre-rabatt amount (`unitPrice = to_bill / (1 − Rabatt)`) so Fiken's discount math lands on the same `to_bill` value the audit trail records.
+
+**Invoice fields**:
+
+- `ourReference` (Vår referanse) = Notion project name. Same field the Phase C poller will match on.
+- `yourReference` (Deres referanse) = Project `Faktura merkes` rich_text. Optional; omitted from the draft when blank.
+- Line text comes in two pieces driven by the Oppgave's `Oppgave kategori` multi_select (first selected label wins):
+  - `description` (bold first line) = the **Kategori label** (e.g. `Næring - Interiør`, `Print`). Falls back to `"{Navn} — {Beskrivelse}"` (or just Navn / Beskrivelse / discipline name) when the row has no Kategori.
+  - `comment` (smaller sub-line) = `"{Navn} - {Beskrivelse}"` (or just Navn when Beskrivelse is blank). So the customer reads the category up top and the specific deliverable underneath.
+- `incomeAccount` per line is also driven by Kategori via `FIKEN_KATEGORI_TO_ACCOUNT` in [config.py](../../src/gb_automations/config.py) — `3020` for tjeneste (`Næring - Interiør`, …), `3000` for vare (`Print`, …). Unknown/blank Kategori → defaults to `3020` with a WARN log. Both still book at 25% MVA (`HIGH`); only the income account differs so the accountant can split tjeneste vs vare revenue.
+- Free-text lines (no `productId`) so we control the printed text entirely. The per-discipline product catalogue (`goldbox-interior` / `…-exterior` / `…-animation` / `…-other`) is still mirrored in Fiken so per-product reports stay populated.
+- Draft-level "Kommentar" (Fiken API field: `invoiceText`) is set per `invoice_type` from two env-driven defaults:
+  - `FIKEN_INVOICE_TEXT_OPPSTART` — printed on oppstart drafts. Default: "Oppstartsfaktura: 50 % av avtalt beløp for oppstart av prosjektet. Resterende beløp faktureres ved levering."
+  - `FIKEN_INVOICE_TEXT_SLUTT` — printed on slutt drafts (both `Til avslutningsfaktura` and the synonym `Til fakturering`). Default: "Sluttfaktura: Gjenstående beløp etter eventuell oppstartsfaktura. Takk for at du valgte Goldbox."
+
+  Edit either in `.env` and `docker compose up -d --force-recreate api` to push the change. An empty string in either var → engine omits the field on that mode's drafts and Fiken falls back to the company-level default ("endre standard" in the UI). Empirically verified field name: alternative candidates (`comment`, `message`, `paymentText`) are silently dropped by Fiken on POST.
+
+**Webhook**: `POST /webhooks/notion/send-faktura` (bearer auth via `NOTION_WEBHOOK_SECRET`). Enqueues a `send_faktura` task — never inline. The worker dispatcher routes to [sync/sync_fiken_invoice.py](../../src/gb_automations/sync/sync_fiken_invoice.py) `create_fiken_invoice(project_page_id)`.
+
+**Customer resolution**: Project → Fakturamottaker → `Orgnr` (one hop — the Project has a direct `Fakturamottaker` relation). Matched against `/contacts?customer=true` by digits-only org number. On no match (but Orgnr present) the engine auto-creates a Fiken contact using the Fakturamottaker row's title + Orgnr (operator fills address/email in Fiken later). **If Orgnr is missing entirely** (no Fakturamottaker linked yet, or linked but Orgnr column blank) the engine links the draft to a shared **"Mangler kunde" placeholder contact** (name = `settings.fiken_placeholder_contact_name`; auto-created on first use, cached per `company_slug` in `fiken_placeholder_contacts`). The operator then picks or creates the real customer in Fiken's draft UI before clicking Send. Fiken's API rejects drafts with no `customerId` (`"'customerId' er påkrevd"`) so the placeholder is necessary; it also lets the team scan their Fiken drafts list and immediately see which ones still need a real customer. The earlier two-hop walk through Kunder is gone; Kunder may still exist on the Projects DB for views / contacts but the engine no longer reads it.
+
+**Out of scope for v2** (revisit when needed):
+
+- Cancelling / deleting drafts (operator does it in Fiken UI).
+- Auto-send (drafts stay drafts until the user clicks Send in Fiken).
+- Reading the draft back into Notion before send (Phase C poller catches it once sent).
+- Kategori-based product mapping: the client hasn't finalized the Oppgave kategori options yet — when they do, we'll add a config-driven kategori → Fiken product map.
+
+---
+
+## Phase C — Fiken → Notion read-back (still not started)
+
+The original v1 plan below is the Phase C poller (sent invoices + offers → year-partitioned `Fakturaer YYYY` / `Tilbud YYYY` Notion DBs). The schema landed in [migration v7s8t9u0p1q2](../../migrations/versions/v7s8t9u0p1q2_add_fiken_phase_a.py); the engine still needs writing.
+
+The Phase C cutover replaces the existing Make automation that pulls sent invoices from Fiken into a Notion DB today.
 
 ---
 

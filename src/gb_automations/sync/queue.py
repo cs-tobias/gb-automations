@@ -470,8 +470,8 @@ _ACTIVE_LEVERANSE_STATUS_PREDICATE = text(
 _ACTIVE_FRAME_FILE_STATUS_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'frame_file_status_sync'"
 )
-_ACTIVE_FIKEN_INVOICE_CREATE_PREDICATE = text(
-    "status IN ('pending','in_progress') AND task_type = 'fiken_invoice_create'"
+_ACTIVE_SEND_FAKTURA_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'send_faktura'"
 )
 _ACTIVE_FIKEN_POLL_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'fiken_poll'"
@@ -613,41 +613,38 @@ async def enqueue_frame_file_status_sync(
 # ============================================================
 
 
-async def enqueue_fiken_invoice_create(
-    project_page_id: str, invoice_type: str
-) -> int:
+async def enqueue_send_faktura(project_page_id: str) -> int:
     """Enqueue a Fiken draft-invoice creation for one Notion Project.
 
-    Fired by the per-project Notion buttons (Opprett oppstartsfaktura /
-    Opprett sluttfaktura). The worker reads the live Notion project +
-    ticked Oppgaver at process time, so collapsing rapid double-clicks
-    of the same button to one task is correct — the engine sees whatever
-    state the rows are in when it runs.
+    Fired by the per-project "Send faktura" Notion button. The worker
+    reads the live Project + Oppgaver at process time — including the
+    project's `Faktura status` (which determines whether this run is an
+    oppstart or slutt) — so collapsing rapid double-clicks of the button
+    to one task is correct.
 
-    `invoice_type` is "oppstart" or "slutt". We pack
-    f"{project_page_id}:{invoice_type}" into gmail_thread_id so the same
-    project can have BOTH an oppstart and a slutt creation in flight
-    simultaneously (distinct dedup keys), while two clicks of the SAME
-    button on the same project collapse to one row via
-    uq_sync_tasks_active_fiken_invoice_create.
+    Dedup key is `project_page_id` alone. The project's `Faktura status`
+    can only hold ONE billable state at a time ("Til oppstartsfaktura" or
+    "Til avslutningsfaktura"), so there's no need for an invoice_type
+    suffix; the engine reads it off the project. After a successful run
+    the engine flips Faktura status to "Oppstart fakturert" / "Fakturert"
+    and the next click is a clean skip.
 
     Returns 1 if newly enqueued, 0 if a duplicate was already active.
     """
-    if not project_page_id or invoice_type not in ("oppstart", "slutt"):
+    if not project_page_id:
         return 0
 
-    dedup_key = f"{project_page_id}:{invoice_type}"
     stmt = (
         pg_insert(SyncTask)
         .values(
-            task_type="fiken_invoice_create",
+            task_type="send_faktura",
             project_page_id=project_page_id,
             user_email="*",
-            gmail_thread_id=dedup_key,
+            gmail_thread_id=project_page_id,
         )
         .on_conflict_do_nothing(
             index_elements=["gmail_thread_id"],
-            index_where=_ACTIVE_FIKEN_INVOICE_CREATE_PREDICATE,
+            index_where=_ACTIVE_SEND_FAKTURA_PREDICATE,
         )
     )
     async with SessionLocal() as own:
@@ -966,7 +963,7 @@ __all__ = [
     "enqueue_frame_version_sync",
     "enqueue_oppgave_done_sync",
     "enqueue_leveranse_status_recheck",
-    "enqueue_fiken_invoice_create",
+    "enqueue_send_faktura",
     "enqueue_fiken_poll",
     "claim_one",
     "mark_done",
