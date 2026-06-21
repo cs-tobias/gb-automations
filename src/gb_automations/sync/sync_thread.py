@@ -24,10 +24,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1207,6 +1208,7 @@ async def _sync_single_message(
         session,
         project_page_ids=project_page_ids,
         from_email=from_email_for_dedup,
+        sent_at=msg.date,
         body=cleaned_body,
     )
     if content_hit is not None:
@@ -1277,12 +1279,14 @@ async def _sync_single_message(
     )
     created = await notion_client.create_email_row(properties, db_id)
     row_id = created["id"]
-    # Record (project, from, body_hash) → page mapping so a later thread that
-    # quotes this body hits the content dedup instead of creating a duplicate.
+    # Record (project, from, sent_at_minute, body_hash) → page mapping so a
+    # later thread that quotes this body hits the content dedup instead of
+    # creating a duplicate.
     await _record_content_dedup(
         session,
         project_page_ids=project_page_ids,
         from_email=from_email_for_dedup,
+        sent_at=msg.date,
         body=cleaned_body,
         notion_page_id=row_id,
         gmail_message_id=msg.message_id,
@@ -1519,6 +1523,7 @@ async def _sync_extracted_message(
         session,
         project_page_ids=project_page_ids,
         from_email=from_email_for_dedup,
+        sent_at=inner.date,
         body=display_body,
     )
     if content_hit is not None:
@@ -1589,12 +1594,14 @@ async def _sync_extracted_message(
     )
     notion_page = await notion_client.create_email_row(properties, db_id)
     row_id = notion_page["id"]
-    # Record (project, from, body_hash) → page mapping so the same body
-    # extracted from a later thread short-circuits at the dedup layer above.
+    # Record (project, from, sent_at_minute, body_hash) → page mapping so the
+    # same body extracted from a later thread short-circuits at the dedup
+    # layer above.
     await _record_content_dedup(
         session,
         project_page_ids=project_page_ids,
         from_email=from_email_for_dedup,
+        sent_at=inner.date,
         body=display_body,
         notion_page_id=row_id,
         gmail_message_id=synthetic_id,
@@ -1666,25 +1673,76 @@ async def _cache_email_row(
     await session.execute(stmt)
 
 
+_IMAGE_MARKER_RE = re.compile(r"\[image:\s*[^\]]*\]", re.IGNORECASE)
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+
+def _normalize_for_dedup(body: str) -> str:
+    """Normalize a body string for content-dedup hashing.
+
+    Absorbs trivial drift between two presentations of the same logical email
+    (the same message re-quoted across N threads with slightly different
+    surrounding framing):
+      - Lowercase.
+      - Strip `[image: NAME]` markers (per-sync attachment annotations, vary
+        by which attachments survived this sync's attribution pass — not part
+        of the human-written content).
+      - Collapse all whitespace runs (including newlines) to single spaces.
+      - Strip leading/trailing whitespace.
+    """
+    if not body:
+        return ""
+    s = _IMAGE_MARKER_RE.sub(" ", body)
+    s = s.lower()
+    s = _WHITESPACE_RUN_RE.sub(" ", s)
+    return s.strip()
+
+
+def _sent_at_minute(sent_at: datetime | None) -> str | None:
+    """UTC, minute-precision timestamp string for the dedup key.
+
+    Returns None when `sent_at` is missing — caller refuses to build a key
+    in that case, degrading gracefully to layers 1/2 only.
+    """
+    if sent_at is None:
+        return None
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    else:
+        sent_at = sent_at.astimezone(timezone.utc)
+    return sent_at.strftime("%Y-%m-%dT%H:%M")
+
+
 def _content_dedup_key(
-    *, project_page_ids: list[str], from_email: str, body: str
-) -> tuple[str, str, str] | None:
-    """Build the (project, from, body_hash) lookup key for `email_content_dedup`.
+    *,
+    project_page_ids: list[str],
+    from_email: str,
+    sent_at: datetime | None,
+    body: str,
+) -> tuple[str, str, str, str] | None:
+    """Build the (project, from, sent_at_minute, body_hash) lookup key.
 
     Returns None when we can't safely dedup:
     - No project matched: dedup across all projects could collapse unrelated
-      emails. Falls through to normal create.
-    - Empty body: too common a fingerprint (attachment-only / OK / Takk!) for
-      a single-character body to be a stable identity. Falls through.
-    Both cases preserve the existing message_id dedup as the only protection,
-    which is correct — content dedup only adds a layer, never weakens one.
+      emails (explicit user direction: per-project only). Falls through.
+    - Empty body (after normalization): not a stable fingerprint. Falls through.
+    - Missing `sent_at`: without a timestamp we can't distinguish two distinct
+      "Takk!" replies from the same sender — better to skip dedup than risk
+      collapsing them. Falls through.
+    All cases preserve the existing message_id dedup as the only protection.
     """
-    if not project_page_ids or not body or not body.strip():
+    if not project_page_ids:
+        return None
+    minute_pk = _sent_at_minute(sent_at)
+    if minute_pk is None:
+        return None
+    normalized = _normalize_for_dedup(body)
+    if not normalized:
         return None
     project_pk = project_page_ids[0]
     sender_pk = (from_email or "").strip().lower()
-    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    return (project_pk, sender_pk, body_hash)
+    body_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return (project_pk, sender_pk, minute_pk, body_hash)
 
 
 async def _find_content_dedup(
@@ -1692,11 +1750,15 @@ async def _find_content_dedup(
     *,
     project_page_ids: list[str],
     from_email: str,
+    sent_at: datetime | None,
     body: str,
 ) -> EmailContentDedup | None:
-    """Look up an existing row by (project, from, body_hash). None if absent."""
+    """Look up an existing row by (project, from, sent_at_minute, body_hash)."""
     key = _content_dedup_key(
-        project_page_ids=project_page_ids, from_email=from_email, body=body
+        project_page_ids=project_page_ids,
+        from_email=from_email,
+        sent_at=sent_at,
+        body=body,
     )
     if key is None:
         return None
@@ -1708,11 +1770,12 @@ async def _record_content_dedup(
     *,
     project_page_ids: list[str],
     from_email: str,
+    sent_at: datetime | None,
     body: str,
     notion_page_id: str,
     gmail_message_id: str,
 ) -> None:
-    """Record the (project, from, body_hash) → notion_page_id mapping.
+    """Record the (project, from, sent_at_minute, body_hash) → page mapping.
 
     Called after a successful row create in BOTH the regular and extracted
     paths. The user's resync flow (`rebuild_thread`) archives old rows and
@@ -1722,22 +1785,26 @@ async def _record_content_dedup(
     once might both try to insert the same key — first writer wins, idempotent.
     """
     key = _content_dedup_key(
-        project_page_ids=project_page_ids, from_email=from_email, body=body
+        project_page_ids=project_page_ids,
+        from_email=from_email,
+        sent_at=sent_at,
+        body=body,
     )
     if key is None:
         return
-    project_pk, sender_pk, body_hash = key
+    project_pk, sender_pk, minute_pk, body_hash = key
     stmt = (
         insert(EmailContentDedup)
         .values(
             project_page_id=project_pk,
             from_email=sender_pk,
+            sent_at_minute=minute_pk,
             body_hash=body_hash,
             notion_page_id=notion_page_id,
             gmail_message_id=gmail_message_id,
         )
         .on_conflict_do_nothing(
-            index_elements=["project_page_id", "from_email", "body_hash"]
+            index_elements=["project_page_id", "from_email", "sent_at_minute", "body_hash"]
         )
     )
     await session.execute(stmt)

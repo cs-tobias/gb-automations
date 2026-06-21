@@ -97,7 +97,7 @@ class EmailRow(Base):
 
 
 class EmailContentDedup(Base):
-    """(project, from_email, body_hash) → notion_page_id of the canonical row.
+    """(project, from_email, sent_at_minute, body_hash) → notion_page_id of the canonical row.
 
     Third dedup layer for the case where Gmail splits one conversation into
     several threads (`KG9: …`, `Svar: KG9: …`, `Svar: Svar: KG9: …`). Each
@@ -113,18 +113,28 @@ class EmailContentDedup(Base):
     This table closes that gap, scoped per project so generic short bodies
     ("Takk!" / "OK") only collapse within the same project.
 
-    PK is `(project_page_id, from_email, body_hash)` — that IS the lookup key,
-    so no separate index needed. body_hash is SHA-256 hex of the SAME cleaned
-    body string we write to Notion's `Melding`; from_email is lower-cased and
-    may be empty for LLM-extracted name-only senders (an empty-empty match
-    across two rows still legitimately means "same body, same project, same
-    nameless sender" — we collapse those too).
+    `sent_at_minute` is part of the key so two genuinely-distinct short
+    replies ("Takk!") from the same sender don't collapse — they'll have
+    different timestamps. The same logical email re-quoted across N threads
+    carries the same minute-truncated timestamp and DOES collapse. Truncating
+    to the minute absorbs sub-second drift between Gmail's `internalDate` and
+    the regex-parsed "On X wrote:" date in quoted history.
+
+    `body_hash` is SHA-256 hex of the *normalized* body (lowercased, whitespace
+    collapsed, `[image: …]` markers stripped). Normalization absorbs the
+    trivial drift that breaks an exact-byte hash when the same logical email
+    is re-quoted across threads with slightly different surrounding framing.
+
+    `from_email` is lower-cased and may be empty for LLM-extracted name-only
+    senders (an empty-empty match across two rows still legitimately means
+    "same body, same project, same timestamp, same nameless sender").
     """
 
     __tablename__ = "email_content_dedup"
 
     project_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     from_email: Mapped[str] = mapped_column(String(254), primary_key=True)
+    sent_at_minute: Mapped[str] = mapped_column(String(16), primary_key=True)
     body_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
     # The Gmail message id (real or synthetic) of the row that won the dedup.
