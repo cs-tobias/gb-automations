@@ -52,7 +52,7 @@ from gb_automations.sync.sync_toggl_project import sync_toggl_project
 
 logger = logging.getLogger(__name__)
 
-CONCURRENCY = 1
+CONCURRENCY = 2
 MAX_ATTEMPTS = 5
 BASE_BACKOFF_SECONDS = 30
 POLL_INTERVAL_SECONDS = 15.0
