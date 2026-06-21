@@ -14,8 +14,8 @@ across N threads always carries the same minute-truncated timestamp.
 The table is a cache (Notion is the source of truth), so we DROP and recreate
 rather than backfilling. The next sync of each thread repopulates naturally.
 
-Revision ID: a2x3y4z5v6w7
-Revises: z1w2x3y4u5v6
+Revision ID: f7g8h9i0j1k2
+Revises: e6f7g8h9i0j1
 Create Date: 2026-06-21
 
 """
@@ -25,8 +25,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "a2x3y4z5v6w7"
-down_revision: str | None = "z1w2x3y4u5v6"
+revision: str = "f7g8h9i0j1k2"
+down_revision: str | None = "e6f7g8h9i0j1"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
