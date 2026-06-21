@@ -1851,6 +1851,7 @@ async def debug_fiken_inspect(
         FAKTURERT_STATUS_IKKE,
         FAKTURERT_STATUS_50,
         FAKTURERT_STATUS_UTGAR,
+        KORREKSJON_KIND_KORREKSJONSRUNDE,
         OPPGAVER_PROPS,
         PROJECTS_FAKTURA_STATUS_PROP,
     )
@@ -1877,8 +1878,8 @@ async def debug_fiken_inspect(
         billed = notion_client.read_number_prop(row, OPPGAVER_PROPS["billed_amount"])
 
         reasons: list[str] = []
-        if canonical is None:
-            reasons.append(f"Type {raw_type!r} not a recognized discipline")
+        if (raw_type or "").strip().lower() == KORREKSJON_KIND_KORREKSJONSRUNDE.lower():
+            reasons.append("Type = Korreksjonsrunde (Frame.io admin sub-row, never billed)")
         if fakturert_status in (FAKTURERT_STATUS_FULL, FAKTURERT_STATUS_UTGAR):
             reasons.append(f"Fakturert status = {fakturert_status!r}")
         if invoice_type == "oppstart" and fakturert_status != FAKTURERT_STATUS_IKKE:
