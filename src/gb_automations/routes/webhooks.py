@@ -52,6 +52,7 @@ from gb_automations.obs import request_scope
 from gb_automations.sync import queue_mirror
 from gb_automations.sync import resync_project as resync_project_mod
 from gb_automations.sync.queue import (
+    enqueue_graduate_faktura,
     enqueue_send_faktura,
     enqueue_frame_comment_sync,
     enqueue_frame_file_status_sync,
@@ -967,6 +968,92 @@ async def _notion_send_faktura_impl(request: Request) -> Response:
         page_id,
     )
     _record_notion_automation_hit("send-faktura", action)
+    return _json({"page_id": page_id, "action": action})
+
+
+# ============================================================
+# /webhooks/notion/graduate-faktura — manual "check Fiken" button
+# ============================================================
+
+
+@router.post("/notion/graduate-faktura")
+async def notion_graduate_faktura(request: Request) -> Response:
+    """Notion button receiver: "Sjekk fiken" on a Project row.
+
+    Operator's manual fallback for the future hourly poller (C.3b).
+    Pings Fiken for all sent invoices belonging to this project, writes
+    Faktura DB rows, graduates statuses + Fakturert beløp, clears the
+    draft URL — same engine the hourly poller will use, on demand.
+
+    Use cases:
+      - Test the integration end-to-end without waiting for the poller.
+      - CEO just sent an invoice in Fiken and wants it in Notion now.
+      - Force a re-check if something looks stale.
+
+    Mirrors `/webhooks/notion/send-faktura` exactly: bearer check,
+    body parse, ENQUEUE a `graduate_faktura` task, return 200. All
+    real work runs on the queue worker so we stay under Notion's
+    auto-pause threshold.
+    """
+    with request_scope("graduate-faktura"):
+        return await _notion_graduate_faktura_impl(request)
+
+
+async def _notion_graduate_faktura_impl(request: Request) -> Response:
+    if not _verify_bearer(request.headers.get("Authorization")):
+        logger.warning(
+            "Notion graduate-faktura auth failed (NOTION_WEBHOOK_SECRET set: %s)",
+            bool(settings.notion_webhook_secret),
+        )
+        _record_notion_automation_hit("graduate-faktura", "auth_failed")
+        return _json({"action": "skipped", "reason": "auth failed"})
+
+    raw_body = await request.body()
+    try:
+        payload: dict[str, Any] = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        logger.warning("graduate-faktura: invalid JSON body")
+        _record_notion_automation_hit("graduate-faktura", "invalid_json")
+        return _json({"action": "skipped", "reason": "invalid JSON"})
+
+    data = payload.get("data") or {}
+    page_id = (data.get("id") or "").strip()
+    if not page_id:
+        logger.warning("graduate-faktura: no page id in payload")
+        _record_notion_automation_hit("graduate-faktura", "no_page_id")
+        return _json({"action": "skipped", "reason": "no page id"})
+
+    # Parent-DB sanity check — same as send-faktura.
+    parent = (data.get("parent") or {}).get("database_id") or ""
+    target_db = (settings.projects_db_id or "").replace("-", "").lower()
+    payload_db = parent.replace("-", "").lower()
+    if target_db and payload_db != target_db:
+        logger.info(
+            "graduate-faktura: page %s parent DB %s does not match "
+            "PROJECTS_DB_ID — skipping",
+            page_id,
+            parent,
+        )
+        _record_notion_automation_hit(
+            "graduate-faktura", "wrong_parent_db"
+        )
+        return _json(
+            {
+                "page_id": page_id,
+                "action": "skipped",
+                "reason": "wrong parent DB",
+            }
+        )
+
+    inserted = await enqueue_graduate_faktura(page_id)
+    queue_worker.wake()
+    action = "queued" if inserted else "already_queued"
+    logger.info(
+        "📥 graduate-faktura %s for %s",
+        "enqueued" if inserted else "already_queued",
+        page_id,
+    )
+    _record_notion_automation_hit("graduate-faktura", action)
     return _json({"page_id": page_id, "action": action})
 
 

@@ -197,6 +197,55 @@ def test_eligible_rows_rejects_bad_invoice_type():
 
 
 # ---------------------------------------------------------------------------
+# Postgres-derived "row is on an unsent draft" gate
+# ---------------------------------------------------------------------------
+
+
+def test_eligible_rows_skips_oppgave_in_rows_on_unsent_drafts_oppstart():
+    """When a row's page id is in the rows_on_unsent_drafts set (because
+    its FikenInvoiceLine references an unsent FikenInvoice), the
+    eligibility filter skips it — defensive belt-and-suspenders with
+    the per-project block check in create_fiken_invoice."""
+    rows = [
+        _oppgave(page_id="a"),  # ✓
+        _oppgave(page_id="b"),  # ✗ on unsent draft
+    ]
+    eligible = engine._eligible_rows(
+        rows, "oppstart", rows_on_unsent_drafts={"b"}
+    )
+    assert [r["id"] for r in eligible] == ["a"]
+
+
+def test_eligible_rows_skips_oppgave_in_rows_on_unsent_drafts_slutt():
+    """Same gate fires on slutt — there's only one unsent draft per
+    project (block check enforces it), so if a row is on one, no new
+    draft mode should bill it."""
+    rows = [
+        _oppgave(page_id="a"),  # ✓
+        _oppgave(page_id="b"),  # ✗
+    ]
+    eligible = engine._eligible_rows(
+        rows, "slutt", rows_on_unsent_drafts={"b"}
+    )
+    assert [r["id"] for r in eligible] == ["a"]
+
+
+def test_eligible_rows_empty_unsent_drafts_set_is_permissive():
+    """Default kwarg (None) and explicit empty set both behave the same:
+    no draft-gating, all rows pass the unsent-draft check."""
+    rows = [_oppgave(page_id="a"), _oppgave(page_id="b")]
+    assert sorted(
+        r["id"] for r in engine._eligible_rows(rows, "oppstart")
+    ) == ["a", "b"]
+    assert sorted(
+        r["id"]
+        for r in engine._eligible_rows(
+            rows, "oppstart", rows_on_unsent_drafts=set()
+        )
+    ) == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
 # _row_billable_nok — discount, renegotiation, "nothing left" skip
 # ---------------------------------------------------------------------------
 
@@ -243,6 +292,71 @@ def test_row_billable_oppstart_with_rabatt():
     assert unit_price == 10_000.0
     assert quantity_fraction == 0.5
     assert discount_fraction == 0.10
+
+
+def test_row_billable_slutt_subtracts_unsent_drafted_nok():
+    """Oppstart was DRAFTED but never sent in Fiken — so Fakturert
+    beløp on the Notion row is still 0 (we only write that on
+    graduation). But the audit table holds the drafted amount.
+
+    Pris 10_000, oppstart drafted = 5000 unsent, slutt math should
+    bill the remaining 5000, NOT the full 10_000.
+    """
+    row = _oppgave(page_id="a", pris=10_000.0, billed_amount_nok=0.0)
+    (
+        to_bill,
+        new_total,
+        unit_price,
+        quantity_fraction,
+        discount_fraction,
+    ) = engine._row_billable_nok(
+        row, "slutt", already_drafted_nok=5000.0
+    )
+    assert to_bill == 5000.0
+    # new_total = already_committed (5000) + to_bill (5000) = 10_000.
+    # The graduation step computes the actual Notion cumulative
+    # separately (it reads current Fakturert beløp + adds the
+    # audit-line NOK), so new_total here is informational only.
+    assert new_total == 10_000.0
+    assert unit_price == 10_000.0
+    assert quantity_fraction == 0.5
+
+
+def test_row_billable_slutt_skips_when_drafted_already_covers_gross():
+    """Oppstart drafted for the FULL gross (e.g. operator made a
+    single-shot full-bill oppstart draft for testing); slutt math
+    sees remaining=0 and skips.
+    """
+    row = _oppgave(page_id="a", pris=10_000.0, billed_amount_nok=0.0)
+    result = engine._row_billable_nok(
+        row, "slutt", already_drafted_nok=10_000.0
+    )
+    assert result is None
+
+
+def test_row_billable_oppstart_ignores_drafted_kwarg():
+    """Oppstart math is unchanged by the unsent-drafted kwarg
+    (defaults to 0; even if passed in, oppstart computes 50% of
+    gross independent of prior drafts)."""
+    row = _oppgave(page_id="a", pris=10_000.0, billed_amount_nok=0.0)
+    (
+        to_bill_default,
+        _,
+        _,
+        qf_default,
+        _,
+    ) = engine._row_billable_nok(row, "oppstart")
+    (
+        to_bill_with_drafted,
+        _,
+        _,
+        qf_with_drafted,
+        _,
+    ) = engine._row_billable_nok(
+        row, "oppstart", already_drafted_nok=999_999.0
+    )
+    assert to_bill_default == to_bill_with_drafted == 5000.0
+    assert qf_default == qf_with_drafted == 0.5
 
 
 def test_row_billable_slutt_remainder_after_oppstart():

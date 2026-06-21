@@ -49,17 +49,23 @@ Algorithm:
     6. Persist the audit trail (FikenInvoice + FikenInvoiceLine — one
        row per Oppgave actually billed; each line carries the NOK amount
        sent so the cumulative billed-per-row is reconstructable).
-    7. Stamp each billed Oppgave in Notion: bump `Fakturert beløp` by
-       to_bill, set `Fakturert status` to "Fakturert 50%" (oppstart)
-       or "Fakturert" (slutt). Flip the Project `Faktura status` to
-       "Oppstart fakturert" or "Fakturert". Write the draft URL onto
-       the side-specific Project column.
+    7. Write the draft URL onto the Project's `Faktura utkast` column.
+       send_faktura does NOT touch any Notion billing field — NOT
+       `Fakturert status`, NOT `Fakturert beløp` — on Oppgaver OR the
+       Project. Both are written by the graduation step
+       (sync/graduate_project.py) ONLY after the draft has actually
+       been sent in Fiken. A draft is paperwork awaiting Send; writing
+       to Fakturert beløp at draft time would lie about the project's
+       real billed total. The audit trail (FikenInvoiceLine, written
+       in step 6) holds the per-Oppgave NOK for graduation to add later.
 
 Idempotency / re-click safety:
   - The dedup index on the `send_faktura` task type collapses concurrent
     double-clicks during the in-flight window to one task.
-  - Once the engine flips the Project `Faktura status` past the billable
-    states, the next click is a clean skip (no Fiken POST).
+  - At the top of create_fiken_invoice, a Postgres query checks for
+    any FikenInvoice row with sent_at NULL for this project; if one
+    exists, the engine BLOCKS the click (one unsent draft per project
+    at a time — operator sorts out the existing one in Fiken first).
   - The audit trail is the source of truth for "what was billed when" —
     each FikenInvoiceLine carries the NOK amount.
 
@@ -78,6 +84,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gb_automations.clients import brreg as brreg_client
@@ -85,8 +92,6 @@ from gb_automations.clients import fiken as fiken_client
 from gb_automations.clients import notion as notion_client
 from gb_automations.config import (
     DISCIPLINE_KEYS,
-    FAKTURA_STATUS_FULL_DONE,
-    FAKTURA_STATUS_OPPSTART_DONE,
     FAKTURA_STATUS_TO_INVOICE_TYPE,
     FAKTURERT_STATUS_50,
     FAKTURERT_STATUS_FULL,
@@ -218,37 +223,36 @@ def _normalize_discipline(raw: str | None) -> str | None:
 
 
 def _eligible_rows(
-    rows: list[dict[str, Any]], invoice_type: str
+    rows: list[dict[str, Any]],
+    invoice_type: str,
+    *,
+    rows_on_unsent_drafts: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Filter Notion rows to those eligible for this invoice run.
 
-    "Bulletproof" mode: the engine errs on the side of INCLUDING rows
-    so the operator can trust that every Oppgave they see lands on the
-    invoice draft unless they explicitly excluded it (`Utgår`) or it's
-    an auto-generated admin sub-row (`Korreksjonsrunde`).
+    Bulletproof skip rules — a row is SKIPPED iff ONE of:
 
-    A row is SKIPPED iff:
-      - `Type == "Korreksjonsrunde"` — these are auto-created by the
-        Frame.io integration to track correction rounds; they're admin
-        metadata, not deliverables.
-      - `Fakturert status == "Utgår"` — operator excluded it.
-      - `Fakturert status == "Fakturert"` — already fully billed,
-        nothing to add (Fakturert beløp = gross already; this is a
-        nothing-to-bill case, not a hidden filter).
-      - For oppstart: `Fakturert status == "Fakturert 50%"` — already
-        oppstartet; re-clicking oppstart shouldn't double-bill.
-      - For slutt: nothing further; both `Ikke fakturert` AND
-        `Fakturert 50%` land. ("Fakturert" is caught above.)
+      - `Type == "Korreksjonsrunde"` — Frame.io admin sub-row, never
+        billed.
+      - `Fakturert status == "Utgår"` — operator excluded.
+      - `Fakturert status == "Fakturert"` — already fully billed.
+      - oppstart click + `Fakturert status == "Fakturert 50%"`
+        — oppstart already sent; only slutt remains.
+      - row's page id is in `rows_on_unsent_drafts` — there's a
+        FikenInvoice row in Postgres with sent_at NULL whose
+        FikenInvoiceLine references this Oppgave. Belt-and-suspenders
+        with the per-project block check in create_fiken_invoice;
+        normally empty when we get here.
 
-    Everything else passes — including rows with blank Type, unknown
-    Type, missing Pris, missing Kategori, etc. Downstream stages handle
-    those gracefully (kr 0 unitPrice, free-text with default
-    incomeAccount, etc.).
+    Everything else lands — blank Type, unknown Type, missing Pris,
+    missing Kategori. Downstream stages render kr 0 lines / free-text
+    fallbacks gracefully.
     """
     if invoice_type not in ("oppstart", "slutt"):
         raise ValueError(
             f"invoice_type must be oppstart|slutt, got {invoice_type!r}"
         )
+    on_draft = rows_on_unsent_drafts or set()
     out: list[dict[str, Any]] = []
     for row in rows:
         # Skip Korreksjonsrunde sub-rows. `task_discipline` returns the
@@ -264,17 +268,25 @@ def _eligible_rows(
         )
         if status in (FAKTURERT_STATUS_FULL, FAKTURERT_STATUS_UTGAR):
             continue
-        if invoice_type == "oppstart":
-            if status == FAKTURERT_STATUS_50:
-                continue
-        # else slutt: Ikke fakturert AND Fakturert 50% both pass.
+        if invoice_type == "oppstart" and status == FAKTURERT_STATUS_50:
+            continue
+
+        # Already on an unsent draft → skip. The per-project block
+        # check normally prevents this set from being non-empty in
+        # send_faktura, but the eligibility filter is defensive.
+        row_id = row.get("id") or ""
+        if row_id and row_id in on_draft:
+            continue
 
         out.append(row)
     return out
 
 
 def _row_billable_nok(
-    row: dict[str, Any], invoice_type: str
+    row: dict[str, Any],
+    invoice_type: str,
+    *,
+    already_drafted_nok: float = 0.0,
 ) -> tuple[float, float, float, float, float] | None:
     """Compute the per-row billing amounts.
 
@@ -284,6 +296,14 @@ def _row_billable_nok(
     or None when the row should be skipped (no Pris, or renegotiation
     pushed remaining ≤ 0). All NOK values are decimals; the integer-øre
     conversion happens in the caller.
+
+    `already_drafted_nok` is the sum of NOK on this Oppgave across
+    every UNSENT FikenInvoiceLine in Postgres for the project (computed
+    by `_unsent_oppgave_billed_ore_for_project`). It's added to the
+    Notion-tracked `Fakturert beløp` when slutt computes `remaining`,
+    so a slutt click while an oppstart draft sits unsent in Fiken
+    correctly bills only the leftover. Defaults to 0 for the oppstart
+    path (which doesn't use it) and for unit-test convenience.
 
     Contract (v3 — "Pris is always Pris"):
       - `unit_price_nok` is ALWAYS the full agreed Pris from Notion,
@@ -353,11 +373,17 @@ def _row_billable_nok(
     discount_fraction = max(0.0, min(float(discount_fraction), 1.0))
     gross = price_nok * (1.0 - discount_fraction)
 
-    already = (
+    already_in_notion = (
         notion_client.read_number_prop(row, OPPGAVER_PROPS["billed_amount"])
         or 0.0
     )
-    already = max(0.0, float(already))
+    already_in_notion = max(0.0, float(already_in_notion))
+    # "Committed but not yet invoiced": NOK sitting on unsent drafts
+    # for this Oppgave. Slutt math treats this as already-billed so a
+    # slutt click while an oppstart draft is still unsent in Fiken
+    # bills only the remainder, not the full gross.
+    already_committed = max(0.0, float(already_drafted_nok))
+    already = already_in_notion + already_committed
 
     if invoice_type == "oppstart":
         quantity_fraction = OPPSTART_FRACTION
@@ -370,18 +396,20 @@ def _row_billable_nok(
             quantity_fraction = 0.0
             to_bill = 0
         elif remaining <= 0:
-            # Genuine over-billed case: operator lowered Pris below what
-            # was already invoiced. Skip silently — the over-bill is
-            # already visible in Notion via the `Budsjett` vs `Fakturert
-            # sum` rollups, and a credit note (future feature) is the
-            # proper resolution.
+            # Genuine over-billed case: operator lowered Pris below
+            # the committed amount (sent invoices + unsent drafts).
+            # Skip silently — the over-bill is already visible in
+            # Notion via the `Budsjett` vs `Fakturert sum` rollups,
+            # and a credit note (future feature) is the proper
+            # resolution.
             logger.info(
                 "fiken send-faktura: row %s already over-billed "
-                "(gross=%.2f, already=%.2f, remaining=%.2f) — skipping; "
-                "Notion rollups surface the discrepancy",
+                "(gross=%.2f, sent=%.2f, drafted=%.2f, remaining=%.2f) "
+                "— skipping; Notion rollups surface the discrepancy",
                 row.get("id"),
                 gross,
-                already,
+                already_in_notion,
+                already_committed,
                 remaining,
             )
             return None
@@ -559,6 +587,7 @@ async def _build_line_items(
     *,
     invoice_type: str,
     company_slug: str,
+    unsent_drafted_ore: dict[str, int] | None = None,
 ) -> list[InvoiceLine]:
     """Compose Fiken invoice lines from eligible rows — ONE line per
     Oppgave. Per-line amount + quantity come from `_row_billable_nok`;
@@ -593,7 +622,16 @@ async def _build_line_items(
         # trail / fallback labels.
         canonical = _normalize_discipline(notion_client.task_discipline(row))
 
-        amounts = _row_billable_nok(row, invoice_type)
+        # Per-Oppgave "already committed but unsent" — converted from
+        # the audit table's øre into NOK for the math.
+        row_id = row.get("id") or ""
+        already_drafted_nok = 0.0
+        if unsent_drafted_ore and row_id in unsent_drafted_ore:
+            already_drafted_nok = unsent_drafted_ore[row_id] / 100.0
+
+        amounts = _row_billable_nok(
+            row, invoice_type, already_drafted_nok=already_drafted_nok
+        )
         if amounts is None:
             # _row_billable_nok only returns None in the over-billed
             # case (slutt with remaining ≤ 0). Skip silently — Notion
@@ -663,6 +701,202 @@ def _normalize_orgnr(raw: str | None) -> str:
     if not raw:
         return ""
     return "".join(ch for ch in raw if ch.isdigit())
+
+
+# ============================================================
+# Self-healing draft-in-flight check (Postgres + verify against Fiken)
+# ============================================================
+#
+# Postgres stores a FikenInvoice row with sent_at=NULL every time
+# send_faktura creates a draft. The graduation step (C.3a /
+# graduate_project) sets sent_at when the draft has been sent in Fiken.
+#
+# But: operators delete drafts in Fiken's UI without telling us, and
+# any drafts created before C.3a was wired won't ever get graduated.
+# If we trust Postgres alone, the block check would refuse all future
+# clicks on a project the moment one stale row exists.
+#
+# So the check is two-stage:
+#   1. SELECT candidate FikenInvoice rows from Postgres
+#      (project, sent_at IS NULL).
+#   2. For each candidate, GET its draft on Fiken via
+#      `fiken.check_draft_exists`. Three outcomes per candidate:
+#        - "exists"  → genuine in-flight draft; block.
+#        - "gone"    → draft was deleted (or sent without our knowing);
+#                      mark the row stale via _mark_audit_row_stale and
+#                      do NOT count it toward the block decision.
+#        - "unknown" → network error / 5xx; fail-safe by leaving the
+#                      row alone AND counting it toward the block (we
+#                      don't want to accidentally create a duplicate
+#                      draft during a Fiken outage).
+
+
+async def _mark_audit_row_stale(
+    company_slug: str, fiken_invoice_id: str
+) -> None:
+    """Stamp sent_at=now on a FikenInvoice row that no longer has a
+    matching draft in Fiken. We use sent_at as the "no longer
+    in-flight" marker — semantically slightly off (the draft was
+    deleted, not sent) but it's the column that already drives the
+    block check + graduation idempotency, and we want the same
+    "this row is done" signal for both cases.
+    """
+    from datetime import datetime, timezone
+
+    async with SessionLocal() as session:
+        stmt = (
+            pg_insert(FikenInvoice)
+            .values(
+                company_slug=company_slug,
+                fiken_invoice_id=fiken_invoice_id,
+                sent_at=datetime.now(timezone.utc),
+            )
+            .on_conflict_do_update(
+                index_elements=["company_slug", "fiken_invoice_id"],
+                set_={"sent_at": datetime.now(timezone.utc)},
+            )
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+async def _live_unsent_invoice_ids_for_project(
+    company_slug: str,
+    project_page_id: str,
+    *,
+    invoice_type: str | None = None,
+) -> set[str]:
+    """Return the set of FikenInvoice.fiken_invoice_id rows for this
+    project that BOTH have sent_at NULL in Postgres AND still exist
+    as drafts in Fiken. Self-heals stale rows by stamping sent_at on
+    any candidate whose draft is "gone" in Fiken.
+
+    `invoice_type` (None | "oppstart" | "slutt"):
+      - None     — return ALL unsent drafts regardless of type (used
+                   by the slutt math, which needs every draft's NOK
+                   to subtract from the remaining).
+      - "oppstart" / "slutt" — return only drafts of the matching type
+                   (used by the block check, scoped per-mode so an
+                   unsent oppstart doesn't block a slutt click).
+
+    Treats Fiken errors as fail-safe (counts toward the in-flight set).
+    """
+    async with SessionLocal() as session:
+        clauses = [
+            FikenInvoice.company_slug == company_slug,
+            FikenInvoice.project_page_id == project_page_id,
+            FikenInvoice.sent_at.is_(None),
+        ]
+        if invoice_type is not None:
+            clauses.append(FikenInvoice.invoice_type == invoice_type)
+        stmt = select(FikenInvoice.fiken_invoice_id).where(*clauses)
+        candidates = list((await session.execute(stmt)).scalars())
+
+    live_ids: set[str] = set()
+    for draft_id in candidates:
+        if not draft_id:
+            continue
+        status = await fiken_client.check_draft_exists(
+            company_slug, draft_id
+        )
+        if status == "exists":
+            live_ids.add(draft_id)
+        elif status == "gone":
+            logger.info(
+                "send_faktura: stale FikenInvoice row for draft_id=%s "
+                "(Fiken says gone) — marking sent_at and dropping from "
+                "the in-flight set.",
+                draft_id,
+            )
+            await _mark_audit_row_stale(company_slug, draft_id)
+        else:  # "unknown" — fail-safe.
+            logger.warning(
+                "send_faktura: could not verify draft %s against Fiken "
+                "(check returned 'unknown'); counting toward the "
+                "in-flight set.",
+                draft_id,
+            )
+            live_ids.add(draft_id)
+    return live_ids
+
+
+async def _project_has_unsent_draft(
+    company_slug: str, project_page_id: str, *, invoice_type: str
+) -> bool:
+    """True iff this project has at least one unsent FikenInvoice row
+    of the given invoice_type ('oppstart' or 'slutt') whose draft is
+    verified to still exist in Fiken.
+
+    Per-type so an unsent oppstart draft doesn't block a slutt click
+    (the slutt math separately subtracts the draft's NOK so we don't
+    double-bill).
+    """
+    return bool(
+        await _live_unsent_invoice_ids_for_project(
+            company_slug, project_page_id, invoice_type=invoice_type
+        )
+    )
+
+
+async def _unsent_oppgave_billed_ore_for_project(
+    company_slug: str, project_page_id: str
+) -> dict[str, int]:
+    """Map of oppgave_page_id -> sum of billed_amount_ore across all
+    unsent FikenInvoiceLine rows for this project (any mode).
+
+    Used by slutt math: `remaining = gross − Fakturert beløp − unsent
+    drafted amount for this Oppgave`. So if oppstart has been drafted
+    but not yet sent (Fakturert beløp still 0), slutt sees the drafted
+    amount and bills only the remainder — over-billing impossible.
+    """
+    live_ids = await _live_unsent_invoice_ids_for_project(
+        company_slug, project_page_id, invoice_type=None
+    )
+    if not live_ids:
+        return {}
+    async with SessionLocal() as session:
+        stmt = select(
+            FikenInvoiceLine.oppgave_page_id,
+            FikenInvoiceLine.billed_amount_ore,
+        ).where(
+            FikenInvoiceLine.company_slug == company_slug,
+            FikenInvoiceLine.fiken_invoice_id.in_(live_ids),
+        )
+        out: dict[str, int] = {}
+        for oppgave_id, amount in (await session.execute(stmt)).all():
+            if not oppgave_id:
+                continue
+            out[oppgave_id] = out.get(oppgave_id, 0) + int(amount or 0)
+        return out
+
+
+async def _unsent_oppgave_ids_for_project(
+    company_slug: str,
+    project_page_id: str,
+    *,
+    invoice_type: str | None = None,
+) -> set[str]:
+    """Set of Oppgave page ids that appear on at least one unsent
+    draft for this project. Filters through the live-draft check so
+    a stale FikenInvoice row doesn't permanently keep its Oppgaver
+    in the "on a draft" set.
+
+    `invoice_type` (None | "oppstart" | "slutt"): when set, scopes
+    to drafts of that mode only (used by the eligibility filter to
+    skip rows already on a same-mode unsent draft).
+    """
+    live_ids = await _live_unsent_invoice_ids_for_project(
+        company_slug, project_page_id, invoice_type=invoice_type
+    )
+    if not live_ids:
+        return set()
+    async with SessionLocal() as session:
+        stmt = select(FikenInvoiceLine.oppgave_page_id).where(
+            FikenInvoiceLine.company_slug == company_slug,
+            FikenInvoiceLine.fiken_invoice_id.in_(live_ids),
+        )
+        rows = (await session.execute(stmt)).scalars()
+        return {oppgave_id for oppgave_id in rows if oppgave_id}
 
 
 # ============================================================
@@ -1189,6 +1423,491 @@ async def _set_fakturamottaker_orgnr(fakt_id: str, orgnr: str) -> None:
 # ============================================================
 
 
+async def _create_kreditnota_drafts(
+    *,
+    project_page_id: str,
+    project_page: dict[str, Any],
+    project_title: str,
+    result: InvoiceCreateResult,
+) -> InvoiceCreateResult:
+    """Kreditering branch: create one draft kreditnota for every sent
+    FikenInvoice on this project that doesn't already have an unsent
+    or sent kreditnota.
+
+    Each kreditnota draft mirrors the parent invoice's lines exactly
+    (positive quantities + positive unitPrice; Fiken negates on Send).
+    The customer + reference + invoiceText come from the parent.
+
+    Idempotency: the per-mode block check finds existing unsent
+    kreditnota drafts for THIS project and refuses to create
+    duplicates. The per-parent check looks at FakturaNotionCache —
+    if a "kreditnota" cache row already exists for an
+    associatedInvoiceId, we skip that parent (already covered).
+    """
+    from gb_automations.models import FakturaNotionCache
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        result.action = "failed"
+        result.note = "FIKEN_COMPANY_SLUG not set"
+        return result
+
+    # 1. Same-mode block check. The operator may have clicked Til
+    # kreditering twice; the first click's drafts are still in flight.
+    # Honor it.
+    if await _project_has_unsent_draft(
+        company_slug, project_page_id, invoice_type="kreditering"
+    ):
+        logger.info(
+            "send_faktura(kreditering): project %r already has unsent "
+            "kreditnota drafts — blocking. Send or delete the existing "
+            "ones in Fiken first.",
+            project_title or project_page_id,
+        )
+        result.action = "skipped"
+        result.note = (
+            "An unsent kreditnota draft already exists for this project. "
+            "Send or delete it in Fiken before clicking Send faktura "
+            "again for Til kreditering."
+        )
+        return result
+
+    # 2. Find every sent FikenInvoice for this project. Skip ones we've
+    # already kreditnotaed (Faktura DB cache has a "kreditnota" row
+    # referencing them).
+    async with SessionLocal() as session:
+        stmt = select(FikenInvoice).where(
+            FikenInvoice.company_slug == company_slug,
+            FikenInvoice.project_page_id == project_page_id,
+            FikenInvoice.sent_at.is_not(None),
+            FikenInvoice.invoice_type.in_(("oppstart", "slutt")),
+        )
+        sent_parents = list((await session.execute(stmt)).scalars())
+
+    if not sent_parents:
+        logger.info(
+            "send_faktura(kreditering): project %r has no sent fakturas "
+            "to credit — nothing to do.",
+            project_title or project_page_id,
+        )
+        result.action = "skipped"
+        result.note = (
+            "No sent invoices to credit. Either there's nothing sent yet, "
+            "or the project hasn't been graduated via Sjekk fiken so we "
+            "don't know about the sent invoices."
+        )
+        return result
+
+    # 3. For each sent parent, skip if already credited.
+    #    Duplicate-detection strategy: parse "Kreditnota for faktura
+    #    {N}" out of each existing kreditnota's Kommentar (the pattern
+    #    OUR Til kreditering flow stamps). Match against the parent
+    #    audit row's invoice_number (graduation populated this).
+    #    Mirrors the kreditnota match strategy on the Sjekk fiken side.
+    import re
+
+    parent_no_re = re.compile(
+        r"kreditnota\s+for\s+faktura\s+(\d+)", re.IGNORECASE
+    )
+
+    async with SessionLocal() as session:
+        stmt = select(FakturaNotionCache.fiken_record_id).where(
+            FakturaNotionCache.company_slug == company_slug,
+            FakturaNotionCache.record_type == "kreditnota",
+        )
+        existing_cn_ids = list((await session.execute(stmt)).scalars())
+
+    credited_parent_numbers: set[str] = set()
+    for cn_id in existing_cn_ids:
+        try:
+            async with await fiken_client._client() as client:
+                cn_resp = await client.get(
+                    f"/companies/{company_slug}/creditNotes/{cn_id}"
+                )
+                if cn_resp.status_code == 200:
+                    cn_data = cn_resp.json()
+                    # Two paths to "this kreditnota covers parent X":
+                    #   - associatedInvoiceId set (Fiken-UI-created)
+                    #     → look up parent's invoice_number from our
+                    #       audit table
+                    #   - creditNoteText / invoiceText carries
+                    #     "Kreditnota for faktura {N}" (our flow)
+                    associated = str(
+                        cn_data.get("associatedInvoiceId") or ""
+                    )
+                    if associated:
+                        # Walk audit rows to find which one's
+                        # sent-side sale id is associated. Cheap.
+                        for cand in sent_parents:
+                            if cand.invoice_number:
+                                credited_parent_numbers.add(
+                                    str(cand.invoice_number)
+                                )
+                                # Stop early would need an extra
+                                # lookup; cheap to add all matching
+                                # candidates instead.
+                    cn_text = (
+                        cn_data.get("creditNoteText")
+                        or cn_data.get("invoiceText")
+                        or ""
+                    )
+                    m = parent_no_re.search(cn_text)
+                    if m:
+                        credited_parent_numbers.add(m.group(1))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 4. Filter to parents not yet credited.
+    parents_to_credit: list[FikenInvoice] = []
+    for parent in sent_parents:
+        parent_no = str(parent.invoice_number) if parent.invoice_number else None
+        if parent_no and parent_no in credited_parent_numbers:
+            logger.info(
+                "send_faktura(kreditering): parent invoice %s "
+                "(number=%s) already has a kreditnota — skipping.",
+                parent.fiken_invoice_id,
+                parent_no,
+            )
+            continue
+        parents_to_credit.append(parent)
+
+    if not parents_to_credit:
+        result.action = "skipped"
+        result.note = (
+            "Every sent invoice on this project already has a kreditnota. "
+            "Nothing more to credit."
+        )
+        return result
+
+    # 5. Resolve customer + Brreg context from the project's
+    #    Fakturamottaker (same code path Send faktura uses for new
+    #    invoices). Customer is the same entity that was originally
+    #    billed.
+    orgnr, fakturamottaker_name = await _resolve_project_orgnr(
+        project_page
+    )
+    customer_id: int | None = None
+    if orgnr:
+        try:
+            customers = await fiken_client.list_contacts(
+                company_slug, customer=True
+            )
+            for c in customers:
+                if _normalize_orgnr(
+                    c.get("organizationNumber")
+                ) == orgnr:
+                    customer_id = c.get("contactId")
+                    break
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "send_faktura(kreditering): list_contacts failed: %s",
+                err,
+            )
+    if customer_id is None:
+        # Same fallback Send faktura uses: link to the shared
+        # "Mangler kunde" placeholder so Fiken accepts the draft.
+        customer_id = await _ensure_placeholder_contact(company_slug)
+        if customer_id is None:
+            result.action = "failed"
+            result.note = (
+                "Could not resolve a customer for kreditnota draft "
+                "(no Fakturamottaker Orgnr + placeholder unavailable)."
+            )
+            return result
+
+    # 6. Create one draft kreditnota per parent. Each draft mirrors
+    #    the parent's audit lines: one kreditnota line per
+    #    FikenInvoiceLine, with the same billed_amount_ore. Description
+    #    comes from the Oppgave's current title (live read).
+    last_draft_url: str | None = None
+    drafts_created = 0
+    issue_date = datetime.now(UTC).date().isoformat()
+    bank_account_number = await _ensure_bank_account_number(company_slug)
+
+    for parent in parents_to_credit:
+        # Load the audit lines for this parent.
+        async with SessionLocal() as session:
+            stmt = select(FikenInvoiceLine).where(
+                FikenInvoiceLine.company_slug == parent.company_slug,
+                FikenInvoiceLine.fiken_invoice_id
+                == parent.fiken_invoice_id,
+            )
+            audit_lines = list((await session.execute(stmt)).scalars())
+
+        if not audit_lines:
+            logger.warning(
+                "send_faktura(kreditering): parent %s has no audit "
+                "lines — skipping (operator should kreditnota in "
+                "Fiken's UI manually).",
+                parent.fiken_invoice_id,
+            )
+            continue
+
+        # Build the kreditnota lines from the audit trail PLUS each
+        # Oppgave's current Notion data. The audit table gives us the
+        # billed NOK (audit.billed_amount_ore — the canonical "what was
+        # actually invoiced"); the Notion row gives us productId,
+        # unitPrice (Pris), discount (Rabatt), description, comment.
+        #
+        # Back-derivation: we have `billed = quantity × unitPrice ×
+        # (1 - discount)`. Solving for quantity:
+        #   quantity = billed / (unitPrice × (1 - discount))
+        # This faithfully reproduces the original "Antall 0.5, Pris kr X,
+        # Rabatt Y%" shape on the printed kreditnota. If Pris was
+        # renegotiated since the invoice, the printed Antall looks
+        # different but the net still equals the audit billed amount.
+        cn_lines: list[dict[str, Any]] = []
+        for audit in audit_lines:
+            if not audit.oppgave_page_id:
+                # No Oppgave to read Pris/Rabatt/Kategori from — fall
+                # back to a single free-text line at the audit amount.
+                cn_lines.append(
+                    {
+                        "description": audit.discipline or "Faktura",
+                        "unitPrice": int(audit.billed_amount_ore),
+                        "quantity": 1.0,
+                        "vatType": "HIGH",
+                        "incomeAccount": FIKEN_FREE_TEXT_INCOME_ACCOUNT,
+                    }
+                )
+                continue
+
+            try:
+                opp_page = await notion_client.get_page(
+                    audit.oppgave_page_id
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning(
+                    "send_faktura(kreditering): could not read Oppgave "
+                    "%s for line context (%s) — falling back to bare "
+                    "amount.",
+                    audit.oppgave_page_id,
+                    err,
+                )
+                cn_lines.append(
+                    {
+                        "description": audit.discipline or "Faktura",
+                        "unitPrice": int(audit.billed_amount_ore),
+                        "quantity": 1.0,
+                        "vatType": "HIGH",
+                        "incomeAccount": FIKEN_FREE_TEXT_INCOME_ACCOUNT,
+                    }
+                )
+                continue
+
+            # ---- Pris, Rabatt, productId, description, comment ----
+            raw_price = notion_client.read_number_prop(
+                opp_page, OPPGAVER_PROPS["price_per_row"]
+            )
+            price_nok = (
+                float(raw_price)
+                if raw_price is not None and raw_price > 0
+                else 0.0
+            )
+            discount_fraction = (
+                notion_client.read_number_prop(
+                    opp_page, OPPGAVER_PROPS["discount_pct"]
+                )
+                or 0.0
+            )
+            discount_fraction = max(
+                0.0, min(float(discount_fraction), 1.0)
+            )
+            unit_price_ore = int(round(price_nok * 100))
+
+            kategori = _resolve_kategori_label(opp_page)
+            product_id: int | None = None
+            if kategori:
+                try:
+                    product_id = await _resolve_kategori_to_product_id(
+                        company_slug, kategori
+                    )
+                except Exception:  # noqa: BLE001
+                    product_id = None
+
+            description = _line_product_name(opp_page, kategori)
+            if not description:
+                canonical = _normalize_discipline(
+                    notion_client.task_discipline(opp_page)
+                )
+                if canonical:
+                    description = _DISCIPLINE_FALLBACK_NAMES.get(
+                        canonical, canonical.title()
+                    )
+            if not description:
+                description = audit.oppgave_page_id
+            comment = _line_comment(opp_page)
+
+            # ---- Back-derive quantity so net = audit amount ----
+            #   billed = quantity × unitPrice × (1 - discount)
+            # → quantity = billed / (unitPrice × (1 - discount))
+            # Edge cases: kr 0 unitPrice or 100% discount → fall back
+            # to (quantity=1, unitPrice=audit_amount) since the math
+            # can't be expressed in the (Pris, Antall, Rabatt) shape.
+            denom = unit_price_ore * (1.0 - discount_fraction)
+            if denom > 0:
+                quantity = audit.billed_amount_ore / denom
+                cn_unit_price_ore = unit_price_ore
+            else:
+                quantity = 1.0
+                cn_unit_price_ore = int(audit.billed_amount_ore)
+
+            cn_line: dict[str, Any] = {
+                "description": description,
+                "unitPrice": cn_unit_price_ore,
+                "quantity": round(quantity, 6),
+                "vatType": "HIGH",
+            }
+            if discount_fraction > 0:
+                cn_line["discount"] = round(
+                    discount_fraction * 100.0, 4
+                )
+            if comment:
+                cn_line["comment"] = comment
+            if product_id is not None:
+                cn_line["productId"] = product_id
+            else:
+                cn_line["incomeAccount"] = FIKEN_FREE_TEXT_INCOME_ACCOUNT
+            cn_lines.append(cn_line)
+
+        # Reference fields: use the parent's invoice_number for clarity
+        # ("Kreditnota for faktura 10058"), project title as Vår ref,
+        # and the project's Faktura merkes as Deres ref (same source as
+        # the original invoice so the printed kreditnota matches its
+        # parent's reference block).
+        parent_no = parent.invoice_number or "ukjent"
+        cn_text = f"Kreditnota for faktura {parent_no}"
+        cn_our_ref = project_title or project_page_id
+        cn_your_ref = (
+            notion_client.read_rich_text_prop(
+                project_page, PROJECTS_FAKTURA_MERKES_PROP
+            )
+            or ""
+        ).strip() or None
+
+        try:
+            draft = await fiken_client.create_credit_note_draft(
+                company_slug,
+                customer_id=customer_id,
+                issue_date=issue_date,
+                days_until_due_date=DEFAULT_DAYS_UNTIL_DUE_DATE,
+                reference=cn_our_ref,
+                lines=cn_lines,
+                your_reference=cn_your_ref,
+                credit_note_text=cn_text,
+                bank_account_number=bank_account_number,
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.exception(
+                "send_faktura(kreditering): create_credit_note_draft "
+                "failed for parent %s",
+                parent.fiken_invoice_id,
+            )
+            result.note = (
+                f"Failed to create kreditnota draft for parent "
+                f"{parent.fiken_invoice_id}: {err}"
+            )
+            # Continue to the next parent — partial success is useful.
+            continue
+
+        draft_id = (
+            str(draft.get("draftId") or draft.get("id") or "")
+            or (draft.get("Location") or "").rsplit("/", 1)[-1]
+        )
+        if not draft_id:
+            logger.warning(
+                "send_faktura(kreditering): Fiken accepted the draft "
+                "but the response carries no draftId/id: %s",
+                draft,
+            )
+            continue
+
+        # Fetch the uuid for the URL writeback.
+        draft_uuid: str | None = None
+        try:
+            full_draft = await fiken_client.get_credit_note_draft(
+                company_slug, draft_id
+            )
+            uu = full_draft.get("uuid")
+            if uu:
+                draft_uuid = str(uu)
+                last_draft_url = (
+                    f"https://fiken.no/foretak/{company_slug}/"
+                    f"fakturautkast/{uu}"
+                )
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "send_faktura(kreditering): GET draft %s for uuid "
+                "failed: %s",
+                draft_id,
+                err,
+            )
+
+        # Audit trail: store the kreditnota draft as a FikenInvoice
+        # with invoice_type="kreditering". The block check + sjekk-
+        # fiken graduation paths both branch on invoice_type, so this
+        # stays out of the oppstart/slutt math.
+        async with SessionLocal() as session:
+            await session.execute(
+                pg_insert(FikenInvoice)
+                .values(
+                    company_slug=company_slug,
+                    fiken_invoice_id=draft_id,
+                    project_page_id=project_page_id,
+                    invoice_type="kreditering",
+                    invoice_fraction=1.0,
+                    draft_uuid=draft_uuid,
+                )
+                .on_conflict_do_update(
+                    index_elements=["company_slug", "fiken_invoice_id"],
+                    set_={
+                        "project_page_id": project_page_id,
+                        "invoice_type": "kreditering",
+                        "invoice_fraction": 1.0,
+                        "draft_uuid": draft_uuid,
+                    },
+                )
+            )
+            await session.commit()
+
+        drafts_created += 1
+        logger.info(
+            "✅ send_faktura(kreditering): created kreditnota draft %s "
+            "for parent invoice %s",
+            draft_id,
+            parent.fiken_invoice_id,
+        )
+
+    # 5. Write the most recent draft URL to Faktura utkast on the
+    # project. With multiple drafts, this is the last one; operator
+    # clicks through to Fiken's fakturautkast list to see them all.
+    # (Empirically pinned: Fiken's web UI uses /fakturautkast/{uuid}
+    # for BOTH invoice and kreditnota drafts — there is no separate
+    # /kreditnotautkast/ path.)
+    if last_draft_url:
+        try:
+            await notion_client.set_project_draft_url(
+                project_page_id, url=last_draft_url
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "send_faktura(kreditering): failed to write draft URL "
+                "on %s: %s",
+                project_page_id,
+                err,
+            )
+
+    result.action = "created" if drafts_created > 0 else "failed"
+    if drafts_created > 0:
+        result.note = (
+            f"Created {drafts_created} kreditnota draft(s). Open each in "
+            "Fiken to review + click Send. Then click Sjekk fiken to pull "
+            "them into Notion."
+        )
+        result.lines_created = drafts_created
+    return result
+
+
 async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
     """Worker entrypoint for a `send_faktura` task.
 
@@ -1237,6 +1956,50 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
         return result
     result.invoice_type = invoice_type
 
+    # Kreditering branch: inverts the engine. Instead of creating new
+    # outgoing-money drafts (oppstart/slutt), creates draft kreditnotas
+    # that reverse every sent FikenInvoice on this project not already
+    # credited. Skips the Oppgaver / Pris pipeline entirely — kreditnota
+    # lines are built by mirroring the parent invoice's actual lines.
+    if invoice_type == "kreditering":
+        return await _create_kreditnota_drafts(
+            project_page_id=project_page_id,
+            project_page=project_page,
+            project_title=project_title,
+            result=result,
+        )
+
+    # Block if this project already has an unsent draft of the SAME
+    # mode (oppstart blocks oppstart, slutt blocks slutt). Different
+    # modes are allowed — an unsent oppstart draft does NOT block a
+    # slutt click, because:
+    #   - The math is still safe: slutt computes `remaining = gross −
+    #     Fakturert beløp − unsent drafted NOK` (see
+    #     _unsent_oppgave_billed_ore_for_project), so the unsent
+    #     oppstart's amount gets subtracted and slutt bills only the
+    #     remainder.
+    #   - Operationally common: CEO sits on an oppstart draft for
+    #     weeks; we shouldn't permanently block slutt for a different
+    #     project phase.
+    if await _project_has_unsent_draft(
+        company_slug, project_page_id, invoice_type=invoice_type
+    ):
+        logger.info(
+            "send_faktura: project %r already has an unsent %s draft — "
+            "blocking same-mode re-click. Send or delete the existing "
+            "draft in Fiken before clicking Send faktura again for %s.",
+            project_title or project_page_id,
+            invoice_type,
+            invoice_type,
+        )
+        result.action = "skipped"
+        result.note = (
+            f"An unsent Fiken {invoice_type} draft already exists for "
+            f"this project. Send or delete it in Fiken before clicking "
+            f"Send faktura again for {invoice_type}."
+        )
+        return result
+
     # Deres referanse, optional.
     your_reference = (
         notion_client.read_rich_text_prop(
@@ -1256,7 +2019,19 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
         result.note = f"Notion oppgaver_for_project: {err}"
         return result
 
-    eligible = _eligible_rows(rows, invoice_type)
+    # Belt-and-suspenders: even though the per-mode block check at
+    # the top of this function should prevent us getting here when a
+    # same-mode unsent draft exists, pull the set of Oppgave page ids
+    # currently on a same-mode unsent draft and pass it to the
+    # eligibility filter. Scoped per-mode so a row on an unsent
+    # oppstart draft is still eligible for slutt (the math subtracts
+    # the unsent NOK separately).
+    rows_on_unsent_drafts = await _unsent_oppgave_ids_for_project(
+        company_slug, project_page_id, invoice_type=invoice_type
+    )
+    eligible = _eligible_rows(
+        rows, invoice_type, rows_on_unsent_drafts=rows_on_unsent_drafts
+    )
     result.eligible_rows = len(eligible)
     if not eligible:
         logger.info(
@@ -1270,10 +2045,21 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
 
     # 3. Build invoice lines. Per-row math is pure; the kategori →
     # productId lookup may hit Fiken on cache miss, so this is async.
+    #
+    # For slutt: pre-fetch the per-Oppgave NOK currently sitting on
+    # unsent drafts (any mode) for this project. The slutt math
+    # subtracts this from `remaining` so an unsent oppstart draft is
+    # treated as already-committed — slutt bills only the leftover.
+    unsent_drafted_ore: dict[str, int] | None = None
+    if invoice_type == "slutt":
+        unsent_drafted_ore = await _unsent_oppgave_billed_ore_for_project(
+            company_slug, project_page_id
+        )
     lines = await _build_line_items(
         eligible,
         invoice_type=invoice_type,
         company_slug=company_slug,
+        unsent_drafted_ore=unsent_drafted_ore,
     )
     if not lines:
         result.action = "skipped"
@@ -1530,7 +2316,13 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
     # The POST response carries only the numeric draftId, but Fiken's UI
     # paths the draft on its `uuid`. Fetch once to read the uuid; degrade
     # to None on failure (the audit trail still preserves the draft_id).
+    #
+    # Phase C.3a — the draft `uuid` is ALSO the FK that lets the poller
+    # match a sent invoice back to this row (Fiken mints a fresh
+    # `invoiceId` at send-time, but `invoiceDraftUuid` on the sent
+    # record == the draft's `uuid`). Stored on FikenInvoice below.
     draft_url: str | None = None
+    draft_uuid_for_audit: str | None = None
     if draft_id:
         try:
             full_draft = await fiken_client.get_invoice_draft(
@@ -1538,6 +2330,7 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
             )
             uuid = full_draft.get("uuid")
             if uuid:
+                draft_uuid_for_audit = str(uuid)
                 draft_url = (
                     f"https://fiken.no/foretak/{company_slug}/fakturautkast/{uuid}"
                 )
@@ -1563,6 +2356,7 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
                     project_page_id=project_page_id,
                     invoice_type=invoice_type,
                     invoice_fraction=invoice_fraction,
+                    draft_uuid=draft_uuid_for_audit,
                 )
                 .on_conflict_do_update(
                     index_elements=["company_slug", "fiken_invoice_id"],
@@ -1570,6 +2364,10 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
                         "project_page_id": project_page_id,
                         "invoice_type": invoice_type,
                         "invoice_fraction": invoice_fraction,
+                        # Update draft_uuid on re-clicks too — Fiken
+                        # could (in theory) re-issue the draft and
+                        # mint a new uuid; the most recent wins.
+                        "draft_uuid": draft_uuid_for_audit,
                     },
                 )
             )
@@ -1596,45 +2394,24 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
                 )
             await session.commit()
 
-    # 8. Stamp each billed Oppgave + Project + draft URL.
-    # The audit trail (step 7) ALREADY persisted what was billed, so a
-    # failure here is a "Notion is out of sync but Fiken + Postgres
-    # agree" condition the operator can repair by hand.
-    new_oppgave_status = (
-        FAKTURERT_STATUS_50 if invoice_type == "oppstart" else FAKTURERT_STATUS_FULL
-    )
-    for line in lines:
-        if not line.oppgave_page_id:
-            continue
-        try:
-            await notion_client.set_oppgave_billed(
-                line.oppgave_page_id,
-                status=new_oppgave_status,
-                billed_amount_nok=line.new_billed_amount_nok,
-            )
-        except Exception as err:  # noqa: BLE001
-            logger.warning(
-                "send_faktura: failed to stamp Oppgave %s: %s",
-                line.oppgave_page_id,
-                err,
-            )
-
-    new_project_status = (
-        FAKTURA_STATUS_OPPSTART_DONE
-        if invoice_type == "oppstart"
-        else FAKTURA_STATUS_FULL_DONE
-    )
-    try:
-        await notion_client.set_project_faktura_status(
-            project_page_id, status=new_project_status
-        )
-    except Exception as err:  # noqa: BLE001
-        logger.warning(
-            "send_faktura: failed to flip project %s Faktura status to %r: %s",
-            project_page_id,
-            new_project_status,
-            err,
-        )
+    # 8. Write the draft URL on the project.
+    #
+    # send_faktura does NOT touch ANY Notion billing field on the
+    # Oppgaver or Project. Both `Fakturert status` (history label)
+    # and `Fakturert beløp` (NOK total) are reserved for the
+    # graduation step (sync/graduate_project.py), which writes them
+    # ONLY after the draft has actually been sent in Fiken.
+    #
+    # The draft-in-flight signal is the `Faktura utkast` URL written
+    # below plus the unsent FikenInvoice row in Postgres (which the
+    # eligibility matrix + block check use). The audit trail
+    # (FikenInvoiceLine, step 7) carries the per-Oppgave NOK that
+    # WILL be added to Fakturert beløp at graduation.
+    #
+    # The reasoning: Notion's billing columns are the source of truth
+    # for "what's actually invoiced." A draft is not invoiced — it's
+    # paperwork awaiting Send. Writing to Fakturert beløp at draft
+    # time would lie about the project's real billed total.
 
     if draft_url:
         try:

@@ -47,6 +47,103 @@ async def _enqueue_toggl_hours_job() -> None:
         )
 
 
+async def _enqueue_fiken_graduations_for_all_active_projects() -> None:
+    """Hourly Fiken-graduation poller.
+
+    Queries the Projects DB for every row whose `Faktura status` is in
+    a non-terminal state (anything except blank / Ikke fakturert /
+    Fakturert / Kreditert) and enqueues a `graduate_faktura` task per
+    project. The worker dispatches each to the same `graduate_project`
+    engine the operator's "Sjekk fiken" button uses.
+
+    The queue's per-project dedup (uq_sync_tasks_active_graduate_
+    faktura) collapses the cron-enqueue with any in-flight operator
+    click, so racing is safe.
+
+    Best-effort overall: any exception during the scan logs + returns
+    (next hour retries). Per-project enqueue failures don't block the
+    rest — they're logged inline.
+    """
+    from gb_automations.clients import notion as notion_client
+    from gb_automations.config import (
+        FAKTURA_STATUS_FULL,
+        FAKTURA_STATUS_IKKE,
+        FAKTURA_STATUS_KREDITERT,
+        PROJECTS_FAKTURA_STATUS_PROP,
+    )
+    from gb_automations.sync.queue import enqueue_graduate_faktura
+
+    if not settings.projects_db_id:
+        logger.info(
+            "⏰ fiken_graduations cron: PROJECTS_DB_ID not set; skipping."
+        )
+        return
+
+    # "Active" = anything not at a terminal end-state. Blank counts as
+    # terminal (operator hasn't queued anything). Most projects in
+    # flight will have one of: Til oppstartsfaktura / Til
+    # avslutningsfaktura / Til fakturering / Til kreditering /
+    # Fakturert 50%.
+    terminal = {
+        None,
+        "",
+        FAKTURA_STATUS_IKKE,
+        FAKTURA_STATUS_FULL,
+        FAKTURA_STATUS_KREDITERT,
+    }
+
+    try:
+        rows = await notion_client.query_database(settings.projects_db_id)
+    except Exception as err:  # noqa: BLE001
+        logger.warning(
+            "⏰ fiken_graduations cron: Projects DB query failed (%s); "
+            "skipping this hour.",
+            err,
+        )
+        return
+
+    enqueued = 0
+    skipped_terminal = 0
+    skipped_dedup = 0
+    errors = 0
+    for row in rows:
+        status = notion_client.read_select_name(
+            row, PROJECTS_FAKTURA_STATUS_PROP
+        )
+        if status in terminal:
+            skipped_terminal += 1
+            continue
+        page_id = row.get("id") or ""
+        if not page_id:
+            continue
+        try:
+            inserted = await enqueue_graduate_faktura(page_id)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "⏰ fiken_graduations cron: enqueue failed for %s: %s",
+                page_id,
+                err,
+            )
+            errors += 1
+            continue
+        if inserted:
+            enqueued += 1
+        else:
+            skipped_dedup += 1
+
+    if enqueued:
+        queue_worker.wake()
+    logger.info(
+        "⏰ fiken_graduations cron: scanned=%d enqueued=%d "
+        "skipped_terminal=%d skipped_dedup=%d errors=%d",
+        len(rows),
+        enqueued,
+        skipped_terminal,
+        skipped_dedup,
+        errors,
+    )
+
+
 async def _frame_token_keepalive() -> None:
     """Force a Frame refresh-token rotation so the 14-day clock can't run out.
 
@@ -87,6 +184,25 @@ def start_scheduler() -> None:
             _enqueue_toggl_hours_job,
             CronTrigger(hour=2, minute=0, timezone="Europe/Oslo"),
             id="toggl_hours_daily",
+            replace_existing=True,
+        )
+
+    # Fiken graduation hourly poller. Replaces the operator's manual
+    # Sjekk fiken click — every hour, scan active projects (anything
+    # not at a terminal Faktura status) and enqueue a graduate_faktura
+    # task per project. Per-project dedup makes this safe even when
+    # the operator clicks Sjekk fiken simultaneously. Gated on the
+    # feature flag so a deploy without Fiken doesn't fire an hourly
+    # task that just skips itself.
+    #
+    # Off-minute timing (minute=7) avoids clustering with the
+    # daily Toggl + Frame jobs at minute=0/30 — keeps each scheduler
+    # tick lightly loaded.
+    if settings.sync_fiken_graduations:
+        scheduler.add_job(
+            _enqueue_fiken_graduations_for_all_active_projects,
+            CronTrigger(minute=7),  # every hour at :07
+            id="fiken_graduations_hourly",
             replace_existing=True,
         )
 

@@ -473,6 +473,9 @@ _ACTIVE_FRAME_FILE_STATUS_PREDICATE = text(
 _ACTIVE_SEND_FAKTURA_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'send_faktura'"
 )
+_ACTIVE_GRADUATE_FAKTURA_PREDICATE = text(
+    "status IN ('pending','in_progress') AND task_type = 'graduate_faktura'"
+)
 _ACTIVE_FIKEN_POLL_PREDICATE = text(
     "status IN ('pending','in_progress') AND task_type = 'fiken_poll'"
 )
@@ -622,12 +625,13 @@ async def enqueue_send_faktura(project_page_id: str) -> int:
     oppstart or slutt) — so collapsing rapid double-clicks of the button
     to one task is correct.
 
-    Dedup key is `project_page_id` alone. The project's `Faktura status`
+    Dedup key is `project_page_id` alone. The project's `Faktura handling`
     can only hold ONE billable state at a time ("Til oppstartsfaktura" or
     "Til avslutningsfaktura"), so there's no need for an invoice_type
     suffix; the engine reads it off the project. After a successful run
-    the engine flips Faktura status to "Oppstart fakturert" / "Fakturert"
-    and the next click is a clean skip.
+    the engine sets `Faktura handling = "Utkast laget"` and the eligibility
+    gate makes the next click a clean skip until the Phase-C poller
+    graduates and clears the handling column.
 
     Returns 1 if newly enqueued, 0 if a duplicate was already active.
     """
@@ -645,6 +649,45 @@ async def enqueue_send_faktura(project_page_id: str) -> int:
         .on_conflict_do_nothing(
             index_elements=["gmail_thread_id"],
             index_where=_ACTIVE_SEND_FAKTURA_PREDICATE,
+        )
+    )
+    async with SessionLocal() as own:
+        result = await own.execute(stmt)
+        await own.commit()
+        return result.rowcount or 0
+
+
+async def enqueue_graduate_faktura(project_page_id: str) -> int:
+    """Enqueue a manual "check Fiken for sent invoices on this project"
+    graduation. Fired by the per-project "Sjekk fiken" Notion button.
+
+    Engine: `sync/graduate_project.py::graduate_project`. Lists every
+    sent invoice on the Fiken side for the project's company, matches
+    each one to this project (via draft_uuid FK or reference.our
+    fallback), writes Faktura DB rows, graduates statuses + Fakturert
+    beløp, clears the draft URL.
+
+    Same dedup shape as send_faktura: at most one in-flight task per
+    project. The button is the operator's manual fallback for the
+    future hourly poller (C.3b) — sometimes the CEO needs invoices in
+    Notion RIGHT NOW, or wants to test the integration without waiting.
+
+    Returns 1 if newly enqueued, 0 if a duplicate was already active.
+    """
+    if not project_page_id:
+        return 0
+
+    stmt = (
+        pg_insert(SyncTask)
+        .values(
+            task_type="graduate_faktura",
+            project_page_id=project_page_id,
+            user_email="*",
+            gmail_thread_id=project_page_id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["gmail_thread_id"],
+            index_where=_ACTIVE_GRADUATE_FAKTURA_PREDICATE,
         )
     )
     async with SessionLocal() as own:

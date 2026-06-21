@@ -490,6 +490,78 @@ async def _process_project_status_dispatch(
     )
 
 
+async def _process_graduate_faktura(
+    claimed: _Claimed, progress: str
+) -> None:
+    """Run a graduate_faktura task: scan Fiken for sent invoices that
+    belong to this project, write Faktura DB rows, graduate statuses
+    + Fakturert beløp, clear the draft URL.
+
+    Engine: `sync/graduate_project.py::graduate_project`. Same engine
+    the future hourly poller (C.3b) will call in a per-project loop.
+    """
+    from gb_automations.sync.graduate_project import graduate_project
+
+    project_page_id = claimed.project_page_id or claimed.gmail_thread_id
+    retry_note = (
+        f" (retry {claimed.attempts}/{MAX_ATTEMPTS})"
+        if claimed.attempts > 1
+        else ""
+    )
+    logger.info(
+        "▶ task %s — graduate_faktura for %s%s",
+        progress,
+        project_page_id,
+        retry_note,
+    )
+
+    await queue_mirror.refresh_project_dot(
+        project_page_id,
+        progress=progress,
+        subject="Sjekk fiken",
+    )
+
+    outcome_error: str | None = None
+    try:
+        if not project_page_id:
+            raise ValueError(
+                "graduate_faktura task has no project_page_id"
+            )
+        summary = await graduate_project(project_page_id)
+        if summary.error:
+            outcome_error = summary.error
+        else:
+            logger.info(
+                "✓ graduate_faktura for %s: scanned=%d matched=%d "
+                "skipped_already=%d skipped_no_match=%d",
+                project_page_id,
+                summary.fiken_invoices_scanned,
+                len(summary.matched),
+                summary.skipped_already_graduated,
+                summary.skipped_no_match,
+            )
+    except Exception as err:
+        log_api_error(
+            logger,
+            f"graduate_faktura crashed for {project_page_id}",
+            err,
+        )
+        outcome_error = describe_error(err)
+
+    await _record_outcome(
+        claimed.id,
+        claimed.attempts,
+        outcome_error,
+        progress=progress,
+        label=str(project_page_id),
+    )
+    await queue_mirror.refresh_project_dot(
+        project_page_id,
+        progress=progress,
+        subject="Sjekk fiken",
+    )
+
+
 async def _process_send_faktura(
     claimed: _Claimed, progress: str
 ) -> None:
@@ -992,6 +1064,9 @@ async def _process(claimed: _Claimed, progress: str) -> None:
         return
     if claimed.task_type == "send_faktura":
         await _process_send_faktura(claimed, progress)
+        return
+    if claimed.task_type == "graduate_faktura":
+        await _process_graduate_faktura(claimed, progress)
         return
     if claimed.task_type == "toggl_project_sync":
         await _process_toggl_project_sync(claimed, progress)

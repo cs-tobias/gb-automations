@@ -477,6 +477,19 @@ _project_pages_cache: dict[str, dict[str, str]] | None = None
 _project_pages_cached_at: float = 0.0
 
 
+async def query_database(db_id: str) -> list[dict[str, Any]]:
+    """Public alias for `_query_projects_db` — every non-archived row
+    in the given Notion database, paginated.
+
+    Generic shape (no project-specific filter), used by Phase C.2's
+    Fakturamottaker-by-Orgnr resolver. The implementation is the same;
+    a thin wrapper rather than aliasing the private name so the API
+    surface is explicit and the private helper stays free to specialize
+    if Projects ever needs project-only filters later.
+    """
+    return await _query_projects_db(db_id)
+
+
 async def _query_projects_db(db_id: str) -> list[dict[str, Any]]:
     """Every non-archived row in the Projects DB, paginated.
 
@@ -1125,48 +1138,42 @@ async def set_deliverable_frame_url(deliverable_page_id: str, url: str | None) -
 async def set_oppgave_billed(
     oppgave_page_id: str,
     *,
-    status: str,
+    status: str | None = None,
     billed_amount_nok: float,
 ) -> None:
-    """Stamp post-billing state on an Oppgave after a Fiken draft is created.
+    """Stamp post-billing state on an Oppgave.
 
-    Sets both `Fakturert status` (Notion `status` property type) and
-    `Fakturert beløp` (number, NOK running total) in a single PATCH so
-    the row is never left in a half-stamped state if the worker dies
-    between writes.
-
-    `status` is the new option name for the `Fakturert status` column.
-    Expected values:
-      - "Fakturert 50%" (after oppstart on a previously `Ikke fakturert` row)
-      - "Fakturert"     (after slutt — fully invoiced)
-    The engine never writes "Ikke fakturert" or "Utgår" here; those are
-    operator states.
+    Always writes `Fakturert beløp` (running NOK total). Optionally also
+    writes `Fakturert status` if `status` is provided — but Phase C uses
+    a separate `Faktura handling` column for the draft-in-flight state,
+    so `send_faktura` passes `status=None` here (writes only the NOK
+    total) and uses `set_oppgave_handling` for "Utkast 50%" / "Utkast
+    100%". The poller is the only writer that fills `Fakturert status`
+    going forward.
 
     `billed_amount_nok` is the NEW running total of NOK invoiced on this
-    row across ALL drafts (caller computes `existing + this_run`). Written
-    as-is — no addition done here.
+    row across ALL drafts (caller computes `existing + this_run`).
 
-    Notion property type: `status` (not `select`). Configured this way
-    on the CEO's instruction — every one-of-many billing column in the
-    workspace uses Notion's Status type. The reader (`read_select_name`)
-    handles both shapes via fallback, so a misconfigured column still
-    reads cleanly, but writes go to `{"status": {...}}` here. If you
-    flip the column to a Select in Notion, this PATCH will 400 with
-    "status is not a valid property type"; switch the wrapper or revert
-    the column.
+    Notion property type for `Fakturert status`: `status` (not `select`).
+    The reader (`read_select_name`) handles both shapes via fallback;
+    writes go to `{"status": {...}}` here.
 
-    Idempotent: PATCHing the same option + number is a Notion no-op.
+    Idempotent: PATCHing the same values is a Notion no-op.
     """
-    props = {
-        OPPGAVER_PROPS["billed_status"]: {"status": {"name": status}},
+    props: dict = {
         OPPGAVER_PROPS["billed_amount"]: {"number": float(billed_amount_nok)},
     }
+    if status is not None:
+        props[OPPGAVER_PROPS["billed_status"]] = {"status": {"name": status}}
+    op_label = f"billed_amount={billed_amount_nok}"
+    if status is not None:
+        op_label += f" status={status!r}"
     async with _client() as client:
         response = await _with_retries(
             lambda: client.patch(
                 f"/pages/{oppgave_page_id}", json={"properties": props}
             ),
-            op_name=f"PATCH /pages/{oppgave_page_id} fiken billing state ({status})",
+            op_name=f"PATCH /pages/{oppgave_page_id} fiken billing state ({op_label})",
         )
         _raise_for_status(response)
 

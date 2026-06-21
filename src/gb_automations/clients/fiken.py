@@ -326,6 +326,117 @@ async def list_contacts(
     return rows
 
 
+async def get_contact(company_slug: str, contact_id: str) -> dict[str, Any] | None:
+    """`GET /companies/{slug}/contacts/{id}` — single contact lookup.
+
+    Used by Phase C.2's Faktura DB writer to walk
+    customer.contactId → organizationNumber so we can match the Fiken
+    customer to a Notion Fakturamottaker row (by Orgnr).
+
+    Returns the contact dict on 200, None on 404 or any other error.
+    Best-effort: a missing contact is logged at INFO and the caller
+    leaves the Fakturamottaker relation blank — Notion is fine with
+    that, and the operator can hand-link.
+    """
+    async with await _client() as client:
+        try:
+            response = await _with_retries(
+                lambda: client.get(
+                    f"/companies/{company_slug}/contacts/{contact_id}"
+                ),
+                op_name="get_contact",
+            )
+        except Exception:  # noqa: BLE001
+            return None
+    if response.status_code == 404:
+        return None
+    if response.status_code >= 400:
+        return None
+    return response.json()
+
+
+async def list_sent_invoices(
+    company_slug: str,
+    *,
+    issue_date_ge: str | None = None,
+) -> list[dict[str, Any]]:
+    """`GET /companies/{slug}/invoices` — every SENT invoice, paginated.
+
+    Drafts live at the separate /invoices/drafts path and are NOT
+    returned here. Presence on this endpoint IS the "sent" signal.
+
+    `issue_date_ge` is optional `YYYY-MM-DD`. When set, the response
+    is filtered to invoices issued on or after that date (Fiken's
+    `issueDateGe` param). The Phase C.3a manual trigger doesn't
+    use this (it scans all sent invoices for the project and lets
+    the matching logic decide); the future hourly poller will pass
+    a small lookback window. Pagination is 0-indexed (see
+    list_contacts docstring).
+    """
+    rows: list[dict[str, Any]] = []
+    page = 0
+    async with await _client() as client:
+        while True:
+            params: dict[str, Any] = {"page": page, "pageSize": 100}
+            if issue_date_ge:
+                params["issueDateGe"] = issue_date_ge
+            response = await _with_retries(
+                lambda p=params: client.get(
+                    f"/companies/{company_slug}/invoices",
+                    params=p,
+                ),
+                op_name="list_sent_invoices",
+            )
+            _raise_for_status(response)
+            data = _unwrap_list(response.json())
+            if not data:
+                break
+            rows.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+    return rows
+
+
+async def list_credit_notes(
+    company_slug: str,
+    *,
+    issue_date_ge: str | None = None,
+) -> list[dict[str, Any]]:
+    """`GET /companies/{slug}/creditNotes` — every credit note, paginated.
+
+    Mirrors list_sent_invoices. The poller writes Faktura DB rows
+    with Type=Kreditnota for each one. The Phase C.3a manual
+    trigger does NOT scan credit notes (a project-scoped trigger
+    matches by project relation, and credit notes don't always
+    carry a clean reference.our we can match on). They land via
+    the future hourly poller (C.3b).
+    """
+    rows: list[dict[str, Any]] = []
+    page = 0
+    async with await _client() as client:
+        while True:
+            params: dict[str, Any] = {"page": page, "pageSize": 100}
+            if issue_date_ge:
+                params["issueDateGe"] = issue_date_ge
+            response = await _with_retries(
+                lambda p=params: client.get(
+                    f"/companies/{company_slug}/creditNotes",
+                    params=p,
+                ),
+                op_name="list_credit_notes",
+            )
+            _raise_for_status(response)
+            data = _unwrap_list(response.json())
+            if not data:
+                break
+            rows.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+    return rows
+
+
 async def list_products(company_slug: str) -> list[dict[str, Any]]:
     """`GET /companies/{slug}/products` — paginated.
 
@@ -423,6 +534,45 @@ async def get_invoice_draft(
         )
         _raise_for_status(response)
         return response.json()
+
+
+async def check_draft_exists(
+    company_slug: str, draft_id: str
+) -> str:
+    """`GET /companies/{slug}/invoices/drafts/{id}` — non-raising lookup.
+
+    Returns one of three strings:
+      "exists"   — Fiken returned 200, the draft is still unsent.
+      "gone"     — Fiken returned 404, the draft was deleted or sent.
+                   (When sent, Fiken moves it from /drafts/{id} to
+                   /invoices/{newId}; the draft path 404s. Either way,
+                   it's no longer an unsent draft.)
+      "unknown"  — Network error, 5xx, or other non-2xx/non-404. Caller
+                   should fail-safe (NOT cleanup our audit row) to avoid
+                   accidentally unblocking a real in-flight draft during
+                   a Fiken outage.
+
+    Sibling of `get_invoice_draft` (which raises on non-2xx). Used by
+    `_project_has_unsent_draft` to verify our Postgres audit state
+    matches Fiken before blocking a Send-faktura click — operators
+    can delete drafts in Fiken's UI without telling us, so the
+    Postgres row alone can be stale.
+    """
+    try:
+        async with await _client() as client:
+            response = await _with_retries(
+                lambda: client.get(
+                    f"/companies/{company_slug}/invoices/drafts/{draft_id}"
+                ),
+                op_name="check_draft_exists",
+            )
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if response.status_code == 200:
+        return "exists"
+    if response.status_code == 404:
+        return "gone"
+    return "unknown"
 
 
 async def create_invoice_draft(
@@ -540,6 +690,99 @@ async def create_invoice_draft(
             pass
         location = response.headers.get("Location") or ""
         return {"Location": location}
+
+
+async def create_credit_note_draft(
+    company_slug: str,
+    *,
+    customer_id: int | None,
+    issue_date: str,
+    days_until_due_date: int,
+    reference: str,
+    lines: list[dict[str, Any]],
+    currency: str = "NOK",
+    your_reference: str | None = None,
+    credit_note_text: str | None = None,
+    bank_account_number: str | None = None,
+) -> dict[str, Any]:
+    """`POST /companies/{slug}/creditNotes/drafts` — create a DRAFT
+    kreditnota. Mirrors `create_invoice_draft` but POSTs to the
+    creditNotes endpoint with `type="credit_note"`.
+
+    Body shape is identical to invoice drafts (Fiken's
+    `invoiceishDraftRequest` schema is shared). Empirically pinned
+    via probe (2026-06-21): `type` must be the literal string
+    `"credit_note"` (underscore, not `creditNote` / `kreditnota` —
+    those all 400 with "type er påkrevd").
+
+    Sign convention: send POSITIVE quantities + positive unitPrice
+    exactly like an invoice draft. Fiken's UI shows them positive on
+    the draft; the sign flip to negative net happens only when the
+    user clicks Send (the resulting sent credit note carries
+    negative net/gross). So pass amounts in their natural positive
+    form — the engine doesn't need to negate anything.
+
+    `credit_note_text` is sent as `invoiceText` (NOT `creditNoteText`).
+    Empirically pinned: the kreditnota DRAFT endpoint shares the
+    `invoiceishDraftRequest` schema with the invoice draft endpoint
+    so it expects `invoiceText`. The `creditNoteText` field only
+    appears on SENT kreditnotas (Fiken renames it server-side at Send
+    time). Both represent the same Kommentar shown above the line
+    items on the printed document.
+
+    Returns the created draft dict (carries `draftId`).
+    """
+    body: dict[str, Any] = {
+        "type": "credit_note",
+        "issueDate": issue_date,
+        "daysUntilDueDate": days_until_due_date,
+        "currency": currency,
+        REFERENCE_FIELD: reference,
+        "lines": lines,
+    }
+    if customer_id is not None:
+        body["customerId"] = customer_id
+    if your_reference:
+        body["yourReference"] = your_reference
+    if credit_note_text:
+        body["invoiceText"] = credit_note_text
+    if bank_account_number:
+        body["bankAccountNumber"] = bank_account_number
+
+    async with await _client() as client:
+        response = await _with_retries(
+            lambda: client.post(
+                f"/companies/{company_slug}/creditNotes/drafts", json=body
+            ),
+            op_name="create_credit_note_draft",
+        )
+        _raise_for_status(response)
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        location = response.headers.get("Location") or ""
+        return {"Location": location}
+
+
+async def get_credit_note_draft(
+    company_slug: str, draft_id: str
+) -> dict[str, Any]:
+    """`GET /companies/{slug}/creditNotes/drafts/{id}` — read a single
+    kreditnota draft. Mirrors `get_invoice_draft`: used to fetch the
+    draft's `uuid` after creation so we can build the Fiken UI URL
+    (which paths on uuid, not numeric draftId)."""
+    async with await _client() as client:
+        response = await _with_retries(
+            lambda: client.get(
+                f"/companies/{company_slug}/creditNotes/drafts/{draft_id}"
+            ),
+            op_name="get_credit_note_draft",
+        )
+        _raise_for_status(response)
+        return response.json()
 
 
 __all__ = [

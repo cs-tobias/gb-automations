@@ -324,6 +324,19 @@ class Settings(BaseSettings):
     # The Toggl→Notion user attribution is by email match: each Toggl user's
     # email must equal a Notion workspace user's email. No manual mapping.
     sync_toggl_hours: bool = False
+    # Phase C.3b — hourly Fiken graduation poller. When True, an
+    # APScheduler cron job fires every hour and enqueues a
+    # `graduate_faktura` task for every Notion project currently in
+    # an active Faktura status (anything not at Ikke fakturert /
+    # Fakturert / Kreditert end-states). Replaces the operator's
+    # need to click Sjekk fiken every time the CEO sends an invoice.
+    # Each per-project task runs the same `graduate_project` engine
+    # we already use for the manual button.
+    #
+    # Safety: the queue dedup index (uq_sync_tasks_active_graduate_
+    # faktura) makes the cron a no-op when the operator already has
+    # a Sjekk fiken click in flight on a project.
+    sync_fiken_graduations: bool = False
     # Parent page under which yearly `Timer YYYY` databases live (same
     # pattern as emails_parent_page_id). The hours engine auto-creates
     # `Timer 2026`, `Timer 2027`, etc. on first use.
@@ -726,7 +739,18 @@ OPPGAVER_PROPS = {
     "price_per_row": "Pris",                # number (NOK)
     "discount_pct": "Rabatt",               # number (percent 0–100)
     "billed_amount": "Fakturert beløp",     # number (NOK)
-    "billed_status": "Fakturert status",    # single_select
+    # Single billing column (status property type). Phase C engine
+    # writes the terminal `Fakturert 50%` / `Fakturert` values only
+    # AFTER the draft has been graduated to a sent invoice via the
+    # graduation trigger (or future hourly poller). At draft-creation
+    # time `send_faktura` writes nothing here — the draft-in-flight
+    # signal is the Faktura utkast URL on the project, plus the
+    # presence of an unsent FikenInvoice row in Postgres (which the
+    # eligibility matrix uses to block double-bills). The earlier
+    # split with a separate `Faktura handling` column was reverted
+    # June 2026 — too much UI surface area for a state the URL +
+    # Postgres lookup already convey.
+    "billed_status": "Fakturert status",    # status
     # Multi-select on the Oppgave naming the Fiken product / service
     # category. The first selected label is the engine's lookup key
     # against Fiken's product catalogue: it picks the Fiken product
@@ -753,72 +777,109 @@ OPPGAVER_PROPS = {
 FIKEN_FREE_TEXT_INCOME_ACCOUNT = "3020"
 
 
-# The four option names that may appear in the `Fakturert status`
-# single_select on an Oppgaver row. Engine reads them to decide
-# eligibility, writes them after a successful draft creation.
+# =====================================================================
+# Phase C — billing-status model (single column per DB)
+# =====================================================================
 #
-# State machine:
-#   Ikke fakturert (default)  — never billed; both oppstart + slutt eligible
-#   Fakturert 50%             — oppstart booked half the gross; only slutt eligible
-#   Fakturert                 — fully invoiced (either via the 50/50 path or
-#                                a single slutt run); engine never re-bills
-#   Utgår                     — operator opted this row out; engine skips
-#                                in BOTH modes. Manual-only label; engine
-#                                never writes it.
+# History note: Phase C briefly split this into two columns (history +
+# handling) to make every state explicit on the Notion UI. That was
+# reverted after operator feedback (the URL on Faktura utkast +
+# the Fakturaer relation already convey "draft in flight" / "we've
+# sent X" without a status option for it). The split was too much
+# UI surface for state the rest of the system already exposes.
+#
+# Current model — one Status property per DB:
+#
+#   Project   `Faktura status`   (status property)
+#   Oppgave   `Fakturert status` (status property)
+#
+# Both share the same option set; the operator interacts with the
+# Project-side options to queue a click, and the engine writes the
+# terminal `Fakturert*` values only AFTER a sent-invoice graduation.
+# At draft-creation time send_faktura writes NOTHING to either status
+# column — the draft-in-flight signal is the Faktura utkast URL on
+# the project plus an unsent FikenInvoice row in Postgres (which the
+# eligibility check uses to block double-bills).
+
+
+# ---- Oppgaver: Fakturert status (single status column) -------------
+#
+#   Ikke fakturert (default) — never sent; eligible for both modes
+#   Fakturert 50%            — oppstart invoice SENT; slutt eligible
+#   Fakturert                — fully sent (single-shot or after slutt)
+#   Utgår                    — operator opt-out; engine skips in every
+#                              mode. Manual-only; engine never writes.
 FAKTURERT_STATUS_PROP = OPPGAVER_PROPS["billed_status"]
 FAKTURERT_STATUS_IKKE = "Ikke fakturert"
 FAKTURERT_STATUS_50 = "Fakturert 50%"
 FAKTURERT_STATUS_FULL = "Fakturert"
 FAKTURERT_STATUS_UTGAR = "Utgår"
+# Engine-written when a kreditnota fully reverses a prior faktura on
+# this row. "We did invoice this, but the kreditnota voids it." The
+# accompanying Fakturert beløp is also reduced to net 0.
+FAKTURERT_STATUS_KREDITERT = "Kreditert"
 
 # Statuses that mean "skip this row in every mode."
-#   Fakturert → already fully billed; nothing left to invoice.
+#   Fakturert → fully sent already; nothing left to invoice.
 #   Utgår     → operator excluded; respect it.
 FAKTURERT_STATUSES_SKIP = frozenset({
     FAKTURERT_STATUS_FULL,
     FAKTURERT_STATUS_UTGAR,
+    FAKTURERT_STATUS_KREDITERT,
 })
 
 
-# Project-side billing mode. The single "Send faktura" button on the
-# Project reads `Faktura status` to decide whether this click is a
-# startup invoice (50% of every eligible row) or a finalizing one
-# (the remainder of every row not in `Fakturert` / `Utgår`).
+# ---- Projects: Faktura status (single status column) ---------------
 #
-# State machine:
-#   Til oppstartsfaktura   — next click bills 50% of every eligible row;
-#                             engine flips to `Oppstart fakturert` on done.
-#   Til avslutningsfaktura — next click bills the remainder of every
-#                             eligible row; engine flips to `Fakturert` on
-#                             done.
-#   Til fakturering        — exact synonym of `Til avslutningsfaktura`.
-#                             The CEO uses this shorter wording on Notion;
-#                             both names are accepted so the team can pick
-#                             whichever reads better and the engine maps
-#                             both to the same `slutt` invoice_type.
-#   Oppstart fakturert     — terminal post-state after a successful oppstart
-#                             run. Re-clicking is a no-op until the operator
-#                             flips back to a billable state.
-#   Fakturert              — terminal post-state after a successful slutt
-#                             run. Re-clicking is a no-op.
+# Operator picks "Til oppstartsfaktura" / "Til avslutningsfaktura" to
+# queue the next billable click; engine writes the terminal `Fakturert*`
+# values only after graduation (Phase C.3). Between the operator's
+# pick and the graduation, the value stays at whatever the operator
+# picked — the draft URL on Faktura utkast carries the in-flight signal.
+#
+#   Ikke fakturert (default) — nothing planned
+#   Til oppstartsfaktura     — operator: bill 50% next
+#   Til avslutningsfaktura   — operator: bill remainder next
+#   Til fakturering          — exact synonym of avslutningsfaktura
+#                              (shorter wording the CEO uses); engine
+#                              maps both to the same "slutt" mode
+#   Fakturert 50%            — engine-written after oppstart graduation
+#   Fakturert                — engine-written after slutt graduation
 PROJECTS_FAKTURA_STATUS_PROP = "Faktura status"
-# Deres referanse (yourReference on the Fiken invoice). rich_text on the
-# Project. Optional — engine omits the field when blank.
-PROJECTS_FAKTURA_MERKES_PROP = "Faktura merkes"
+FAKTURA_STATUS_IKKE = "Ikke fakturert"
 FAKTURA_STATUS_TIL_OPPSTART = "Til oppstartsfaktura"
 FAKTURA_STATUS_TIL_AVSLUTNING = "Til avslutningsfaktura"
 FAKTURA_STATUS_TIL_FAKTURERING = "Til fakturering"
-FAKTURA_STATUS_OPPSTART_DONE = "Oppstart fakturert"
-FAKTURA_STATUS_FULL_DONE = "Fakturert"
+FAKTURA_STATUS_50 = "Fakturert 50%"
+FAKTURA_STATUS_FULL = "Fakturert"
+# Operator-picked: next click creates a DRAFT kreditnota in Fiken for
+# every sent FikenInvoice on this project that doesn't already have
+# one. 1 invoice = 1 draft kreditnota; 2 = 2; etc. Mirrors the
+# Til oppstartsfaktura / Til avslutningsfaktura pattern but inverts:
+# instead of new outgoing money, it reverses prior outgoing money.
+FAKTURA_STATUS_TIL_KREDITERING = "Til kreditering"
+# Engine-written when ALL of this project's sent fakturas have been
+# fully credit-noted. Net billing = 0 but the audit trail remains
+# visible via Fakturaer (2+ rows: 1+ Faktura + 1+ Kreditnota).
+FAKTURA_STATUS_KREDITERT = "Kreditert"
+# Back-compat alias — older code path used FAKTURA_STATUS_FULL_DONE for
+# the "slutt done" terminal write. Same string ("Fakturert").
+FAKTURA_STATUS_FULL_DONE = FAKTURA_STATUS_FULL
 
-# Maps the project-side mode to the canonical invoice_type key the
-# engine uses internally. Both `Til avslutningsfaktura` and `Til
-# fakturering` resolve to "slutt" — same engine behavior, two operator-
-# friendly names. Add more keys here if the team adopts more synonyms.
+
+# Deres referanse (yourReference on the Fiken invoice). rich_text on the
+# Project. Optional — engine omits the field when blank.
+PROJECTS_FAKTURA_MERKES_PROP = "Faktura merkes"
+
+
+# Maps the operator-picked Faktura status value to the canonical
+# invoice_type key the engine uses internally. Both `Til
+# avslutningsfaktura` and `Til fakturering` resolve to "slutt".
 FAKTURA_STATUS_TO_INVOICE_TYPE = {
     FAKTURA_STATUS_TIL_OPPSTART: "oppstart",
     FAKTURA_STATUS_TIL_AVSLUTNING: "slutt",
     FAKTURA_STATUS_TIL_FAKTURERING: "slutt",
+    FAKTURA_STATUS_TIL_KREDITERING: "kreditering",
 }
 
 
@@ -834,6 +895,101 @@ FAKTURA_STATUS_TO_INVOICE_TYPE = {
 # that matters; the slutt run just overwrites the slot. After Send,
 # the URL stops working, which IS the signal that the draft graduated.
 PROJECTS_DRAFT_URL_PROP = "Faktura utkast"
+
+
+# =====================================================================
+# Phase C.2 — Faktura DB schema (operator-managed; engine WRITES rows)
+# =====================================================================
+#
+# The Faktura DB is the operator-visible record of every sent invoice
+# (and credit note) the company has produced. Today it's populated by
+# the legacy Make.com automation; Phase C.2 builds the writer code,
+# Phase C.3 wires the poller that drives it. Both writers (Make + ours)
+# can coexist during the migration period — rows are deduped by
+# (company_slug, record_type, fiken_record_id) in FakturaNotionCache
+# so re-writes are safe.
+#
+# Property names below match the operator's existing Notion DB
+# verbatim. Do not rename anything here without renaming in Notion.
+
+# Settings field for the DB id. Already declared as `faktura_db_id`
+# (empty default) on the Settings class — engine no-ops when blank, so
+# C.2 can ship before the operator wires the id into .env.
+
+# `Fakturaer` relation property on the Projects DB. The Faktura row's
+# Prosjekt relation auto-syncs back to this column on Projects (Notion
+# auto-creates the reverse). Engine writes the Faktura side; Projects
+# side is read-only display for the operator. Naming kept simple to
+# match Norwegian plural ("invoices").
+PROJECTS_FAKTURAER_PROP = "Fakturaer"
+
+FAKTURA_PROPS = {
+    # title — the invoiceNumber as a printable string ("10042"). Same
+    # text Fiken renders on the printed invoice.
+    "navn": "Navn",
+    # number — invoiceNumber parsed as int. Lets the operator sort the
+    # Faktura DB numerically and use Notion formulas for aggregations.
+    "fakturanummer": "Fakturanummer",
+    # number — for credit notes ONLY: the parent invoice's
+    # invoiceNumber (Fiken's `associatedInvoiceId` → invoiceNumber
+    # lookup). Plain integer, not a relation (operator picked this
+    # shape; matches Make's existing rows). Blank on normal invoices.
+    "kreditnota_til": "Kreditnota til faktura",
+    # number — Fiken's `net` (before VAT). The "what was invoiced"
+    # number the operator looks at to reconcile against Notion's
+    # Fakturert sum rollup.
+    "netto": "Netto",
+    # select — "Faktura" or "Kreditnota". Discriminates the two
+    # record types in the same DB.
+    "type": "Type",
+    # rich_text — Fiken's `message` (or `comment` if `message` is
+    # missing). What the customer reads on the printed invoice as
+    # "Kommentar".
+    "kommentar": "Kommentar",
+    # relation → Fakturamottaker DB. Resolved by walking
+    # customer.contactId → /contacts/{id} → organizationNumber →
+    # FAKTURAMOTTAKER_PROPS["orgnr"] lookup. Left blank when no match.
+    "fakturamottaker": "Fakturamottaker",
+    # relation → Projects DB. Matched by reference.our (Vår referanse
+    # = project title in our send_faktura flow). Left blank when no
+    # match. The reverse relation lives on Projects as `Fakturaer`.
+    "prosjekt": "Prosjekt",
+    # rich_text — Fiken's reference.yours (Deres referanse).
+    "deres_ref": "Deres ref",
+    # date — Fiken's issueDate (YYYY-MM-DD). Operator sees this as
+    # "when did we send it."
+    "dato": "Dato",
+    # rich_text — Fiken's reference.our (Vår referanse = project
+    # title). Stored alongside the relation as a denormalized text
+    # field so it's visible without hopping the relation.
+    "vaar_ref": "Vår ref",
+    # rich_text — denormalized customer.name. Same rationale as
+    # vaar_ref: makes the row legible in the Faktura DB list view
+    # without clicking through to Fakturamottaker.
+    "fakturamottaker_tekst": "Fakturamottaker tekst",
+    # url — Fiken UI page for the sent invoice (path:
+    # /handel/salg/{saleId} for both invoices + kreditnotas).
+    # The clickable "open in Fiken" link.
+    "url": "URL",
+    # url — DIRECT link to the printed invoice/kreditnota PDF in
+    # Fiken's file store. Fiken's payload nests this under
+    # `invoicePdf` on invoices and `creditNotePdf` on kreditnotas;
+    # both expose `downloadUrlWithFikenNormalUserCredentials` which
+    # is the browser-friendly URL (auto-authenticates the user via
+    # their Fiken session — opens straight to the PDF). The
+    # `downloadUrl` sibling requires a Bearer token; we don't use
+    # it because the operator clicking from Notion doesn't have one.
+    "pdf_url": "Faktura PDF",
+}
+
+# Type select option strings on the Faktura DB. Match Make's existing
+# values exactly so we don't churn the option list on prod Notion.
+FAKTURA_TYPE_FAKTURA = "Faktura"
+FAKTURA_TYPE_KREDITNOTA = "Kreditnota"
+
+# Income account default for the Faktura DB writer is not needed —
+# Faktura rows don't carry a per-line account (that's on the Fiken
+# invoice itself). Documented here so nobody looks for one.
 
 
 # Names of the properties on the Korreksjoner database — individual feedback

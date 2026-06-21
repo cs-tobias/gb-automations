@@ -662,6 +662,28 @@ class FikenInvoice(Base):
     # Fiken's lastModifiedDate (string yyyy-mm-dd) — poll cursor reads this
     # to skip unchanged rows on incremental polls.
     last_modified_date: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Phase C.3a — set at draft creation. Lets the poller match a sent
+    # Fiken invoice to this row via Fiken's `invoiceDraftUuid` field
+    # (the SENT invoice's `invoiceId` is freshly minted at send-time,
+    # so we can't match on id; but the draft's `uuid` is preserved
+    # as `invoiceDraftUuid` on the sent record). NULL on poller-
+    # discovered rows (those never had a draft we knew about).
+    draft_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Phase C.3a — graduation marker. Set when the poller / manual
+    # trigger successfully reconciles this row to a sent invoice in
+    # Fiken. NULL = the draft is still in Fiken awaiting Send (or the
+    # poller hasn't processed it yet). Lets `/debug/fiken/sent-invoices`
+    # show what we've already graduated vs what's still pending.
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Phase C.3a — the Fiken UI URL we wrote into the Faktura DB row's
+    # URL column. Captured here for diagnostics so we don't have to
+    # walk back through Notion to find it.
+    sent_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Phase C.3a — Fiken's `invoiceNumber` on the sent invoice (the
+    # printable number like "10042"). NULL until graduated.
+    invoice_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     inserted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -711,6 +733,53 @@ class FikenInvoiceLine(Base):
 
     __table_args__ = (
         Index("ix_fiken_invoice_lines_oppgave", "oppgave_page_id"),
+    )
+
+
+class FakturaNotionCache(Base):
+    """Idempotency cache for Phase C.2 Faktura DB writes.
+
+    Each row records "we created a Notion page in the Faktura DB for
+    this Fiken record." Phase C.3's poller checks this cache before
+    writing — a cached hit is a no-op, so a repeated poll over the
+    same window doesn't create duplicate Notion rows.
+
+    PK is (company_slug, record_type, fiken_record_id) where record_type
+    is "faktura" or "kreditnota" — the two record types share the
+    same Faktura DB in Notion but live at different Fiken endpoints
+    (`/invoices` vs `/creditNotes`), and their ids COULD collide
+    numerically since they're separate sequences in Fiken.
+
+    `notion_page_id` is recorded purely for diagnostics / debug
+    endpoints. The cache never tries to re-PATCH an existing page;
+    the operator is free to delete a Faktura row in Notion intentionally
+    (e.g. they corrected something) and the cache will silently leave
+    it alone on subsequent polls. Notion is the source of truth for
+    "does this row exist or not" — Postgres just remembers we already
+    wrote it once.
+
+    Make.com automation rows are NOT tracked here. Phase C migration
+    expects Make to keep populating the DB until C.3 ships; the two
+    writers coexist because they target different sets of records
+    (Make handles whatever it was configured for; we only write rows
+    we've matched ourselves). Final cutover happens at C.4.
+    """
+
+    __tablename__ = "faktura_notion_cache"
+
+    company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
+    record_type: Mapped[str] = mapped_column(String(16), primary_key=True)
+    fiken_record_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    notion_page_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "record_type IN ('faktura', 'kreditnota')",
+            name="faktura_notion_cache_record_type_check",
+        ),
     )
 
 

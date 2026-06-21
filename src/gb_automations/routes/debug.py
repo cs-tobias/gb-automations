@@ -1157,6 +1157,675 @@ async def debug_fiken_create_draft(
     }
 
 
+@router.post("/fiken/graduate-project")
+async def debug_fiken_graduate_project(
+    project_page_id: str = Query(
+        ..., description="Notion Project page id"
+    ),
+) -> dict[str, Any]:
+    """Phase C.3a — manually graduate one project's sent Fiken invoices.
+
+    Walks the same engine that C.3b's hourly poller will use, but
+    scoped to a single project. For each sent Fiken invoice that
+    matches this project (via draft_uuid FK or reference.our exact
+    match):
+
+      1. Creates a row in the Faktura DB (idempotent via cache).
+      2. When matched via draft_uuid (i.e. we have a per-line audit
+         trail), graduates Project + Oppgave statuses to the right
+         Fakturert* values and clears Faktura handling on both.
+      3. Records sent_at + sent_url + invoice_number on the
+         FikenInvoice audit row so subsequent calls short-circuit.
+
+    Returns a JSON summary listing every Fiken invoice scanned,
+    which matched + how, and what changed in Notion. Safe to
+    re-run — all writes idempotent.
+
+    Requires `FAKTURA_DB_ID` to be set for Faktura DB rows to land;
+    when unset, the writer returns None per the C.2 dormant-engine
+    contract and the summary records `faktura_db_page_id: null`
+    (status writes still fire).
+    """
+    from gb_automations.sync.graduate_project import graduate_project
+
+    summary = await graduate_project(project_page_id)
+    return summary.as_dict()
+
+
+@router.post("/fiken/simulate-graduation")
+async def debug_fiken_simulate_graduation(
+    project_page_id: str = Query(
+        ...,
+        description=(
+            "Notion project page id. The endpoint reads this project's "
+            "most recent UNSENT FikenInvoice row + its FikenInvoiceLine "
+            "audit rows and pretends the draft was sent."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Phase C.3a — simulate a draft being sent + graduated.
+
+    For testing the full draft→sent→graduate flow without actually
+    clicking Send in Fiken (which would create a real Norwegian
+    accounting ledger entry).
+
+    Flow:
+      1. Find the project's most recent unsent FikenInvoice row +
+         its FikenInvoiceLine audit rows (the per-Oppgave NOK).
+      2. Fetch the DRAFT from Fiken (read-only) to pull customer +
+         reference info for the Faktura DB row.
+      3. Build a synthetic "sent invoice" payload: real customer +
+         reference + dates from the draft, but with a fake-but-stable
+         invoiceNumber/invoiceId so the Faktura DB row is consistent.
+      4. Run the full graduation pipeline against this synthetic
+         payload:
+           - Create the Faktura DB row (idempotent).
+           - For each audit-row Oppgave: read current Fakturert beløp,
+             add this line's NOK, write the new total + status.
+           - Write Project Faktura status to the terminal value.
+           - Clear the Faktura utkast URL.
+      5. Mark the FikenInvoice row sent_at so the block-check clears.
+
+    Idempotent: re-running graduates the next unsent draft (if any)
+    or no-ops (no unsent draft → returns 'no unsent draft for this
+    project').
+
+    Read-only against Fiken (just GETs the draft to read payload).
+    Writes are to Notion + Postgres only.
+    """
+    from datetime import datetime, timezone
+
+    from gb_automations.clients import fiken as fiken_client
+    from gb_automations.config import (
+        FAKTURA_STATUS_50,
+        FAKTURA_STATUS_FULL,
+        FAKTURERT_STATUS_50,
+        FAKTURERT_STATUS_FULL,
+        OPPGAVER_PROPS,
+        settings,
+    )
+    from gb_automations.db import SessionLocal
+    from gb_automations.models import FikenInvoice, FikenInvoiceLine
+    from gb_automations.sync import (
+        graduate_project as graduate_engine,
+        notion_faktura_db,
+    )
+    from sqlalchemy import select
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        return {"error": "FIKEN_COMPANY_SLUG not set"}
+
+    # --- 1. Read the Notion project ---
+    try:
+        project_page = await notion_client.get_page(project_page_id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": f"Failed to read project page: {err}"}
+    project_title = (
+        notion_client.extract_page_title(project_page) or ""
+    ).strip() or None
+
+    # --- 2. Find the most recent unsent FikenInvoice for this project ---
+    async with SessionLocal() as session:
+        stmt = (
+            select(FikenInvoice)
+            .where(
+                FikenInvoice.company_slug == company_slug,
+                FikenInvoice.project_page_id == project_page_id,
+                FikenInvoice.sent_at.is_(None),
+            )
+            .order_by(FikenInvoice.inserted_at.desc())
+            .limit(1)
+        )
+        unsent = (await session.execute(stmt)).scalar_one_or_none()
+
+    if not unsent:
+        return {
+            "synthetic": True,
+            "project_page_id": project_page_id,
+            "project_title": project_title,
+            "error": (
+                "No unsent FikenInvoice row for this project. Click "
+                "Send faktura first to create a draft."
+            ),
+        }
+
+    draft_id = unsent.fiken_invoice_id
+    invoice_type = unsent.invoice_type or "slutt"
+
+    # --- 3. Fetch the draft from Fiken to read its real payload ---
+    async with await fiken_client._client() as client:
+        response = await client.get(
+            f"/companies/{company_slug}/invoices/drafts/{draft_id}"
+        )
+        if response.status_code != 200:
+            return {
+                "synthetic": True,
+                "error": (
+                    f"Failed to GET draft {draft_id} from Fiken "
+                    f"(status {response.status_code}). Was the draft "
+                    f"already deleted?"
+                ),
+                "body": response.text[:500],
+            }
+        draft_payload = response.json()
+
+    # --- 4. Synthesize a "sent invoice" payload from the draft ---
+    # The Faktura DB writer expects `invoiceId`, `invoiceNumber`, etc.
+    # Drafts use `draftId`, no `invoiceNumber`. Build a synthetic dict
+    # that has the right keys without faking customer info.
+    customer = draft_payload.get("customers") or []
+    customer_block: dict[str, Any] = {}
+    if customer:
+        # Fiken's draft endpoint returns customers as a list; the
+        # sent-invoice endpoint returns `customer` as a single dict.
+        # Pick the first.
+        first = customer[0]
+        customer_block = {
+            "contactId": first.get("contactId")
+            or first.get("customerId"),
+            "name": first.get("name") or "",
+            "organizationNumber": first.get("organizationNumber"),
+        }
+
+    fake_invoice_number = f"SIM-{draft_id}"
+    synthetic_invoice: dict[str, Any] = {
+        "invoiceId": int(draft_id) if str(draft_id).isdigit() else draft_id,
+        "invoiceNumber": fake_invoice_number,
+        "issueDate": draft_payload.get("issueDate"),
+        "net": draft_payload.get("net"),
+        "gross": draft_payload.get("gross"),
+        "customer": customer_block,
+        "reference": {
+            "our": draft_payload.get("ourReference")
+            or project_title
+            or "",
+            "yours": draft_payload.get("yourReference") or "",
+        },
+        "invoiceText": draft_payload.get("invoiceText") or "",
+    }
+
+    # --- 5. Create the Faktura DB row ---
+    faktura_db_page_id: str | None = None
+    faktura_db_error: str | None = None
+    try:
+        faktura_db_page_id = await notion_faktura_db.create_faktura_row(
+            company_slug,
+            fiken_record=synthetic_invoice,
+            record_type="faktura",
+            project_page_id=project_page_id,
+            project_title=project_title,
+        )
+    except Exception as err:  # noqa: BLE001
+        faktura_db_error = f"Faktura DB write failed: {err}"
+
+    # --- 6. Per-Oppgave Fakturert beløp + status writes ---
+    async with SessionLocal() as session:
+        stmt = select(FikenInvoiceLine).where(
+            FikenInvoiceLine.company_slug == company_slug,
+            FikenInvoiceLine.fiken_invoice_id == draft_id,
+        )
+        audit_lines = list((await session.execute(stmt)).scalars())
+
+    oppgave_history = (
+        FAKTURERT_STATUS_50
+        if invoice_type == "oppstart"
+        else FAKTURERT_STATUS_FULL
+    )
+    project_history = (
+        FAKTURA_STATUS_50
+        if invoice_type == "oppstart"
+        else FAKTURA_STATUS_FULL
+    )
+
+    oppgave_statuses_set = 0
+    oppgave_errors: list[str] = []
+    for line in audit_lines:
+        if not line.oppgave_page_id:
+            continue
+        try:
+            page = await notion_client.get_page(line.oppgave_page_id)
+            current_nok = (
+                notion_client.read_number_prop(
+                    page, OPPGAVER_PROPS["billed_amount"]
+                )
+                or 0.0
+            )
+            new_total = current_nok + (line.billed_amount_ore / 100.0)
+            await notion_client.set_oppgave_billed(
+                line.oppgave_page_id,
+                status=oppgave_history,
+                billed_amount_nok=new_total,
+            )
+            oppgave_statuses_set += 1
+        except Exception as err:  # noqa: BLE001
+            oppgave_errors.append(
+                f"Oppgave {line.oppgave_page_id}: {err}"
+            )
+
+    # --- 7. Project status + draft URL clear ---
+    project_status_error: str | None = None
+    try:
+        await notion_client.set_project_faktura_status(
+            project_page_id, status=project_history
+        )
+    except Exception as err:  # noqa: BLE001
+        project_status_error = f"set_project_faktura_status: {err}"
+
+    draft_url_error: str | None = None
+    try:
+        await notion_client.set_project_draft_url(
+            project_page_id, url=None
+        )
+    except Exception as err:  # noqa: BLE001
+        draft_url_error = f"set_project_draft_url: {err}"
+
+    # --- 8. Mark the FikenInvoice row sent_at so the block clears ---
+    sent_url = graduate_engine._extract_sent_url(
+        synthetic_invoice, company_slug
+    )
+    mark_error: str | None = None
+    try:
+        await graduate_engine._mark_invoice_sent(
+            company_slug=company_slug,
+            fiken_invoice_id=draft_id,
+            sent_url=sent_url,
+            invoice_number=fake_invoice_number,
+        )
+    except Exception as err:  # noqa: BLE001
+        mark_error = f"_mark_invoice_sent: {err}"
+
+    return {
+        "synthetic": True,
+        "company_slug": company_slug,
+        "project_page_id": project_page_id,
+        "project_title": project_title,
+        "draft_id_graduated": draft_id,
+        "invoice_type": invoice_type,
+        "synthetic_invoice_number": fake_invoice_number,
+        "faktura_db_page_id": faktura_db_page_id,
+        "faktura_db_error": faktura_db_error,
+        "audit_lines_found": len(audit_lines),
+        "oppgave_statuses_set": oppgave_statuses_set,
+        "oppgave_errors": oppgave_errors,
+        "project_status_set": project_status_error is None,
+        "project_status_error": project_status_error,
+        "draft_url_cleared": draft_url_error is None,
+        "draft_url_error": draft_url_error,
+        "audit_marked_sent_at": mark_error is None,
+        "mark_error": mark_error,
+    }
+
+
+@router.post("/fiken/graduate-one-invoice")
+async def debug_fiken_graduate_one_invoice(
+    fiken_invoice_id: str = Query(
+        ...,
+        description=(
+            "Fiken invoice id (numeric, as string) of a real historical "
+            "sent invoice in your Fiken account."
+        ),
+    ),
+    project_page_id: str = Query(
+        ...,
+        description=(
+            "Notion project page id to graduate against. The endpoint "
+            "treats the invoice AS IF it matched this project — bypasses "
+            "the auto-match (draft_uuid / reference.our) logic."
+        ),
+    ),
+    invoice_type: str = Query(
+        "oppstart",
+        description=(
+            "'oppstart' or 'slutt' — drives which terminal status lands "
+            "(Fakturert 50% vs Fakturert) on the Project + any Oppgave "
+            "with audit rows for this invoice."
+        ),
+    ),
+    mark_sent_in_db: bool = Query(
+        False,
+        description=(
+            "When true, also UPSERT a FikenInvoice row with sent_at=now "
+            "so subsequent /debug/fiken/graduate-project runs short-"
+            "circuit on this invoice. Default false so the same "
+            "historical invoice can be re-tested repeatedly without "
+            "DB cleanup."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Phase C.3a — graduate ONE historical invoice against a chosen project.
+
+    Designed for safely testing the graduation flow end-to-end without
+    creating + sending new Fiken invoices (which dirties the books).
+    Pick any real sent invoice from your Fiken account; point it at a
+    test Notion project; the endpoint exercises:
+
+      - Faktura DB row write (C.2 path)
+      - Project Faktura status flip (Fakturert 50% / Fakturert)
+      - Project Faktura utkast URL clear
+      - Per-Oppgave Fakturert status flip IF audit rows exist
+        (historical invoices won't have any — that case is noted in
+        the response and the Oppgave statuses stay unchanged)
+      - Idempotency on re-run (cache + read-first/skip-if-same)
+
+    Read-only against Fiken. Every write is to Notion + Postgres,
+    both of which you can clean up freely.
+
+    Usage:
+        POST /debug/fiken/graduate-one-invoice
+            ?fiken_invoice_id=4493258455
+            &project_page_id=<notion-id>
+            &invoice_type=oppstart
+            &mark_sent_in_db=false
+    """
+    from gb_automations.clients import fiken as fiken_client
+    from gb_automations.config import (
+        FAKTURA_STATUS_50,
+        FAKTURA_STATUS_FULL,
+        FAKTURERT_STATUS_50,
+        FAKTURERT_STATUS_FULL,
+        settings,
+    )
+    from gb_automations.db import SessionLocal
+    from gb_automations.models import FikenInvoiceLine
+    from gb_automations.sync import (
+        graduate_project as graduate_engine,
+        notion_faktura_db,
+    )
+    from sqlalchemy import select
+
+    if invoice_type not in ("oppstart", "slutt"):
+        return {
+            "error": (
+                f"invoice_type must be 'oppstart' or 'slutt', "
+                f"got {invoice_type!r}"
+            )
+        }
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        return {"error": "FIKEN_COMPANY_SLUG not set"}
+
+    # --- 1. Read the Notion project page (presence + title) ---
+    try:
+        project_page = await notion_client.get_page(project_page_id)
+    except Exception as err:  # noqa: BLE001
+        return {"error": f"Failed to read project page: {err}"}
+    project_title = (
+        notion_client.extract_page_title(project_page) or ""
+    ).strip() or None
+
+    # --- 2. Fetch the real Fiken invoice payload ---
+    async with await fiken_client._client() as client:
+        response = await client.get(
+            f"/companies/{company_slug}/invoices/{fiken_invoice_id}"
+        )
+        if response.status_code != 200:
+            return {
+                "error": f"Fiken returned {response.status_code}",
+                "body": response.text[:500],
+            }
+        fiken_invoice = response.json()
+
+    # --- 3. Write the Faktura DB row (idempotent via C.2 cache) ---
+    cached_before = await notion_faktura_db._get_cached_page_id(
+        company_slug, "faktura", fiken_invoice_id
+    )
+    faktura_db_page_id: str | None = None
+    faktura_db_error: str | None = None
+    try:
+        faktura_db_page_id = await notion_faktura_db.create_faktura_row(
+            company_slug,
+            fiken_record=fiken_invoice,
+            record_type="faktura",
+            project_page_id=project_page_id,
+            project_title=project_title,
+        )
+    except Exception as err:  # noqa: BLE001
+        faktura_db_error = f"Faktura DB write failed: {err}"
+    faktura_db_cached = (
+        cached_before is not None
+        and faktura_db_page_id == cached_before
+    )
+
+    # --- 4. Per-Oppgave status flips (only if audit rows exist) ---
+    oppgave_history = (
+        FAKTURERT_STATUS_50
+        if invoice_type == "oppstart"
+        else FAKTURERT_STATUS_FULL
+    )
+    project_history = (
+        FAKTURA_STATUS_50
+        if invoice_type == "oppstart"
+        else FAKTURA_STATUS_FULL
+    )
+
+    async with SessionLocal() as session:
+        stmt = select(FikenInvoiceLine).where(
+            FikenInvoiceLine.company_slug == company_slug,
+            FikenInvoiceLine.fiken_invoice_id == fiken_invoice_id,
+        )
+        audit_lines = list((await session.execute(stmt)).scalars())
+
+    # For each Oppgave on the invoice: read current Fakturert beløp,
+    # ADD this invoice's billed NOK, write the new total + the status.
+    # See _graduate_statuses in sync/graduate_project.py for the
+    # rationale (Notion is truth for actually-invoiced money; draft
+    # creation doesn't write here, graduation does).
+    from gb_automations.config import OPPGAVER_PROPS
+
+    oppgave_statuses_set = 0
+    oppgave_errors: list[str] = []
+    for line in audit_lines:
+        if not line.oppgave_page_id:
+            continue
+        try:
+            page = await notion_client.get_page(line.oppgave_page_id)
+            current_nok = (
+                notion_client.read_number_prop(
+                    page, OPPGAVER_PROPS["billed_amount"]
+                )
+                or 0.0
+            )
+            new_total = current_nok + (line.billed_amount_ore / 100.0)
+            await notion_client.set_oppgave_billed(
+                line.oppgave_page_id,
+                status=oppgave_history,
+                billed_amount_nok=new_total,
+            )
+            oppgave_statuses_set += 1
+        except Exception as err:  # noqa: BLE001
+            oppgave_errors.append(
+                f"Oppgave {line.oppgave_page_id}: {err}"
+            )
+
+    # --- 5. Project status flip + draft URL clear (always attempt) ---
+    project_status_error: str | None = None
+    try:
+        await notion_client.set_project_faktura_status(
+            project_page_id, status=project_history
+        )
+    except Exception as err:  # noqa: BLE001
+        project_status_error = f"set_project_faktura_status: {err}"
+
+    draft_url_error: str | None = None
+    try:
+        await notion_client.set_project_draft_url(
+            project_page_id, url=None
+        )
+    except Exception as err:  # noqa: BLE001
+        draft_url_error = f"set_project_draft_url: {err}"
+
+    # --- 6. Optional: stamp the FikenInvoice audit row as sent ---
+    marked_sent: bool = False
+    sent_url = graduate_engine._extract_sent_url(
+        fiken_invoice, company_slug
+    )
+    invoice_number = (
+        str(fiken_invoice.get("invoiceNumber"))
+        if fiken_invoice.get("invoiceNumber") is not None
+        else None
+    )
+    if mark_sent_in_db:
+        try:
+            await graduate_engine._mark_invoice_sent(
+                company_slug=company_slug,
+                fiken_invoice_id=fiken_invoice_id,
+                sent_url=sent_url,
+                invoice_number=invoice_number,
+            )
+            marked_sent = True
+        except Exception as err:  # noqa: BLE001
+            return {
+                "synthetic": True,
+                "error": f"_mark_invoice_sent: {err}",
+                "faktura_db_page_id": faktura_db_page_id,
+                "faktura_db_cached": faktura_db_cached,
+            }
+
+    return {
+        "synthetic": True,
+        "company_slug": company_slug,
+        "project_page_id": project_page_id,
+        "project_title": project_title,
+        "fiken_invoice_id": fiken_invoice_id,
+        "invoice_number": invoice_number,
+        "invoice_type": invoice_type,
+        "faktura_db_page_id": faktura_db_page_id,
+        "faktura_db_cached": faktura_db_cached,
+        "faktura_db_error": faktura_db_error,
+        "audit_lines_found": len(audit_lines),
+        "oppgave_statuses_set": oppgave_statuses_set,
+        "oppgave_errors": oppgave_errors,
+        "project_status_set": project_status_error is None,
+        "project_status_error": project_status_error,
+        "draft_url_cleared": draft_url_error is None,
+        "draft_url_error": draft_url_error,
+        "marked_sent_in_db": marked_sent,
+        "sent_url": sent_url,
+        "fiken_record_preview": {
+            "number": fiken_invoice.get("invoiceNumber"),
+            "issueDate": fiken_invoice.get("issueDate"),
+            "net": fiken_invoice.get("net"),
+            "customer_name": (fiken_invoice.get("customer") or {}).get(
+                "name"
+            ),
+            "reference": fiken_invoice.get("reference")
+            or {
+                "our": fiken_invoice.get("ourReference"),
+                "yours": fiken_invoice.get("yourReference"),
+            },
+        },
+    }
+
+
+@router.post("/fiken/write-faktura-row")
+async def debug_fiken_write_faktura_row(
+    fiken_invoice_id: str = Query(
+        ..., description="Fiken invoice id (numeric, as a string)"
+    ),
+    record_type: str = Query(
+        "faktura",
+        description="'faktura' or 'kreditnota'",
+    ),
+    project_page_id: str | None = Query(
+        None,
+        description=(
+            "Optional Notion Project page id to link via the Prosjekt "
+            "relation. Omit to leave it blank."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Phase C.2 — manually write one Faktura DB row from a Fiken record.
+
+    Fetches the Fiken invoice (or credit note) by id, walks the C.2
+    writer, and returns the resulting Notion page id (plus any cache
+    hit info). Lets operators sanity-check column-by-column formatting
+    against Make.com's existing rows before C.3 wires up the poller.
+
+    Usage:
+        POST /debug/fiken/write-faktura-row?fiken_invoice_id=4493258455
+        POST /debug/fiken/write-faktura-row?fiken_invoice_id=4493258455
+            &project_page_id=<notion-id>
+
+    Requires `FAKTURA_DB_ID` to be set in `.env` (writes are dormant
+    otherwise — the engine returns None with an INFO log).
+
+    Idempotent: a repeated call for the same Fiken invoice id returns
+    the cached page id (no new Notion row).
+    """
+    from gb_automations.clients import fiken as fiken_client
+    from gb_automations.config import settings
+    from gb_automations.sync import notion_faktura_db
+
+    if record_type not in ("faktura", "kreditnota"):
+        return {
+            "error": (
+                f"record_type must be 'faktura' or 'kreditnota', "
+                f"got {record_type!r}"
+            )
+        }
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        return {"error": "FIKEN_COMPANY_SLUG not set"}
+
+    # Fetch the live Fiken payload. The poller (C.3) will pass these in
+    # from the list endpoint instead of fetching one at a time.
+    async with await fiken_client._client() as client:
+        endpoint = "invoices" if record_type == "faktura" else "creditNotes"
+        response = await client.get(
+            f"/companies/{company_slug}/{endpoint}/{fiken_invoice_id}"
+        )
+        if response.status_code != 200:
+            return {
+                "error": f"Fiken returned {response.status_code}",
+                "body": response.text[:500],
+            }
+        fiken_record = response.json()
+
+    project_title: str | None = None
+    if project_page_id:
+        try:
+            project_page = await notion_client.get_page(project_page_id)
+            project_title = (
+                notion_client.extract_page_title(project_page) or ""
+            ).strip() or None
+        except Exception:  # noqa: BLE001
+            project_title = None
+
+    new_page_id = await notion_faktura_db.create_faktura_row(
+        company_slug,
+        fiken_record=fiken_record,
+        record_type=record_type,  # type: ignore[arg-type]
+        project_page_id=project_page_id,
+        project_title=project_title,
+    )
+
+    return {
+        "company_slug": company_slug,
+        "record_type": record_type,
+        "fiken_record_id": fiken_invoice_id,
+        "notion_page_id": new_page_id,
+        "engine_disabled": new_page_id is None
+        and not settings.faktura_db_id,
+        "fiken_record_preview": {
+            "number": fiken_record.get("invoiceNumber")
+            or fiken_record.get("creditNoteNumber"),
+            "issueDate": fiken_record.get("issueDate"),
+            "net": fiken_record.get("net"),
+            "customer_name": (fiken_record.get("customer") or {}).get(
+                "name"
+            ),
+            "reference": fiken_record.get("reference")
+            or {
+                "our": fiken_record.get("ourReference"),
+                "yours": fiken_record.get("yourReference"),
+            },
+        },
+    }
+
+
 @router.get("/fiken/inspect")
 async def debug_fiken_inspect(
     project_page_id: str = Query(..., description="Notion Project page id"),
