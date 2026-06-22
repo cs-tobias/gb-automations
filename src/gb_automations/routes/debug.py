@@ -1932,3 +1932,103 @@ async def debug_fiken_inspect(
         "eligible_count": sum(1 for r in inspected if r["eligible"]),
         "rows": inspected,
     }
+
+
+@router.get("/fiken/orphan-drafts")
+async def debug_fiken_orphan_drafts(
+    project_page_id: str | None = Query(
+        None,
+        description=(
+            "Optional Notion Project page id. When set, only drafts whose "
+            "ourReference casefold-matches the project title are returned. "
+            "Omit to list every orphan draft in the company."
+        ),
+    ),
+) -> dict[str, Any]:
+    """List Fiken drafts that have no active FikenInvoice audit row.
+
+    An orphan is a live, unsent Fiken draft whose numeric draftId has no
+    `FikenInvoice` row with sent_at IS NULL — i.e. a draft we created in a
+    run that crashed before recording it (the historical duplicate-draft
+    bug), or one created by hand in Fiken's UI.
+
+    Read-only. To remove one, call POST /debug/fiken/delete-draft, or
+    POST /debug/fiken/reset-project to clear all of a project's drafts.
+    """
+    from gb_automations.config import settings
+    from gb_automations.sync.sync_fiken_invoice import find_orphan_drafts
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        return {"error": "FIKEN_COMPANY_SLUG not set"}
+
+    project_title: str | None = None
+    if project_page_id:
+        try:
+            project_page = await notion_client.get_page(project_page_id)
+            project_title = (
+                notion_client.extract_page_title(project_page) or ""
+            ).strip() or None
+        except Exception as err:  # noqa: BLE001
+            return {"error": f"Failed to read project page: {err}"}
+
+    orphans = await find_orphan_drafts(
+        company_slug, project_title=project_title
+    )
+    return {
+        "company_slug": company_slug,
+        "project_page_id": project_page_id,
+        "project_title": project_title,
+        "orphan_count": len(orphans),
+        "orphans": orphans,
+    }
+
+
+@router.post("/fiken/delete-draft")
+async def debug_fiken_delete_draft(
+    draft_id: str = Query(..., description="Fiken numeric draftId to delete"),
+) -> dict[str, Any]:
+    """Delete one Fiken draft + stamp sent_at on any matching audit row.
+
+    Explicit single-draft removal — use after reviewing
+    /debug/fiken/orphan-drafts. Idempotent: a draft Fiken says is already
+    gone returns "gone" and still marks the audit row stale.
+    """
+    from gb_automations.config import settings
+    from gb_automations.sync.sync_fiken_invoice import (
+        delete_draft_and_mark_stale,
+    )
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        return {"error": "FIKEN_COMPANY_SLUG not set"}
+
+    outcome = await delete_draft_and_mark_stale(company_slug, draft_id)
+    return {"company_slug": company_slug, "draft_id": draft_id, "outcome": outcome}
+
+
+@router.post("/fiken/reset-project")
+async def debug_fiken_reset_project(
+    project_page_id: str = Query(..., description="Notion Project page id"),
+) -> dict[str, Any]:
+    """Wipe all draft-in-flight state for one project.
+
+    For every unsent FikenInvoice row of this project: best-effort DELETE
+    the live Fiken draft + stamp sent_at so it drops out of the slutt
+    remainder math and the same-mode block check. Does NOT touch Notion
+    billing columns — this only clears the phantom draft state that makes
+    a cleared-in-Notion project still read as partly billed.
+
+    Use this when a project's draft state is tangled (e.g. duplicate
+    orphan drafts from a crashed run) and you want a clean slate before
+    re-clicking Send faktura.
+    """
+    from gb_automations.config import settings
+    from gb_automations.sync.sync_fiken_invoice import reset_project_drafts
+
+    company_slug = settings.fiken_company_slug
+    if not company_slug:
+        return {"error": "FIKEN_COMPANY_SLUG not set"}
+
+    summary = await reset_project_drafts(company_slug, project_page_id)
+    return {"company_slug": company_slug, **summary}

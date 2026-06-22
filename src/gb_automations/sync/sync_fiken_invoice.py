@@ -900,6 +900,166 @@ async def _unsent_oppgave_ids_for_project(
 
 
 # ============================================================
+# Orphan-draft reconciliation + per-project draft reset
+#
+# The engine can create a duplicate Fiken draft when a run crashes after
+# the POST but before the audit row is durable (historical NULL-discipline
+# bug). The split-transaction fix in create_fiken_invoice prevents NEW
+# duplicates, but pre-existing orphans need a manual cleanup path. These
+# functions back both the /debug/fiken/* endpoints and the one-shot
+# scripts/fiken_reset_project.py CLI.
+# ============================================================
+
+
+def _draft_id_of(draft: dict[str, Any]) -> str:
+    """Pull the numeric draftId off a Fiken draft list payload as a str."""
+    return str(draft.get("draftId") or draft.get("id") or "").strip()
+
+
+def _draft_reference_of(draft: dict[str, Any]) -> str:
+    """Pull the ourReference (Vår referanse) off a draft payload as a str."""
+    return str(
+        draft.get(fiken_client.REFERENCE_FIELD)
+        or draft.get("reference")
+        or ""
+    )
+
+
+def _filter_orphan_drafts(
+    drafts: list[dict[str, Any]],
+    known_active_ids: set[str],
+    *,
+    project_title: str | None = None,
+) -> list[dict[str, Any]]:
+    """Pure predicate behind find_orphan_drafts (separated for testing).
+
+    An orphan is a draft whose draftId is NOT in `known_active_ids` (the
+    set of FikenInvoice rows with sent_at IS NULL). When `project_title`
+    is given, only drafts whose ourReference casefold-equals it survive —
+    so a project-scoped call never flags a draft it can't attribute.
+    """
+    title_cf = (project_title or "").strip().casefold() or None
+    orphans: list[dict[str, Any]] = []
+    for draft in drafts:
+        draft_id = _draft_id_of(draft)
+        if not draft_id or draft_id in known_active_ids:
+            continue
+        reference = _draft_reference_of(draft)
+        if title_cf is not None and reference.strip().casefold() != title_cf:
+            continue
+        orphans.append(
+            {
+                "draft_id": draft_id,
+                "uuid": draft.get("uuid"),
+                "reference": reference,
+                "issue_date": draft.get("issueDate"),
+            }
+        )
+    return orphans
+
+
+async def find_orphan_drafts(
+    company_slug: str, *, project_title: str | None = None
+) -> list[dict[str, Any]]:
+    """Drafts live in Fiken that have NO active FikenInvoice audit row.
+
+    "Active" = a FikenInvoice row with sent_at IS NULL. A live Fiken draft
+    whose draftId has no such row is an orphan: it was created by a run
+    that crashed before recording it, or created by hand in Fiken's UI.
+
+    `project_title` (optional): when set, only drafts whose ourReference
+    casefold-equals the title are returned (scopes the report to one
+    project — ourReference carries the Notion project name).
+
+    Read-only. Returns a list of dicts: {draft_id, uuid, reference,
+    total, issue_date} for operator review before deletion.
+    """
+    drafts = await fiken_client.list_invoice_drafts(company_slug)
+
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(FikenInvoice.fiken_invoice_id).where(
+                    FikenInvoice.company_slug == company_slug,
+                    FikenInvoice.sent_at.is_(None),
+                )
+            )
+        ).scalars()
+        known_active = {r for r in rows if r}
+
+    return _filter_orphan_drafts(
+        drafts, known_active, project_title=project_title
+    )
+
+
+async def delete_draft_and_mark_stale(
+    company_slug: str, draft_id: str
+) -> str:
+    """Delete a Fiken draft and stamp sent_at on any matching audit row.
+
+    Returns the delete_invoice_draft result ("deleted" / "gone" /
+    "error"). The audit row is marked stale regardless of delete outcome
+    when the draft is confirmed gone/deleted, so the in-flight set drops
+    it either way.
+    """
+    outcome = await fiken_client.delete_invoice_draft(company_slug, draft_id)
+    if outcome in ("deleted", "gone"):
+        await _mark_audit_row_stale(company_slug, draft_id)
+    return outcome
+
+
+async def reset_project_drafts(
+    company_slug: str, project_page_id: str
+) -> dict[str, Any]:
+    """Wipe all draft-in-flight state for one project so a fresh Send
+    faktura click starts clean.
+
+    For every FikenInvoice row of this project with sent_at IS NULL:
+      - best-effort DELETE the live Fiken draft,
+      - stamp sent_at so it drops out of the slutt remainder math and
+        the block check.
+
+    Does NOT touch Notion billing columns (Fakturert beløp / status) —
+    those are the operator's to set, and graduation owns them. This only
+    clears the PHANTOM draft state that was making a cleared-in-Notion
+    project still read as half-billed.
+
+    Returns a summary dict for logging / the debug response.
+    """
+    async with SessionLocal() as session:
+        unsent = list(
+            (
+                await session.execute(
+                    select(FikenInvoice.fiken_invoice_id).where(
+                        FikenInvoice.company_slug == company_slug,
+                        FikenInvoice.project_page_id == project_page_id,
+                        FikenInvoice.sent_at.is_(None),
+                    )
+                )
+            ).scalars()
+        )
+
+    results: list[dict[str, str]] = []
+    for draft_id in unsent:
+        if not draft_id:
+            continue
+        outcome = await delete_draft_and_mark_stale(company_slug, draft_id)
+        results.append({"draft_id": draft_id, "outcome": outcome})
+        logger.info(
+            "reset_project_drafts: project=%s draft=%s → %s",
+            project_page_id,
+            draft_id,
+            outcome,
+        )
+
+    return {
+        "project_page_id": project_page_id,
+        "unsent_audit_rows": len(unsent),
+        "drafts_processed": results,
+    }
+
+
+# ============================================================
 # Notion-side: read Fakturamottaker → Orgnr off the project (one hop)
 # ============================================================
 
@@ -2313,14 +2473,55 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
         )
     result.fiken_invoice_id = draft_id or None
 
+    # 7. RESILIENCE-CRITICAL ORDERING. The Fiken POST above is an
+    # irreversible external side-effect, and everything that follows it
+    # (uuid GET, per-line audit, Notion writes) can throw. If a throw
+    # rolls back the FikenInvoice parent row, a retry of this task finds
+    # no unsent-draft audit row, the same-mode block check at the top
+    # passes, and we POST a SECOND draft — that's exactly how this
+    # project ended up with a pile of orphan drafts.
+    #
+    # So: commit the FikenInvoice parent row in its OWN transaction the
+    # instant the draft exists, BEFORE the uuid GET and BEFORE the line
+    # inserts. After this point, a crash leaves a durable "the draft
+    # exists" record; the block check sees it and the retry skips
+    # re-POSTing. draft_uuid / lines are filled in by separate
+    # transactions below so their failure can never erase the parent.
+    invoice_fraction = OPPSTART_FRACTION if invoice_type == "oppstart" else 1.0
+    if draft_id:
+        async with SessionLocal() as session:
+            await session.execute(
+                pg_insert(FikenInvoice)
+                .values(
+                    company_slug=company_slug,
+                    fiken_invoice_id=draft_id,
+                    project_page_id=project_page_id,
+                    invoice_type=invoice_type,
+                    invoice_fraction=invoice_fraction,
+                    # draft_uuid is unknown until the GET below; a retry
+                    # that already populated it must NOT have it nulled,
+                    # so we DON'T set it here and DON'T overwrite it in
+                    # the conflict clause.
+                )
+                .on_conflict_do_update(
+                    index_elements=["company_slug", "fiken_invoice_id"],
+                    set_={
+                        "project_page_id": project_page_id,
+                        "invoice_type": invoice_type,
+                        "invoice_fraction": invoice_fraction,
+                    },
+                )
+            )
+            await session.commit()
+
     # The POST response carries only the numeric draftId, but Fiken's UI
     # paths the draft on its `uuid`. Fetch once to read the uuid; degrade
-    # to None on failure (the audit trail still preserves the draft_id).
+    # to None on failure (the parent row above already records the draft).
     #
     # Phase C.3a — the draft `uuid` is ALSO the FK that lets the poller
     # match a sent invoice back to this row (Fiken mints a fresh
     # `invoiceId` at send-time, but `invoiceDraftUuid` on the sent
-    # record == the draft's `uuid`). Stored on FikenInvoice below.
+    # record == the draft's `uuid`).
     draft_url: str | None = None
     draft_uuid_for_audit: str | None = None
     if draft_id:
@@ -2342,35 +2543,40 @@ async def create_fiken_invoice(project_page_id: str) -> InvoiceCreateResult:
             )
     result.draft_url = draft_url
 
-    # 7. Audit trail: persist FikenInvoice + FikenInvoiceLine.
+    # Backfill draft_uuid onto the already-committed parent row (own txn).
+    # Matches the upsert pattern used elsewhere (_mark_audit_row_stale) so
+    # the row exists even in the unreachable case where the parent insert
+    # above was skipped.
+    if draft_id and draft_uuid_for_audit:
+        try:
+            async with SessionLocal() as session:
+                await session.execute(
+                    pg_insert(FikenInvoice)
+                    .values(
+                        company_slug=company_slug,
+                        fiken_invoice_id=draft_id,
+                        draft_uuid=draft_uuid_for_audit,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["company_slug", "fiken_invoice_id"],
+                        set_={"draft_uuid": draft_uuid_for_audit},
+                    )
+                )
+                await session.commit()
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "send_faktura: failed to backfill draft_uuid for %s: %s "
+                "(non-fatal; graduation can still match via ourReference)",
+                draft_id,
+                err,
+            )
+
+    # Per-line audit trail, in its OWN transaction. A failure here (e.g.
+    # the historical NULL-discipline crash) parks the task as failed but
+    # does NOT erase the parent row above — so the retry's block check
+    # short-circuits instead of minting a duplicate draft.
     if draft_id:
         async with SessionLocal() as session:
-            invoice_fraction = (
-                OPPSTART_FRACTION if invoice_type == "oppstart" else 1.0
-            )
-            await session.execute(
-                pg_insert(FikenInvoice)
-                .values(
-                    company_slug=company_slug,
-                    fiken_invoice_id=draft_id,
-                    project_page_id=project_page_id,
-                    invoice_type=invoice_type,
-                    invoice_fraction=invoice_fraction,
-                    draft_uuid=draft_uuid_for_audit,
-                )
-                .on_conflict_do_update(
-                    index_elements=["company_slug", "fiken_invoice_id"],
-                    set_={
-                        "project_page_id": project_page_id,
-                        "invoice_type": invoice_type,
-                        "invoice_fraction": invoice_fraction,
-                        # Update draft_uuid on re-clicks too — Fiken
-                        # could (in theory) re-issue the draft and
-                        # mint a new uuid; the most recent wins.
-                        "draft_uuid": draft_uuid_for_audit,
-                    },
-                )
-            )
             for line in lines:
                 if not line.oppgave_page_id:
                     continue

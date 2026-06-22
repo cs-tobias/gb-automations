@@ -1309,3 +1309,53 @@ async def test_bulletproof_negative_remainder_still_skipped(
     )
     # `ok` lands; over-billed row stays off the draft.
     assert [l.oppgave_page_id for l in lines] == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# Orphan-draft reconciliation — _filter_orphan_drafts (the pure predicate
+# behind find_orphan_drafts). Resilience tooling for the duplicate-draft
+# class of bug: a live Fiken draft with no active FikenInvoice audit row.
+# ---------------------------------------------------------------------------
+
+
+def _draft(draft_id: str, *, reference: str = "", uuid: str = "u") -> dict[str, Any]:
+    return {
+        "draftId": draft_id,
+        "uuid": uuid,
+        "ourReference": reference,
+        "issueDate": "2026-06-22",
+    }
+
+
+def test_filter_orphan_drafts_flags_drafts_with_no_audit_row():
+    drafts = [_draft("100"), _draft("200"), _draft("300")]
+    # 200 is known/active (has an unsent audit row); 100 + 300 are orphans.
+    known = {"200"}
+    orphans = engine._filter_orphan_drafts(drafts, known)
+    assert {o["draft_id"] for o in orphans} == {"100", "300"}
+
+
+def test_filter_orphan_drafts_scopes_by_reference_when_title_given():
+    drafts = [
+        _draft("100", reference="Cinesuit AS"),
+        _draft("200", reference="Annet Prosjekt"),
+        _draft("300", reference=""),  # blank ref — unattributable
+    ]
+    orphans = engine._filter_orphan_drafts(
+        drafts, set(), project_title="cinesuit as"  # casefold match
+    )
+    # Only the casefold-exact ourReference match survives; blank + other
+    # project are left alone (never deleted by a project-scoped call).
+    assert [o["draft_id"] for o in orphans] == ["100"]
+
+
+def test_filter_orphan_drafts_unscoped_returns_all_orphans():
+    drafts = [_draft("100", reference="x"), _draft("300", reference="")]
+    orphans = engine._filter_orphan_drafts(drafts, set(), project_title=None)
+    assert {o["draft_id"] for o in orphans} == {"100", "300"}
+
+
+def test_filter_orphan_drafts_ignores_payload_without_draft_id():
+    drafts = [{"uuid": "u", "ourReference": "x"}, _draft("100")]
+    orphans = engine._filter_orphan_drafts(drafts, set())
+    assert [o["draft_id"] for o in orphans] == ["100"]

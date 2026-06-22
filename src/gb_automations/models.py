@@ -723,7 +723,9 @@ class FikenInvoiceLine(Base):
     company_slug: Mapped[str] = mapped_column(String(64), primary_key=True)
     fiken_invoice_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     oppgave_page_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    discipline: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Nullable: rows whose Type isn't a recognized discipline (free-text /
+    # internal tasks) are billable now and land on the draft with discipline=None.
+    discipline: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # NOK amount actually billed on THIS invoice line, in øre (integer cents)
     # so float drift is impossible. The cumulative sum across all of an
     # Oppgave's lines equals what Notion's `Fakturert beløp` holds (modulo

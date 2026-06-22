@@ -692,6 +692,81 @@ async def create_invoice_draft(
         return {"Location": location}
 
 
+async def list_invoice_drafts(company_slug: str) -> list[dict[str, Any]]:
+    """`GET /companies/{slug}/invoices/drafts` — every UNSENT draft, paginated.
+
+    The counterpart to `list_sent_invoices` (which lists SENT invoices on
+    the /invoices path). Used by the orphan-draft reconciliation tooling:
+    a draft present here whose numeric `draftId` has no `FikenInvoice`
+    audit row in Postgres is an orphan (created by a run that crashed
+    before recording it, or created by hand in Fiken's UI). Pagination is
+    0-indexed (see list_contacts docstring).
+    """
+    rows: list[dict[str, Any]] = []
+    page = 0
+    async with await _client() as client:
+        while True:
+            params: dict[str, Any] = {"page": page, "pageSize": 100}
+            response = await _with_retries(
+                lambda p=params: client.get(
+                    f"/companies/{company_slug}/invoices/drafts",
+                    params=p,
+                ),
+                op_name="list_invoice_drafts",
+            )
+            _raise_for_status(response)
+            data = _unwrap_list(response.json())
+            if not data:
+                break
+            rows.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+    return rows
+
+
+async def delete_invoice_draft(company_slug: str, draft_id: str) -> str:
+    """`DELETE /companies/{slug}/invoices/drafts/{id}` — non-raising.
+
+    Returns one of:
+      "deleted" — Fiken returned 2xx, the draft is gone.
+      "gone"    — Fiken returned 404, the draft was already deleted/sent.
+                  (Idempotent: the caller's goal — "this draft no longer
+                  exists" — is satisfied either way.)
+      "error"   — any other status / network failure. Caller should log
+                  and NOT assume the draft was removed.
+
+    Draft deletion was deliberately omitted from this wrapper in v2 (the
+    operator did it in Fiken's UI). It's added now for the orphan-draft
+    cleanup tooling — the engine can create duplicate drafts when a run
+    crashes between the POST and the audit write, and the operator needs
+    a programmatic way to clear them.
+    """
+    try:
+        async with await _client() as client:
+            response = await _with_retries(
+                lambda: client.delete(
+                    f"/companies/{company_slug}/invoices/drafts/{draft_id}"
+                ),
+                op_name="delete_invoice_draft",
+            )
+    except Exception as err:  # noqa: BLE001
+        logger.warning(
+            "delete_invoice_draft: %s failed: %s", draft_id, err
+        )
+        return "error"
+    if response.status_code == 404:
+        return "gone"
+    if 200 <= response.status_code < 300:
+        return "deleted"
+    logger.warning(
+        "delete_invoice_draft: %s returned unexpected status %s",
+        draft_id,
+        response.status_code,
+    )
+    return "error"
+
+
 async def create_credit_note_draft(
     company_slug: str,
     *,
@@ -798,4 +873,6 @@ __all__ = [
     "list_products",
     "list_bank_accounts",
     "create_invoice_draft",
+    "list_invoice_drafts",
+    "delete_invoice_draft",
 ]
