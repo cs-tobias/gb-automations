@@ -29,7 +29,7 @@ across all companies, this one targets a single Notion project and:
           the Faktura DB (idempotent via FakturaNotionCache).
         - When the match was PRIMARY (we know which Oppgaver were
           on the invoice via FikenInvoiceLine), graduates statuses:
-          set Fakturert status to "Fakturert 50%" (oppstart) or
+          set Fakturert status to "Oppstart fakturert" (oppstart) or
           "Fakturert" (slutt) on each Oppgave; set Project Faktura
           status to the right history value; clear both handling
           columns to blank.

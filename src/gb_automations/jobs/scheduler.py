@@ -83,7 +83,7 @@ async def _enqueue_fiken_graduations_for_all_active_projects() -> None:
     # terminal (operator hasn't queued anything). Most projects in
     # flight will have one of: Til oppstartsfaktura / Til
     # avslutningsfaktura / Til fakturering / Til kreditering /
-    # Fakturert 50%.
+    # Oppstart fakturert.
     terminal = {
         None,
         "",

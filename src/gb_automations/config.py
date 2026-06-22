@@ -805,13 +805,13 @@ FIKEN_FREE_TEXT_INCOME_ACCOUNT = "3020"
 # ---- Oppgaver: Fakturert status (single status column) -------------
 #
 #   Ikke fakturert (default) — never sent; eligible for both modes
-#   Fakturert 50%            — oppstart invoice SENT; slutt eligible
+#   Oppstart fakturert       — oppstart invoice SENT; slutt eligible
 #   Fakturert                — fully sent (single-shot or after slutt)
 #   Utgår                    — operator opt-out; engine skips in every
 #                              mode. Manual-only; engine never writes.
 FAKTURERT_STATUS_PROP = OPPGAVER_PROPS["billed_status"]
 FAKTURERT_STATUS_IKKE = "Ikke fakturert"
-FAKTURERT_STATUS_50 = "Fakturert 50%"
+FAKTURERT_STATUS_50 = "Oppstart fakturert"
 FAKTURERT_STATUS_FULL = "Fakturert"
 FAKTURERT_STATUS_UTGAR = "Utgår"
 # Engine-written when a kreditnota fully reverses a prior faktura on
@@ -843,14 +843,14 @@ FAKTURERT_STATUSES_SKIP = frozenset({
 #   Til fakturering          — exact synonym of avslutningsfaktura
 #                              (shorter wording the CEO uses); engine
 #                              maps both to the same "slutt" mode
-#   Fakturert 50%            — engine-written after oppstart graduation
+#   Oppstart fakturert       — engine-written after oppstart graduation
 #   Fakturert                — engine-written after slutt graduation
 PROJECTS_FAKTURA_STATUS_PROP = "Faktura status"
 FAKTURA_STATUS_IKKE = "Ikke fakturert"
 FAKTURA_STATUS_TIL_OPPSTART = "Til oppstartsfaktura"
 FAKTURA_STATUS_TIL_AVSLUTNING = "Til avslutningsfaktura"
 FAKTURA_STATUS_TIL_FAKTURERING = "Til fakturering"
-FAKTURA_STATUS_50 = "Fakturert 50%"
+FAKTURA_STATUS_50 = "Oppstart fakturert"
 FAKTURA_STATUS_FULL = "Fakturert"
 # Operator-picked: next click creates a DRAFT kreditnota in Fiken for
 # every sent FikenInvoice on this project that doesn't already have

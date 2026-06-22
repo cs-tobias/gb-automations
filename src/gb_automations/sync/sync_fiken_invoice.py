@@ -19,7 +19,7 @@ Algorithm:
          - `Fakturert status` is NOT in {"Fakturert", "Utgår"}.
          - For oppstart: `Fakturert status == "Ikke fakturert"`.
          - For slutt: `Fakturert status ∈ {"Ikke fakturert",
-           "Fakturert 50%"}`.
+           "Oppstart fakturert"}`.
     3. Per row, compute the NOK amount to bill on this run. `Pris` is
        the current agreed full price and is MUTABLE — operators can
        renegotiate between oppstart and slutt and the slutt run picks
@@ -236,7 +236,7 @@ def _eligible_rows(
         billed.
       - `Fakturert status == "Utgår"` — operator excluded.
       - `Fakturert status == "Fakturert"` — already fully billed.
-      - oppstart click + `Fakturert status == "Fakturert 50%"`
+      - oppstart click + `Fakturert status == "Oppstart fakturert"`
         — oppstart already sent; only slutt remains.
       - row's page id is in `rows_on_unsent_drafts` — there's a
         FikenInvoice row in Postgres with sent_at NULL whose
