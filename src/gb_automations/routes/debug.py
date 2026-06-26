@@ -1880,6 +1880,8 @@ async def debug_fiken_inspect(
         reasons: list[str] = []
         if (raw_type or "").strip().lower() == KORREKSJON_KIND_KORREKSJONSRUNDE.lower():
             reasons.append("Type = Korreksjonsrunde (Frame.io admin sub-row, never billed)")
+        if price is None or price <= 0:
+            reasons.append("Pris missing or ≤ 0 — not a billable line (never sent to Fiken)")
         if fakturert_status in (FAKTURERT_STATUS_FULL, FAKTURERT_STATUS_UTGAR):
             reasons.append(f"Fakturert status = {fakturert_status!r}")
         if invoice_type == "oppstart" and fakturert_status != FAKTURERT_STATUS_IKKE:

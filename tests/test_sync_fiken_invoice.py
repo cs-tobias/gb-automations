@@ -445,22 +445,18 @@ def test_row_billable_slutt_skips_when_remaining_zero_or_negative():
     assert engine._row_billable_nok(row, "slutt") is None
 
 
-def test_row_billable_missing_or_zero_price_lands_as_kr_zero():
-    """Bulletproof: missing or zero Pris does NOT skip — the row lands
-    on the draft as a kr 0 line so the operator sees it and can fill
-    in the Pris (then re-click, or edit the line directly in Fiken).
+def test_row_billable_missing_or_zero_price_returns_none():
+    """Missing or zero Pris → None (not a billable line). The client does
+    not want kr 0 lines on the draft; such rows are filtered by
+    _eligible_rows, and _row_billable_nok returns None for coherence
+    with direct callers like /debug/fiken/inspect.
     """
     for case in (
         _oppgave(page_id="a", pris=None),
         _oppgave(page_id="b", pris=0.0),
     ):
-        result = engine._row_billable_nok(case, "oppstart")
-        assert result is not None
-        to_bill, new_total, unit_price, quantity_fraction, _ = result
-        assert to_bill == 0.0
-        assert new_total == 0.0
-        assert unit_price == 0.0
-        assert quantity_fraction == 0.5
+        assert engine._row_billable_nok(case, "oppstart") is None
+        assert engine._row_billable_nok(case, "slutt") is None
 
 
 def test_row_billable_rabatt_uses_notion_percent_format():
@@ -626,13 +622,30 @@ async def test_build_line_items_slutt_with_renegotiation(
     assert lines[0].new_billed_amount_nok == 10_000.0
 
 
+def test_eligible_rows_skips_missing_or_zero_price():
+    """A row with no Pris (or Pris ≤ 0) is NOT a billable line — excluded
+    by eligibility, exactly like a Korreksjonsrunde row. The client does
+    not want kr 0 lines on the Fiken draft, and a skipped row gets no
+    audit line so it's invisible to graduation matching too.
+    """
+    rows = [
+        _oppgave(page_id="ok", name="Stue", pris=5000.0),
+        _oppgave(page_id="no_price", name="Kjøkken", pris=None),
+        _oppgave(page_id="zero", name="Bad", pris=0.0),
+    ]
+    eligible = engine._eligible_rows(rows, "oppstart")
+    assert [r["id"] for r in eligible] == ["ok"]
+    # Same on slutt.
+    eligible_slutt = engine._eligible_rows(rows, "slutt")
+    assert [r["id"] for r in eligible_slutt] == ["ok"]
+
+
 @pytest.mark.asyncio
-async def test_build_line_items_bulletproof_lands_blank_price_as_kr_zero(
+async def test_build_line_items_only_priced_rows_land(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Bulletproof: rows with missing or zero Pris land as kr 0 lines.
-    The operator sees them on the draft and can fix Pris in Notion (then
-    re-click) or edit the line directly in Fiken's UI.
+    """End-to-end: after eligibility filters zero-price rows, only the
+    priced row produces a Fiken line.
     """
     monkeypatch.setattr(
         engine, "_resolve_kategori_to_product_id", _stub_resolver()
@@ -646,16 +659,10 @@ async def test_build_line_items_bulletproof_lands_blank_price_as_kr_zero(
     lines = await engine._build_line_items(
         eligible, invoice_type="oppstart", company_slug="probe"
     )
-    # All three rows land; ok=kr 2500 (50% of 5000), the other two=kr 0.
     by_id = {l.oppgave_page_id: l for l in lines}
-    assert set(by_id) == {"ok", "no_price", "zero"}
-    assert by_id["ok"].amount_nok_ore == 250_000
-    assert by_id["no_price"].amount_nok_ore == 0
-    assert by_id["zero"].amount_nok_ore == 0
-    # Unit price falls through: ok=5000 NOK (500_000 øre), others 0.
+    assert set(by_id) == {"ok"}
+    assert by_id["ok"].amount_nok_ore == 250_000  # 50% of 5000
     assert by_id["ok"].unit_price_nok_ore == 500_000
-    assert by_id["no_price"].unit_price_nok_ore == 0
-    assert by_id["zero"].unit_price_nok_ore == 0
 
 
 @pytest.mark.asyncio

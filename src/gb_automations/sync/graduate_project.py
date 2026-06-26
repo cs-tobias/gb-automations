@@ -987,6 +987,14 @@ async def _project_oppgaver_all_kreditert(
         ).strip().lower()
         if raw_type == _KORREKSJON.lower():
             continue
+        # Zero/missing-Pris rows are never invoiced (filtered by
+        # _eligible_rows), so they never reach Kreditert/Utgår. Ignore
+        # them here too — exactly like Korreksjonsrunde — otherwise a
+        # single unpriced row would permanently block the all-Kreditert
+        # project rollup.
+        price = notion_client.read_number_prop(row, _OPPS["price_per_row"])
+        if price is None or price <= 0:
+            continue
         status = (
             notion_client.read_select_name(row, _OPPS["billed_status"])
             or ""

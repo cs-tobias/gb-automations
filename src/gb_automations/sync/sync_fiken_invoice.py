@@ -234,6 +234,11 @@ def _eligible_rows(
 
       - `Type == "Korreksjonsrunde"` — Frame.io admin sub-row, never
         billed.
+      - `Pris` is missing or ≤ 0 — a zero-priced row is not a real
+        invoice line. Treated exactly like a Korreksjonsrunde row:
+        never sent to Fiken AND never used in matching/graduation
+        (no audit FikenInvoiceLine is created for it). The client
+        explicitly does not want kr 0 lines on the draft.
       - `Fakturert status == "Utgår"` — operator excluded.
       - `Fakturert status == "Fakturert"` — already fully billed.
       - oppstart click + `Fakturert status == "Oppstart fakturert"`
@@ -244,9 +249,8 @@ def _eligible_rows(
         with the per-project block check in create_fiken_invoice;
         normally empty when we get here.
 
-    Everything else lands — blank Type, unknown Type, missing Pris,
-    missing Kategori. Downstream stages render kr 0 lines / free-text
-    fallbacks gracefully.
+    Everything else lands — blank Type, unknown Type, missing Kategori.
+    Downstream stages render free-text fallbacks gracefully.
     """
     if invoice_type not in ("oppstart", "slutt"):
         raise ValueError(
@@ -260,6 +264,16 @@ def _eligible_rows(
         # "Korreksjonsrunde", or None for blank).
         raw_type = (notion_client.task_discipline(row) or "").strip()
         if raw_type.lower() == KORREKSJON_KIND_KORREKSJONSRUNDE.lower():
+            continue
+
+        # A row with no Pris (or Pris ≤ 0) is not a billable line. Skip
+        # it entirely — like Korreksjonsrunde, it never reaches Fiken and
+        # never gets a FikenInvoiceLine audit row, so it's also invisible
+        # to graduation matching.
+        raw_price = notion_client.read_number_prop(
+            row, OPPGAVER_PROPS["price_per_row"]
+        )
+        if raw_price is None or raw_price <= 0:
             continue
 
         status = (
@@ -333,32 +347,23 @@ def _row_billable_nok(
         unit_price    = Pris             (always; pre-rabatt, full agreed price)
         new_total     = already + to_bill
 
-    Bulletproof mode: missing/zero Pris is treated as Pris=0, NOT a
-    skip. The engine emits a kr 0 line so the operator sees the row on
-    the draft and can fill in the Pris later. Only the genuine
-    "nothing to bill" case (slutt with remaining ≤ 0 — operator
-    lowered Pris below what was already invoiced) returns None; that
-    one is silently skipped because Notion's `Budsjett` vs `Fakturert
-    sum` rollups already make the over-billing visible at project
-    level (and credit-note logic is out of scope for this engine).
+    Missing/zero Pris → returns None (the row is not a billable line).
+    `_eligible_rows` already filters these out before _build_line_items
+    runs, so the normal send path never sees one; this guard keeps the
+    function coherent for direct callers (e.g. /debug/fiken/inspect,
+    which runs it across ALL rows to show why each is skipped). The other
+    None case is slutt with remaining ≤ 0 (operator lowered Pris below
+    what was already invoiced) — visible via Notion's Budsjett vs
+    Fakturert sum rollups; credit-note logic is out of scope here.
     """
     raw_price = notion_client.read_number_prop(
         row, OPPGAVER_PROPS["price_per_row"]
     )
-    # Bulletproof: missing or non-positive Pris becomes 0. The row still
-    # lands on the draft as a kr 0 line so the operator can fix the Pris
-    # in Notion and re-create the draft, OR edit the line directly in
-    # Fiken's UI.
+    # No Pris (or ≤ 0) → not a billable line. The client does not want
+    # kr 0 lines on the draft, so we skip rather than emit a zero line.
     if raw_price is None or raw_price <= 0:
-        logger.info(
-            "fiken send-faktura: row %s has no Pris set — sending kr 0 "
-            "line (operator can fix Pris in Notion and re-click, or edit "
-            "the line in Fiken's UI)",
-            row.get("id"),
-        )
-        price_nok = 0.0
-    else:
-        price_nok = float(raw_price)
+        return None
+    price_nok = float(raw_price)
 
     # Rabatt: Notion's "Percent" number format returns the value as a
     # fraction (0.15 for 15%), NOT as a percent integer (15). The Oppgaver
