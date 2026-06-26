@@ -461,12 +461,10 @@ async def test_graduate_project_no_match_increments_skipped_counter(
     reconcile.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_graduate_project_skips_already_graduated_rows(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Audit row has sent_at NOT NULL → matching invoice is skipped on
-    re-runs without re-calling _reconcile_one."""
+def _setup_already_graduated(monkeypatch: pytest.MonkeyPatch):
+    """Shared fixture: one sent invoice whose audit row is already
+    graduated (sent_at set). Returns the reconcile mock for assertions.
+    """
     from datetime import datetime, timezone
 
     from gb_automations.config import settings
@@ -474,20 +472,15 @@ async def test_graduate_project_skips_already_graduated_rows(
     monkeypatch.setattr(settings, "fiken_company_slug", "goldbox-as")
 
     project_page = _make_project_page(title="0001_Test")
-    sent_invoices = [
-        _make_fiken_invoice(
-            invoice_draft_uuid="uuid-A",
-        )
-    ]
+    sent_invoices = [_make_fiken_invoice(invoice_draft_uuid="uuid-A")]
     audit_rows = [
         _StubFikenInvoice(
-            fiken_invoice_id="4493258455",  # matches sent invoice id
+            fiken_invoice_id="4493258455",
             draft_uuid="uuid-A",
             sent_at=datetime.now(timezone.utc),  # already graduated
             project_page_id="p1",
         )
     ]
-
     monkeypatch.setattr(
         engine.notion_client, "get_page", AsyncMock(return_value=project_page)
     )
@@ -497,16 +490,84 @@ async def test_graduate_project_skips_already_graduated_rows(
         AsyncMock(return_value=sent_invoices),
     )
     monkeypatch.setattr(
+        engine.fiken_client,
+        "list_credit_notes",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
         engine,
         "_load_audit_rows_for_project",
         AsyncMock(return_value=audit_rows),
     )
     reconcile = AsyncMock()
     monkeypatch.setattr(engine, "_reconcile_one", reconcile)
+    return reconcile
+
+
+@pytest.mark.asyncio
+async def test_graduate_project_skips_when_faktura_db_row_exists(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """sent_at set AND Faktura DB row already cached → fully done, skip
+    without re-calling _reconcile_one."""
+    from gb_automations.config import settings
+
+    reconcile = _setup_already_graduated(monkeypatch)
+    monkeypatch.setattr(settings, "faktura_db_id", "fakturadb")
+    # Cache HIT — the Faktura DB row exists.
+    monkeypatch.setattr(
+        engine.notion_faktura_db,
+        "_get_cached_page_id",
+        AsyncMock(return_value="existing-faktura-page"),
+    )
 
     summary = await engine.graduate_project("p1")
     assert summary.skipped_already_graduated == 1
     reconcile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_graduate_project_skips_when_faktura_db_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """sent_at set + FAKTURA_DB_ID unset → nothing to backfill, skip
+    (legacy behavior preserved)."""
+    from gb_automations.config import settings
+
+    reconcile = _setup_already_graduated(monkeypatch)
+    monkeypatch.setattr(settings, "faktura_db_id", "")
+
+    summary = await engine.graduate_project("p1")
+    assert summary.skipped_already_graduated == 1
+    reconcile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_graduate_project_backfills_missing_faktura_db_row(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """sent_at set (statuses already graduated) BUT Faktura DB row is
+    missing (e.g. prior run had FAKTURA_DB_ID unset) → re-enter
+    _reconcile_one in backfill-only mode to write the missing row, with
+    status graduation suppressed so Fakturert beløp isn't double-added.
+    """
+    from gb_automations.config import settings
+
+    reconcile = _setup_already_graduated(monkeypatch)
+    monkeypatch.setattr(settings, "faktura_db_id", "fakturadb")
+    # Cache MISS — the Faktura DB row was never written.
+    monkeypatch.setattr(
+        engine.notion_faktura_db,
+        "_get_cached_page_id",
+        AsyncMock(return_value=None),
+    )
+
+    summary = await engine.graduate_project("p1")
+    # Not counted as skipped — we re-process it.
+    assert summary.skipped_already_graduated == 0
+    reconcile.assert_called_once()
+    # And it's called in backfill-only mode (statuses must NOT re-run).
+    assert reconcile.call_args.kwargs["faktura_db_backfill_only"] is True
 
 
 @pytest.mark.asyncio

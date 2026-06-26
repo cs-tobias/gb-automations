@@ -227,17 +227,43 @@ async def graduate_project(project_page_id: str) -> GraduationSummary:
             else None
         )
 
-        # Skip rows we've already graduated for THIS project on a
-        # previous run. `sent_at` is the per-row marker the graduation
-        # pass stamps when it succeeds; checking it before reconcile
-        # prevents re-adding Fakturert beløp on every Sjekk fiken click.
-        # Note: we check AFTER matching (sent_at lives on the audit row,
-        # which is found via draft_uuid). Fallback-matched invoices
-        # (reference.our / invoice_text) have no audit row → re-process
-        # is harmless (Faktura DB cache, status skip-if-same).
+        # Skip rows we've already FULLY graduated for THIS project on a
+        # previous run. `sent_at` marks "statuses graduated"; checking it
+        # before reconcile prevents re-adding Fakturert beløp on every
+        # Sjekk fiken click. Note we check AFTER matching (sent_at lives
+        # on the audit row, found via draft_uuid). Fallback-matched
+        # invoices (reference.our / invoice_text) have no audit row →
+        # re-process is harmless (Faktura DB cache, status skip-if-same).
+        #
+        # BUT: "graduated statuses" does NOT imply "wrote the Faktura DB
+        # row." If a previous run graduated while FAKTURA_DB_ID was unset
+        # (C.2 dormant), sent_at got stamped but no Faktura DB row exists.
+        # Setting FAKTURA_DB_ID later + re-clicking Sjekk fiken must be
+        # able to backfill it. So when the Faktura DB is enabled, only
+        # skip if the Faktura DB row ALSO already exists (cache hit);
+        # otherwise fall through to _reconcile_one, which writes the
+        # missing row and re-runs status writes idempotently (skip-if-
+        # same makes the status side a no-op, and _mark_invoice_sent is
+        # already set).
+        # `faktura_db_backfill_only` = statuses were already graduated on
+        # a prior run (sent_at set), but the Faktura DB row is missing
+        # (e.g. that run executed while FAKTURA_DB_ID was unset). In that
+        # case we re-enter reconcile to write ONLY the Faktura DB row —
+        # status graduation must be SKIPPED because _graduate_statuses
+        # ADDS to Fakturert beløp with no dedup and would double-count.
+        faktura_db_backfill_only = False
         if matched_audit is not None and matched_audit.sent_at is not None:
-            summary.skipped_already_graduated += 1
-            continue
+            faktura_db_row_missing = False
+            if settings.faktura_db_id:
+                cached = await notion_faktura_db._get_cached_page_id(
+                    summary.company_slug, "faktura", invoice_id
+                )
+                faktura_db_row_missing = cached is None
+            if faktura_db_row_missing:
+                faktura_db_backfill_only = True
+            else:
+                summary.skipped_already_graduated += 1
+                continue
         match_strategy: str
         if matched_audit is not None:
             match_strategy = "draft_uuid"
@@ -286,6 +312,7 @@ async def graduate_project(project_page_id: str) -> GraduationSummary:
             matched_audit=matched_audit,
             project_page_id=project_page_id,
             project_title=summary.project_title,
+            faktura_db_backfill_only=faktura_db_backfill_only,
         )
         summary.matched.append(record)
 
@@ -440,10 +467,17 @@ async def _reconcile_one(
     matched_audit: FikenInvoice | None,
     project_page_id: str,
     project_title: str | None,
+    faktura_db_backfill_only: bool = False,
 ) -> MatchedRecord:
     """Land the Faktura DB row + (when matched_audit is set) graduate
     Project + Oppgave statuses. Best-effort: errors land on the record
     so the operator sees the full picture in one response.
+
+    `faktura_db_backfill_only`: the row's statuses were already graduated
+    on a prior run (sent_at set) but its Faktura DB row is missing. Write
+    ONLY the Faktura DB row; skip status graduation (which ADDS to
+    Fakturert beløp without dedup and would double-count) and skip
+    re-stamping sent_at (already set).
     """
     record = MatchedRecord(
         fiken_invoice_id=invoice_id,
@@ -489,7 +523,10 @@ async def _reconcile_one(
         # Don't abort — try status writes if we have an audit trail.
 
     # ---- B. Status graduation (only on draft_uuid match) ----
-    if matched_audit is not None:
+    # Skipped on a backfill-only re-entry: statuses were already
+    # graduated on the prior run; re-running would double-add Fakturert
+    # beløp (set_oppgave_billed has no dedup).
+    if matched_audit is not None and not faktura_db_backfill_only:
         try:
             statuses_set = await _graduate_statuses(
                 matched_audit=matched_audit,
@@ -516,7 +553,11 @@ async def _reconcile_one(
     # DB row but doesn't have an audit row to flip; subsequent runs
     # will re-write to the same Faktura DB row (cache hit) and stay
     # idempotent.
-    if matched_audit is not None and record.error is None:
+    if (
+        matched_audit is not None
+        and record.error is None
+        and not faktura_db_backfill_only
+    ):
         try:
             await _mark_invoice_sent(
                 company_slug=summary.company_slug,
