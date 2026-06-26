@@ -278,9 +278,18 @@ def test_build_payload_invoice_writes_every_column(
         "url": "https://fiken.no/foretak/goldbox-as/handel/salg/4493497377"
     }
 
-    # PDF URL — browser-friendly link from invoicePdf.
+    # PDF — files & media column: external file entry from invoicePdf's
+    # browser-friendly link, named after the invoice number.
     assert props[FAKTURA_PROPS["pdf_url"]] == {
-        "url": "https://fiken.no/filer/abc/faktura_2026_10051.pdf"
+        "files": [
+            {
+                "name": "10051.pdf",
+                "type": "external",
+                "external": {
+                    "url": "https://fiken.no/filer/abc/faktura_2026_10051.pdf"
+                },
+            }
+        ]
     }
 
     # Relations
@@ -498,7 +507,15 @@ def test_build_payload_credit_note_pulls_pdf_from_creditNotePdf():
         fakturamottaker_page_id=None,
     )
     assert props[FAKTURA_PROPS["pdf_url"]] == {
-        "url": "https://fiken.no/filer/xyz/kreditnota_2026_20003.pdf"
+        "files": [
+            {
+                "name": "5.pdf",
+                "type": "external",
+                "external": {
+                    "url": "https://fiken.no/filer/xyz/kreditnota_2026_20003.pdf"
+                },
+            }
+        ]
     }
 
 
@@ -533,7 +550,15 @@ def test_build_payload_falls_back_to_downloadUrl_when_no_browser_url():
         fakturamottaker_page_id=None,
     )
     assert props[FAKTURA_PROPS["pdf_url"]] == {
-        "url": "https://api.fiken.no/api/v2/files/abc/x.pdf"
+        "files": [
+            {
+                "name": "10051.pdf",
+                "type": "external",
+                "external": {
+                    "url": "https://api.fiken.no/api/v2/files/abc/x.pdf"
+                },
+            }
+        ]
     }
 
 

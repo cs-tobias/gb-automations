@@ -359,7 +359,22 @@ def _build_payload(
     if url:
         props[FAKTURA_PROPS["url"]] = {"url": url}
     if pdf_url:
-        props[FAKTURA_PROPS["pdf_url"]] = {"url": pdf_url}
+        # `Faktura PDF` is a files & media column in the operator's DB
+        # (their existing Make-written rows embed the PDF, so clicking it
+        # downloads the file). Write it as an EXTERNAL file entry rather
+        # than a plain url so new rows match — Notion renders an external
+        # file as a clickable attachment. `name` must end in a file-ish
+        # label; we use the invoice number so the download is identifiable.
+        pdf_name = f"{number_str}.pdf" if number_str else "faktura.pdf"
+        props[FAKTURA_PROPS["pdf_url"]] = {
+            "files": [
+                {
+                    "name": pdf_name,
+                    "type": "external",
+                    "external": {"url": pdf_url},
+                }
+            ]
+        }
 
     # Relations — blank when unresolved.
     if project_page_id:

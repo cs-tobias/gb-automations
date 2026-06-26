@@ -971,14 +971,15 @@ FAKTURA_PROPS = {
     # /handel/salg/{saleId} for both invoices + kreditnotas).
     # The clickable "open in Fiken" link.
     "url": "URL",
-    # url — DIRECT link to the printed invoice/kreditnota PDF in
-    # Fiken's file store. Fiken's payload nests this under
-    # `invoicePdf` on invoices and `creditNotePdf` on kreditnotas;
-    # both expose `downloadUrlWithFikenNormalUserCredentials` which
-    # is the browser-friendly URL (auto-authenticates the user via
-    # their Fiken session — opens straight to the PDF). The
-    # `downloadUrl` sibling requires a Bearer token; we don't use
-    # it because the operator clicking from Notion doesn't have one.
+    # files & media (NOT url) — the operator's DB has this column as a
+    # files property and their existing Make-written rows embed the PDF
+    # (clicking downloads it). The writer emits an EXTERNAL file entry
+    # pointing at the Fiken PDF so new rows match. Source URL: Fiken
+    # nests the PDF under `invoicePdf` (invoices) / `creditNotePdf`
+    # (kreditnotas); both expose `downloadUrlWithFikenNormalUserCredentials`,
+    # the browser-friendly URL that auto-authenticates via the operator's
+    # Fiken session. The `downloadUrl` sibling needs a Bearer token, so
+    # we don't use it (the operator clicking from Notion has none).
     "pdf_url": "Faktura PDF",
 }
 
