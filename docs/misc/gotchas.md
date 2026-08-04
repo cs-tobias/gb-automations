@@ -357,6 +357,18 @@ docker compose exec db psql -U gb -d gb -c \
 
 ---
 
+## 19. Fiken graduation cron re-enqueue storm — an engine-written resting `Faktura status` must be terminal
+
+**Symptom:** the queue fills with hundreds of `graduate_faktura` tasks every hour, each logging `scanned=1136 matched=0 skipped_already=0 skipped_no_match=1221` and doing nothing. Looks alarming ("massive invoice thing!") but writes zero — every side-effect in `graduate_project` lives inside `_reconcile_one`, which is only reached on a match, so `matched=0` means no Notion/Fiken changes. It's pure noise, but it hammers the Fiken API (full invoice catalogue re-scanned per project per hour) and starves the single worker.
+
+**Why:** the hourly poller `_enqueue_fiken_graduations_for_all_active_projects` ([jobs/scheduler.py](../../src/gb_automations/jobs/scheduler.py)) enqueues a task for every project whose `Faktura status` is NOT in its `terminal` set. `Oppstart fakturert` (`FAKTURA_STATUS_50`) is an **engine-written resting state** — the 50% invoice already graduated and stamped `sent_at`, so the project sits there (possibly for weeks) until the operator manually picks `Til avslutningsfaktura`. If that value is missing from `terminal`, EVERY 50%-billed project is non-terminal forever and gets re-enqueued every hour indefinitely. With ~180 such projects that's ~180 pointless full-catalogue scans per hour.
+
+**Fix / rule:** only OPERATOR-INTENT statuses (`Til …`) belong in the actively-polled (non-terminal) set. Any status the ENGINE writes as a resting end-of-step state (`Oppstart fakturert`, `Fakturert`, `Kreditert`) must be in `terminal`. When you add a new intermediate Faktura status later, decide which side wrote it: engine-resting → terminal; operator-intent → non-terminal.
+
+**Recovery when it's already storming:** deploy the corrected `terminal` set FIRST (so the next :07 cron tick can't refill), then clear the backlog — `DELETE FROM sync_tasks WHERE task_type='graduate_faktura' AND status IN ('pending','in_progress')` (scope strictly to `graduate_faktura`; leave Gmail/label/Frame tasks alone). Confirm via `/debug/queue`. As a belt-and-suspenders kill switch, `SYNC_FIKEN_GRADUATIONS=false` + `--force-recreate api` stops the cron entirely.
+
+---
+
 ## When this list grows
 
 Add an entry whenever something costs you more than 15 minutes to figure out the second time. Future-you and the office PC handoff will both thank you.

@@ -66,6 +66,7 @@ async def _enqueue_fiken_graduations_for_all_active_projects() -> None:
     """
     from gb_automations.clients import notion as notion_client
     from gb_automations.config import (
+        FAKTURA_STATUS_50,
         FAKTURA_STATUS_FULL,
         FAKTURA_STATUS_IKKE,
         FAKTURA_STATUS_KREDITERT,
@@ -80,14 +81,25 @@ async def _enqueue_fiken_graduations_for_all_active_projects() -> None:
         return
 
     # "Active" = anything not at a terminal end-state. Blank counts as
-    # terminal (operator hasn't queued anything). Most projects in
-    # flight will have one of: Til oppstartsfaktura / Til
-    # avslutningsfaktura / Til fakturering / Til kreditering /
-    # Oppstart fakturert.
+    # terminal (operator hasn't queued anything). The actively-polled
+    # (non-terminal) set is exactly the four OPERATOR-INTENT values:
+    # Til oppstartsfaktura / Til avslutningsfaktura / Til fakturering /
+    # Til kreditering.
+    #
+    # `Oppstart fakturert` (FAKTURA_STATUS_50) is terminal HERE even
+    # though it's mid-lifecycle: it's an ENGINE-WRITTEN resting state
+    # after the 50% invoice graduated (sent_at stamped), so re-scanning
+    # can only ever produce matched=0 / skipped_already. The project
+    # re-enters the poller the instant the operator flips it to
+    # Til avslutningsfaktura (bill the rest). Leaving it out of this set
+    # caused every 50%-billed project to be re-enqueued EVERY HOUR
+    # forever, each re-scanning Fiken's full invoice catalogue for
+    # nothing — see gotchas.md.
     terminal = {
         None,
         "",
         FAKTURA_STATUS_IKKE,
+        FAKTURA_STATUS_50,
         FAKTURA_STATUS_FULL,
         FAKTURA_STATUS_KREDITERT,
     }
