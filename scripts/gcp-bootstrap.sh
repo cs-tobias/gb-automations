@@ -35,8 +35,8 @@ set -euo pipefail
 # INPUTS — edit these four lines, then paste the rest unchanged.
 # ────────────────────────────────────────────────────────────────────────────
 
-DOMAIN="example.com"
-PROJECT_ID="my-gb-project"
+DOMAIN="goldbox.no"
+PROJECT_ID="gb-automations"
 PROJECT_NAME="gb-automations"
 
 # ────────────────────────────────────────────────────────────────────────────
