@@ -8,7 +8,7 @@ button or POST /debug/queue/retry-failed.
 
 Usage (inside the api container):
     docker compose exec api python -m gb_automations.sync.sync_one \
-        --email tobias@tobiaseek.com \
+        --email user@your-workspace-domain \
         --thread <gmail_thread_id>
 
 The thread ID is the same one shown in /debug/inbox (the `id` field of each message).

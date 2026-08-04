@@ -62,7 +62,7 @@ async def main() -> None:
     if not settings.frame_redirect_uri:
         _die(
             "FRAME_REDIRECT_URI must be set in .env. Example:\n"
-            "  FRAME_REDIRECT_URI=https://hub.tobiaseek.com/oauth/frame/callback\n"
+            "  FRAME_REDIRECT_URI=https://hub.<your-domain>/oauth/frame/callback\n"
             "(Must match EXACTLY the Redirect URI you set in Adobe Developer Console.)"
         )
 

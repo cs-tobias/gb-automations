@@ -353,7 +353,7 @@ class Settings(BaseSettings):
     # comma-separated list of `toggl_email=notion_email` pairs. Set when your
     # personal Toggl + Notion accounts don't share an email (production
     # Goldbox accounts do, so this is left blank there). Example:
-    #   TOGGL_DEV_EMAIL_OVERRIDES=tobias@cinesuit.com=tobias@my-notion.com
+    #   TOGGL_DEV_EMAIL_OVERRIDES=you@example.com=you@my-notion.com
     # An override only swaps the email used for the Notion-user lookup — the
     # Toggl side (TogglUserCache, time-entry attribution, user-name display)
     # is untouched.

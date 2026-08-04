@@ -47,6 +47,10 @@ secrets/
 *.swo
 .DS_Store
 
+# Claude Code — per-machine local state (personal paths + one-off permission
+# grants). A shared .claude/settings.json (if ever added) stays trackable.
+.claude/settings.local.json
+
 # Docker
 # (compose.override.yml is gitignored so devs can override locally)
 docker-compose.override.yml

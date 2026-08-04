@@ -42,7 +42,7 @@ services:
     restart: unless-stopped
 
   # Cloudflare Tunnel: exposes the api service to the public internet at
-  # https://hub.tobiaseek.com. Requires CLOUDFLARE_TUNNEL_TOKEN in .env.
+  # https://hub.<your-domain>. Requires CLOUDFLARE_TUNNEL_TOKEN in .env.
   # If the token is empty (e.g. brand-new clone before setup), the container
   # will crash-loop visibly — that's intentional, signals "you forgot to
   # configure the tunnel". To skip starting it for purely-local dev, run:

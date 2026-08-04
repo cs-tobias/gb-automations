@@ -35,9 +35,9 @@ set -euo pipefail
 # INPUTS — edit these four lines, then paste the rest unchanged.
 # ────────────────────────────────────────────────────────────────────────────
 
-DOMAIN="tobiaseek.com"
-PROJECT_ID="tobiaseek-gb-test"
-PROJECT_NAME="gb-automations test"
+DOMAIN="example.com"
+PROJECT_ID="my-gb-project"
+PROJECT_NAME="gb-automations"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Constants — don't change unless you know why.
