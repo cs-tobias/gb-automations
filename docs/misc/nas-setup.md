@@ -34,22 +34,29 @@ silently lands an empty directory (see [gotchas.md §15](gotchas.md)).
 2. **Set `.env`:**
    ```
    SYNC_NAS_FOLDERS=true
-   NAS_CIFS_DEVICE=//192.168.1.200/filserver/gb-automations-test   # FORWARD slashes; the subfolder is the test root
+   NAS_CIFS_DEVICE=//192.168.1.200/filserver                          # the share ROOT, FORWARD slashes - never a sub-folder
    NAS_USER=petter
    NAS_PASS=<password for that share>
-   NAS_PROJECTS_ROOT=/mnt/nas/Prosjekt                              # the Prosjekt root inside the share
-   NAS_HOST_PATH=W:\gb-automations-test                             # Windows display path for Notion writeback (cosmetic)
-   # NAS_RECEIVED_SUBFOLDER=Mottatt                                 # default; override only if Goldbox renames it
+   NAS_PROJECTS_ROOT=/mnt/nas/gb-automations-test/Prosjekt            # test root; sub-folders go HERE
+   NAS_HOST_PATH=W:                                                   # Windows name of the share root (Notion writeback, cosmetic)
+   # NAS_RECEIVED_SUBFOLDER=Mottatt                                   # default; override only if Goldbox renames it
    ```
    `docker-compose.yml` declares the `nas` CIFS volume with these credentials.
    `NAS_HOST_PATH` is purely the display path written into the Projects-DB
-   NAS URL column — it's never used as a mount source.
+   NAS URL column — it's never used as a mount source. It must name the same
+   folder `NAS_CIFS_DEVICE` mounts (the share root → `W:`).
 
-   For live (after the test sub-folder is validated), switch to:
+   **Always mount the share root, never a sub-folder.** If a sub-folder in
+   `NAS_CIFS_DEVICE` is ever renamed or deleted on the NAS, the mount fails
+   with "no such file or directory", and Docker then won't start the api at
+   all. That takes Gmail, Frame and Fiken down too; it happened in Nov 2026
+   when `gb-automations-test` disappeared. A missing `NAS_PROJECTS_ROOT`
+   folder only affects NAS sync, and the app recreates it on the mounted share
+   by itself (`clients/nas.py` `nas_available`).
+
+   For live (after the test folder is validated), switch only:
    ```
-   NAS_CIFS_DEVICE=//192.168.1.200/filserver
-   NAS_HOST_PATH=W:
-   # NAS_PROJECTS_ROOT stays /mnt/nas/Prosjekt
+   NAS_PROJECTS_ROOT=/mnt/nas/Prosjekt
    ```
 
 3. **Activate the prod overlay** by adding `COMPOSE_FILE` to `.env`. The

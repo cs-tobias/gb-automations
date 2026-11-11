@@ -68,8 +68,10 @@ volumes:
   # nas_available() in clients/nas.py is the runtime check for an
   # already-mounted-but-unwritable share.
   #
-  # NAS_CIFS_DEVICE — UNC path with forward slashes, no smb:// prefix, e.g.
-  #   //192.168.1.200/filserver/gb-automations-test
+  # NAS_CIFS_DEVICE — the share ROOT as a UNC path with forward slashes, no
+  #   smb:// prefix, e.g. //192.168.1.200/filserver. Never a sub-folder: one
+  #   renamed/deleted on the NAS makes this mount fail and the api won't start
+  #   at all. Sub-folders belong in NAS_PROJECTS_ROOT (docs/misc/nas-setup.md).
   # NAS_USER / NAS_PASS — credentials for the share.
   # uid=999,gid=999 matches the container's `app` user (see Dockerfile) so
   # writes don't hit the classic CIFS uid-mismatch failure (gotchas §15).

@@ -119,10 +119,43 @@ def _planned_folders(disciplines: set[str]) -> list[str]:
     return folders
 
 
+# Where docker-compose.prod.yml mounts the NAS share (the CIFS `nas` volume)
+# inside the container. Mount the share ROOT here (NAS_CIFS_DEVICE=//host/share)
+# and put any sub-folder in NAS_PROJECTS_ROOT instead. A sub-folder baked into
+# NAS_CIFS_DEVICE that later gets renamed or deleted on the NAS makes the mount
+# itself fail ("no such file or directory"), and Docker then refuses to start
+# the api AT ALL - Gmail, Frame and Fiken go down with it (gotchas.md §15).
+SHARE_MOUNT = Path("/mnt/nas")
+
+
 def _root() -> Path:
     if not settings.nas_projects_root:
         raise RuntimeError("NAS_PROJECTS_ROOT is not configured")
     return Path(settings.nas_projects_root)
+
+
+def _share_is_mounted() -> bool:
+    return os.path.ismount(SHARE_MOUNT)
+
+
+def _recreate_missing_root(root: Path) -> None:
+    """Put back a projects root someone deleted or renamed on the share.
+
+    Only on the REAL share: without the CIFS mount, /mnt/nas is a plain
+    directory inside the container, and creating folders there would make NAS
+    sync look healthy while writing somewhere nobody can see.
+    """
+    try:
+        root.relative_to(SHARE_MOUNT)
+    except ValueError:
+        return
+    if not _share_is_mounted():
+        return
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        logger.warning("NAS projects root %s was missing on the share - recreated it", root)
+    except OSError as err:
+        logger.warning("NAS projects root %s is missing and could not be recreated: %s", root, err)
 
 
 def nas_available() -> bool:
@@ -131,11 +164,14 @@ def nas_available() -> bool:
     Lets the webhook short-circuit and report cleanly when the share is
     unmounted or down, rather than throwing mid-create. A mounted-but-readonly
     share (wrong uid on a CIFS mount — the classic footgun, see gotchas.md)
-    also fails here.
+    also fails here. A projects root that went missing on a mounted share is
+    recreated first, so a deleted folder heals instead of disabling NAS sync.
     """
     if not settings.nas_projects_root:
         return False
     root = _root()
+    if not root.is_dir():
+        _recreate_missing_root(root)
     return root.is_dir() and os.access(root, os.W_OK)
 
 

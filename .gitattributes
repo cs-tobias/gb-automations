@@ -1,0 +1,4 @@
+# Windows scripts must stay CRLF on every checkout: cmd.exe mis-parses LF-only
+# batch files, and the move folder copies these files to other PCs verbatim.
+deploy/windows/*.cmd text eol=crlf
+deploy/windows/*.ps1 text eol=crlf

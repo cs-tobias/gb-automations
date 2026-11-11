@@ -215,6 +215,15 @@ async def _search_all(object_type: str, page_size: int) -> list[dict[str, Any]]:
     return results
 
 
+async def whoami() -> dict[str, Any]:
+    """`GET /v1/users/me` — the integration's bot user. Cheap auth smoke test
+    (one request), unlike search_pages which paginates the whole workspace."""
+    async with _client() as client:
+        response = await client.get("/users/me")
+        _raise_for_status(response)
+        return response.json()
+
+
 async def search_pages(page_size: int = 100) -> list[dict[str, Any]]:
     """Return every page the integration can see (top-level + DB rows)."""
     return await _search_all("page", page_size)

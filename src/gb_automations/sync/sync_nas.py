@@ -50,23 +50,23 @@ class NasSyncResult:
     note: str | None = None
 
 
-# The container-side root of the bind mount. docker-compose.yml binds
-# ${NAS_HOST_PATH}:/mnt/nas, so anything under /mnt/nas in the container is
-# the same file on Windows under NAS_HOST_PATH. Hardcoded because the bind
-# target is fixed in compose; there's no scenario where someone would change
-# one side without the other.
-_CONTAINER_NAS_MOUNT = PurePosixPath("/mnt/nas")
+# The container-side mount of the NAS share (nas_client.SHARE_MOUNT, fixed by
+# docker-compose.prod.yml). Anything under it in the container is the same file
+# on Windows under NAS_HOST_PATH, so NAS_HOST_PATH must name the SAME folder
+# NAS_CIFS_DEVICE mounts (share root → e.g. "W:").
+_CONTAINER_NAS_MOUNT = PurePosixPath(nas_client.SHARE_MOUNT.as_posix())
 
 
 def _to_display_path(target: Path) -> str | None:
     """Convert the container-visible NAS path to the team-visible Windows path.
 
-    Example: /mnt/nas/Prosjekt/2026/1300_X → X:\\gb-nas-test\\Prosjekt\\2026\\1300_X
-    when NAS_HOST_PATH is "X:\\gb-nas-test". The container mounts the share
-    via Docker's CIFS volume (NAS_CIFS_DEVICE), so /mnt/nas inside the
-    container is the share root; NAS_HOST_PATH is the team's Windows-side
-    name for the same root, set by convention to match what Explorer shows.
-    Keep them in sync (e.g. NAS_CIFS_DEVICE=//srvr/share/X and NAS_HOST_PATH=W:\X).
+    Example: /mnt/nas/gb-automations-test/Prosjekt/2026/1300_X →
+    W:\\gb-automations-test\\Prosjekt\\2026\\1300_X when NAS_HOST_PATH is "W:".
+    The container mounts the share via Docker's CIFS volume (NAS_CIFS_DEVICE),
+    so /mnt/nas inside the container is the share root; NAS_HOST_PATH is the
+    team's Windows-side name for the same root, set by convention to match
+    what Explorer shows. Keep them in sync: NAS_CIFS_DEVICE=//srvr/share (the
+    root, never a sub-folder) and NAS_HOST_PATH=W:.
 
     Returns None when NAS_HOST_PATH isn't configured (writeback skipped) or
     when `target` doesn't sit inside the container mount (defensive —

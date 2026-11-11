@@ -35,7 +35,11 @@ Queue state (what's pending / processing / failed):
 curl http://localhost:8000/debug/queue
 ```
 
-Stop with `docker compose down`. Add `-v` to also wipe the Postgres volume (the queue + dedup caches live there; truth is in Notion).
+Stop with `docker compose down`. Never add `-v` on a real install: it wipes the Postgres volume, which holds state Notion can't rebuild. That includes the live Frame sign-in, the Fiken billing audit trail and the duplicate guards. See [docs/move-to-new-pc.md](docs/move-to-new-pc.md).
+
+## Moving to a new PC
+
+Double-click `deploy\windows\Export-ForMove.cmd` on the old PC, then `Install.cmd` from the resulting folder on the new one. See **[docs/move-to-new-pc.md](docs/move-to-new-pc.md)**.
 
 ## Fresh deployment
 

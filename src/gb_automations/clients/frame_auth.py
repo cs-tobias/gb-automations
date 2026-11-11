@@ -103,6 +103,7 @@ async def _load_refresh_token_from_db() -> str | None:
 
 async def _save_refresh_token_to_db(token: str) -> None:
     """UPSERT the rotated refresh token. Provider key is hardcoded to 'frame'."""
+    from sqlalchemy import func
     from sqlalchemy.dialects.postgresql import insert
 
     from gb_automations.db import SessionLocal
@@ -110,9 +111,13 @@ async def _save_refresh_token_to_db(token: str) -> None:
 
     async with SessionLocal() as session:
         stmt = insert(OAuthToken).values(provider="frame", refresh_token=token)
+        # updated_at explicitly: the model's onupdate= only fires for ORM
+        # updates, never for this Core upsert. It must track the last rotation,
+        # because the move-to-new-PC export reads it to warn about the 14-day
+        # expiry (deploy/windows/Export-ForMove.ps1).
         stmt = stmt.on_conflict_do_update(
             index_elements=["provider"],
-            set_={"refresh_token": token},
+            set_={"refresh_token": token, "updated_at": func.now()},
         )
         await session.execute(stmt)
         await session.commit()

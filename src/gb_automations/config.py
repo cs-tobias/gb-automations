@@ -205,7 +205,8 @@ class Settings(BaseSettings):
     # Windows-mapped drive letter or UNC path does NOT work (gotchas §15).
     # nas_host_path: the Windows-facing display path written back into the
     #   Projects-DB "NAS" URL column so the team can click and open the
-    #   folder in File Explorer (e.g. "W:\Prosjekt" or "W:\gb-automations-test").
+    #   folder in File Explorer. Names the same folder NAS_CIFS_DEVICE mounts
+    #   (the share root, e.g. "W:"), because paths are mapped relative to it.
     #   COSMETIC ONLY — it is NOT used to mount the share. Empty → no Notion
     #   writeback (the folder still gets created, the URL column stays blank).
     # nas_projects_root: mounted root inside the container, e.g.

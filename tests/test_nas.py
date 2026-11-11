@@ -88,3 +88,44 @@ def test_nas_available_false_for_missing_dir(
 ):
     monkeypatch.setattr(settings, "nas_projects_root", str(tmp_path / "nope"))
     assert nas.nas_available() is False
+
+
+def test_missing_root_on_mounted_share_is_recreated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Someone deleted/renamed the projects folder on the NAS: with the share
+    # mounted, the folder is put back instead of NAS sync going dead.
+    share = tmp_path / "share"
+    share.mkdir()
+    monkeypatch.setattr(nas, "SHARE_MOUNT", share)
+    monkeypatch.setattr(nas, "_share_is_mounted", lambda: True)
+    root = share / "gb-automations-test" / "Prosjekt"
+    monkeypatch.setattr(settings, "nas_projects_root", str(root))
+    assert nas.nas_available() is True
+    assert root.is_dir()
+
+
+def test_missing_root_not_created_when_share_unmounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Without the CIFS mount, /mnt/nas is a plain container directory: creating
+    # the root there would fake a healthy NAS that writes nowhere visible.
+    share = tmp_path / "share"
+    share.mkdir()
+    monkeypatch.setattr(nas, "SHARE_MOUNT", share)
+    monkeypatch.setattr(nas, "_share_is_mounted", lambda: False)
+    root = share / "Prosjekt"
+    monkeypatch.setattr(settings, "nas_projects_root", str(root))
+    assert nas.nas_available() is False
+    assert not root.exists()
+
+
+def test_missing_root_outside_share_never_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(nas, "SHARE_MOUNT", tmp_path / "share")
+    monkeypatch.setattr(nas, "_share_is_mounted", lambda: True)
+    root = tmp_path / "elsewhere" / "Prosjekt"
+    monkeypatch.setattr(settings, "nas_projects_root", str(root))
+    assert nas.nas_available() is False
+    assert not root.exists()
