@@ -139,7 +139,7 @@ Each step checks first whether it's already done, so re-running is always safe.
 One window that does this:
 
 1. Starts Ollama if it isn't answering.
-2. Starts Docker Desktop in the background if it's closed. Before launching, it sets Docker's *Open Docker Dashboard when Docker Desktop starts* setting to off (`OpenUIOnStartupDisabled` in `%APPDATA%\Docker\settings-store.json`), so no Docker window appears. It never launches Docker a second time while Docker is still starting.
+2. Starts Docker Desktop in the background if it's closed. Every run, it sets Docker's *Open Docker Dashboard when Docker Desktop starts* setting to off (`OpenUIOnStartupDisabled` in `%APPDATA%\Docker\settings-store.json`), so no Docker window appears. It never launches Docker a second time while Docker is still starting.
 3. Makes sure `cifs-utils` is still in Docker's VM. A Docker Desktop upgrade can drop it.
 4. Runs `docker compose up -d`. It never rebuilds.
 5. Waits up to 3 minutes for `/health`.

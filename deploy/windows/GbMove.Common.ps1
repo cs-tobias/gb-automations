@@ -157,8 +157,8 @@ function Set-DockerDesktopNoWindow {
     # Docker Desktop opens its dashboard window every time it starts unless
     # OpenUIOnStartupDisabled is set (its "Open Docker Dashboard when Docker
     # Desktop starts" setting). The app only needs the engine, so Docker should
-    # start straight to the tray. Docker reads this file when it launches, so
-    # this runs before every launch. Edited as text, not via ConvertTo-Json:
+    # start straight to the tray. Docker reads this file when it launches.
+    # Edited as text, not via ConvertTo-Json:
     # PS 5.1 would rewrite the whole file and could mangle settings it doesn't
     # round-trip. Missing file = Docker has never run here; leave its first run
     # alone. Cosmetic only, so any failure is ignored.
@@ -182,6 +182,9 @@ function Set-DockerDesktopNoWindow {
 
 function Wait-DockerEngine([int]$TimeoutSec = 300) {
     Update-SessionPath
+    # Every run, not just before our own launch: Docker's own start-at-sign-in
+    # may be the one that launches it next time, and it reads the same file.
+    Set-DockerDesktopNoWindow
     if (Test-DockerEngine) { return }
     $exe = Get-DockerDesktopExe
     if (-not $exe) { throw 'Docker Desktop is not installed on this PC.' }
@@ -192,7 +195,6 @@ function Wait-DockerEngine([int]$TimeoutSec = 300) {
         Write-Note 'Docker Desktop is starting, waiting for it...'
     } else {
         Write-Note 'Starting Docker Desktop in the background (this can take a minute or two)...'
-        Set-DockerDesktopNoWindow
         # Launched through explorer.exe so it runs as the signed-in user even
         # when the caller (Install.ps1) is elevated. Docker Desktop is meant to
         # run un-elevated, as it does at every sign-in afterwards.
