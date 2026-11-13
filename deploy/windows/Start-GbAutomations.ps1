@@ -1,16 +1,20 @@
-# The everyday "GB Automations" desktop icon, and (with -AtLogon) the
-# automatic start at Windows sign-in. Both are created by Install.ps1.
+# The "GB Automations" desktop icon, and the automatic start at Windows
+# sign-in (-AtLogon). Both are created by Install.ps1.
 #
-# Normally nothing is needed: the sign-in autostart already ran this. The icon
-# is the "is it running? make it run, then show me" button. It's safe to click
-# any time - every step is a no-op when that part is already up:
-#   1. start Ollama (AI tagging) if it isn't answering,
-#   2. start Docker Desktop if it's closed,
-#   3. make sure the NAS helper is installed (a Docker upgrade can drop it),
-#   4. `docker compose up -d` (starts whatever isn't running; never rebuilds),
-#   5. wait until the app answers, then open the status page.
+# Opens one window that:
+#   1. starts Ollama (AI tagging) if it isn't answering,
+#   2. starts Docker Desktop in the background (no Docker window) if it's off,
+#   3. makes sure the NAS helper is installed (a Docker upgrade can drop it),
+#   4. runs `docker compose up -d` (starts whatever isn't running; never
+#      rebuilds),
+#   5. waits until the app answers,
+#   6. then stays open as the app's live log, so you always see what it does.
 #
-# -AtLogon: silent, no browser. Only a message box if something fails.
+# Safe to run any time: every step is a no-op when that part is already up.
+# Closing the window only closes the log view. The app keeps running.
+#
+# -AtLogon: the sign-in autostart. Installs from before the live log made that
+# shortcut a hidden window, so it reopens this script in a normal window.
 
 [CmdletBinding()]
 param([switch]$AtLogon)
@@ -18,25 +22,74 @@ param([switch]$AtLogon)
 . (Join-Path $PSScriptRoot 'GbMove.Common.ps1')
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$logPath = Start-GbLog 'start'
+$liveLogTitle = 'GB Automations - live log'
 
-function Show-Problem([string]$Message) {
-    $more = 'Help: docs\move-to-new-pc.md (Troubleshooting).'
-    if ($logPath) { $more += " Log: $logPath" }
-    if ($AtLogon) {
-        Add-Type -AssemblyName PresentationFramework
-        [Windows.MessageBox]::Show("GB Automations could not start.`n`n$Message`n`nDouble-click the GB Automations icon on the desktop to try again and see details.`n`n$more", 'GB Automations', 'OK', 'Warning') | Out-Null
+if ($AtLogon) {
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Start-Process -FilePath $psExe -WorkingDirectory $repoRoot `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    exit 0
+}
+
+function Show-Problem([string]$Message, [string]$LogPath) {
+    Write-Host ''
+    Write-Host "PROBLEM: $Message" -ForegroundColor Red
+    Write-Note 'Help: docs\move-to-new-pc.md (Troubleshooting).'
+    if ($LogPath) { Write-Note "Log of this start: $LogPath" }
+    Read-Host 'Press Enter to close this window' | Out-Null
+}
+
+function Show-LiveLog([bool]$Answering) {
+    # Streams the api container's log into this window until it's closed.
+    # docker writes straight to the console (no PowerShell pipe), which keeps
+    # the app's colours and the Norwegian letters intact.
+    $Host.UI.RawUI.WindowTitle = $liveLogTitle
+    Write-Host ''
+    if ($Answering) {
+        Write-Host 'GB Automations is running.' -ForegroundColor Green
     } else {
-        Write-Host ''
-        Write-Host "PROBLEM: $Message" -ForegroundColor Red
-        Write-Note $more
-        Read-Host 'Press Enter to close this window' | Out-Null
+        Write-Attention 'The app has started but is not answering yet. The log below shows why.'
+    }
+    Write-Note "Status page: $script:GbStatusUrl"
+    Write-Note 'Closing this window does NOT stop the app. The icon opens it again.'
+    Write-Host ('-' * 78) -ForegroundColor DarkGray
+
+    $ErrorActionPreference = 'Continue'
+    $since = $null
+    $pausedShown = $false
+    while ($true) {
+        $logArgs = @('compose', 'logs', '--follow', '--no-log-prefix')
+        # First connect: the recent past for context. After a restart (an
+        # update, a crash, Docker restarting) pick up exactly where it stopped.
+        if ($since) { $logArgs += @('--since', $since) } else { $logArgs += @('--tail', '150') }
+        $logArgs += 'api'
+        $startedAt = Get-Date
+        & docker @logArgs
+        if (((Get-Date) - $startedAt).TotalSeconds -gt 10) {
+            $since = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $pausedShown = $false
+        }
+        # Said once per outage, not every retry.
+        if (-not $pausedShown) {
+            Write-Host ''
+            Write-Host '-- The app stopped or is restarting. The log continues as soon as it is back. --' -ForegroundColor DarkGray
+            $pausedShown = $true
+        }
+        Start-Sleep -Seconds 5
     }
 }
 
+# A second double-click shouldn't stack a second log window.
+$existing = Get-Process -Name 'powershell' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -eq $liveLogTitle } |
+    Select-Object -First 1
+
+$Host.UI.RawUI.WindowTitle = 'GB Automations - starting'
+$logPath = Start-GbLog 'start'
+$answering = $false
 try {
     Set-Location -LiteralPath $repoRoot
-    if (-not $AtLogon) { Write-Host 'GB Automations - starting (this window closes by itself)' -ForegroundColor White }
+    Write-Host 'GB Automations - starting' -ForegroundColor White
     $envMap = Read-DotEnv (Join-Path $repoRoot '.env')
 
     Write-Step 'AI tagging (Ollama)'
@@ -58,17 +111,28 @@ try {
     if ((Invoke-Native -Exe 'docker' -Arguments @('compose', 'up', '-d') -AllowFail) -ne 0) {
         throw 'Docker could not start the app (see the lines above). A "mount" error means the NAS: is this PC on the office network, and does the folder in NAS_CIFS_DEVICE (.env) still exist on the NAS?'
     }
+    # Not fatal past this point: if the app doesn't answer, its own log (shown
+    # next) is the fastest way to see why.
     $deadline = (Get-Date).AddMinutes(3)
-    while (-not (Test-AppHealthy)) {
-        if ((Get-Date) -gt $deadline) { throw 'The app started but does not answer on http://localhost:8000.' }
+    while (-not ($answering = Test-AppHealthy)) {
+        if ((Get-Date) -gt $deadline) { break }
         Start-Sleep -Seconds 3
     }
-    Write-Ok 'Running'
-
-    if (-not $AtLogon) { Start-Process $script:GbStatusUrl }
+    if ($answering) { Write-Ok 'Running' }
 } catch {
-    Show-Problem $_.Exception.Message
-    exit 1
-} finally {
     Stop-GbLog
+    Show-Problem $_.Exception.Message $logPath
+    exit 1
 }
+# The live log runs for as long as the window is open: keep it out of the
+# start log, which is meant to record just this start.
+Stop-GbLog
+
+if ($existing) {
+    Write-Ok 'The live log is already open in another window - switching to it.'
+    try { (New-Object -ComObject WScript.Shell).AppActivate($existing.Id) | Out-Null } catch { }
+    Start-Sleep -Seconds 3
+    exit 0
+}
+
+Show-LiveLog $answering

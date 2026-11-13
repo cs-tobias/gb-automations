@@ -20,11 +20,11 @@ The whole move is two double-clicks: **Export** on the old PC, **Install** on th
 1. Copy the folder from the USB stick onto the PC (e.g. the Desktop). The installer runs as administrator, which can't see mapped network drives, and after a restart the USB stick may be gone.
 2. Double-click `Install.cmd`, click **Yes** on the Windows prompt, and type the password.
 3. If it says **RESTART NEEDED**: restart, sign in, and double-click `Install.cmd` again. It continues where it stopped.
-4. When it says **INSTALLED**, the status page opens. Every row should turn green within a few minutes. The first run downloads about 5 GB.
+4. When it says **INSTALLED**, the status page and the live log window open. Every status row should turn green within a few minutes. The first run downloads about 5 GB.
 5. Do the **Left for a human** items it prints (see [After installing](#after-installing)).
 6. Delete the move folder from the USB stick and from the new PC. It contains every password the system uses.
 
-After that, nothing is needed day to day. GB Automations starts by itself whenever someone signs in to Windows. The **GB Automations** icon on the desktop starts it if needed, then shows the status page.
+After that, nothing is needed day to day. GB Automations starts by itself whenever someone signs in to Windows, and opens a window with its live log. Docker starts in the background, with no Docker window. The **GB Automations** icon on the desktop does the same: it starts whatever isn't running, then shows the live log. Closing the log window never stops the app.
 
 ## Rules
 
@@ -124,22 +124,34 @@ Each step checks first whether it's already done, so re-running is always safe.
 
     The api must not start before this. Its first boot would run migrations on the empty database and the restore would collide.
 12. Runs `docker compose up -d --build` and waits for `/health` to report `db: ok`.
-13. Runs `python -m gb_automations.scripts.reconcile` inside the api, to catch up email labelled while no PC was running.
-14. Creates two shortcuts:
+
+    The installer runs no separate email catch-up. Every app start lists the threads under each project label in Gmail and queues only the ones the database has never synced (`_recover_and_reconcile_queue` in `main.py`). That covers email labelled while no PC was running. `scripts.reconcile` re-syncs every thread of every project through Notion. It takes hours, hits Notion's rate limit, and grows with every project, so keep it for repairs.
+13. Creates two shortcuts:
     - the **GB Automations** desktop icon;
     - **GB Automations (autostart)** in the Startup folder.
 
-    It then opens the status page.
+    Both open the same window, described below. Install then opens the status page and that window.
 
 `-RestoreTestOnly` decrypts the move file and restores the dump into a throwaway `postgres:16-alpine` container. It compares migration level and row counts, then deletes the container. It installs nothing and doesn't touch a running app, so it's safe on the old PC too. `GBMOVE_PASSWORD` (environment variable) and `-NoPause` exist so the test can run unattended.
 
-### Start-GbAutomations (the desktop icon, and sign-in autostart with `-AtLogon`)
+### Start-GbAutomations (the desktop icon and the sign-in autostart)
+
+One window that does this:
 
 1. Starts Ollama if it isn't answering.
-2. Starts Docker Desktop if it's closed.
+2. Starts Docker Desktop in the background if it's closed. Before launching, it sets Docker's *Open Docker Dashboard when Docker Desktop starts* setting to off (`OpenUIOnStartupDisabled` in `%APPDATA%\Docker\settings-store.json`), so no Docker window appears. It never launches Docker a second time while Docker is still starting.
 3. Makes sure `cifs-utils` is still in Docker's VM. A Docker Desktop upgrade can drop it.
 4. Runs `docker compose up -d`. It never rebuilds.
-5. Waits for `/health`, then opens `http://localhost:8000/status`. With `-AtLogon` it opens no browser and only shows a message box if something failed.
+5. Waits up to 3 minutes for `/health`.
+6. Becomes the **live log**: `docker compose logs --follow api`, under the title *GB Automations - live log*.
+   - If the app restarts (an update, a crash, Docker restarting), the log carries on where it stopped.
+   - If the app didn't answer in step 5, it says so and shows the log anyway, since the log shows why.
+   - Clicking the icon while a live log window is open switches to that window instead of opening a second one.
+   - Closing the window only closes the view. The app keeps running.
+
+If step 1–4 fails, the window shows the problem in red and stays open until Enter. Each start is logged to `C:\ProgramData\gb-automations\start-*.log`, but the live log itself isn't. It's always in `docker compose logs api`.
+
+Installs from before 2026-11-13 have a hidden sign-in shortcut that passes `-AtLogon`. The script answers that by reopening itself in a normal window, so old shortcuts get the live log too.
 
 ### The status page
 

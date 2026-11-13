@@ -153,16 +153,51 @@ function Test-DockerEngine {
     return ((Invoke-Native -Exe 'docker' -Arguments @('info') -Quiet -AllowFail) -eq 0)
 }
 
+function Set-DockerDesktopNoWindow {
+    # Docker Desktop opens its dashboard window every time it starts unless
+    # OpenUIOnStartupDisabled is set (its "Open Docker Dashboard when Docker
+    # Desktop starts" setting). The app only needs the engine, so Docker should
+    # start straight to the tray. Docker reads this file when it launches, so
+    # this runs before every launch. Edited as text, not via ConvertTo-Json:
+    # PS 5.1 would rewrite the whole file and could mangle settings it doesn't
+    # round-trip. Missing file = Docker has never run here; leave its first run
+    # alone. Cosmetic only, so any failure is ignored.
+    $path = Join-Path $env:APPDATA 'Docker\settings-store.json'
+    try {
+        if (-not (Test-Path -LiteralPath $path)) { return }
+        $text = [IO.File]::ReadAllText($path)
+        $key = '"OpenUIOnStartupDisabled"'
+        if ($text -match "$key\s*:\s*true") { return }
+        if ($text -match "$key\s*:\s*false") {
+            $text = $text -replace "$key\s*:\s*false", "$key`: true"
+        } elseif ($text -match '^\s*\{\s*\}\s*$') {
+            $text = "{$key`: true}"
+        } else {
+            $text = ([regex]'\{').Replace($text, "{$key`: true,", 1)
+        }
+        # Docker's JSON reader rejects a byte-order mark, so no BOM.
+        [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))
+    } catch { }
+}
+
 function Wait-DockerEngine([int]$TimeoutSec = 300) {
     Update-SessionPath
     if (Test-DockerEngine) { return }
     $exe = Get-DockerDesktopExe
     if (-not $exe) { throw 'Docker Desktop is not installed on this PC.' }
-    Write-Note 'Starting Docker Desktop (this can take a minute or two)...'
-    # Launched through explorer.exe so it runs as the signed-in user even when
-    # the caller (Install.ps1) is elevated. Docker Desktop is meant to run
-    # un-elevated, as it does at every sign-in afterwards.
-    Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$exe`"" | Out-Null
+    # Already launching (e.g. its own start-at-sign-in got there first): just
+    # wait. Launching it a second time pops its dashboard window open, and
+    # several launches in a row can kill each other mid-start.
+    if (Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue) {
+        Write-Note 'Docker Desktop is starting, waiting for it...'
+    } else {
+        Write-Note 'Starting Docker Desktop in the background (this can take a minute or two)...'
+        Set-DockerDesktopNoWindow
+        # Launched through explorer.exe so it runs as the signed-in user even
+        # when the caller (Install.ps1) is elevated. Docker Desktop is meant to
+        # run un-elevated, as it does at every sign-in afterwards.
+        Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$exe`"" | Out-Null
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 5

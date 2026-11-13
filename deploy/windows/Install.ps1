@@ -6,8 +6,8 @@
 #
 # What it does: Windows features for Docker (WSL2), installs Git, Docker
 # Desktop and Ollama, sets up the NAS helper, unpacks the code, settings and
-# database from the encrypted move file, starts the app, catches up on missed
-# email, and puts a "GB Automations" icon on the desktop.
+# database from the encrypted move file, starts the app (which catches up on
+# missed email by itself), and puts a "GB Automations" icon on the desktop.
 #
 # -RestoreTestOnly only proves the move file is good: it restores the database
 # copy into a throwaway container, compares row counts and removes it. It
@@ -463,29 +463,31 @@ try {
         throw 'The app did not come up. A "mount" error above = NAS problem: the folder in NAS_CIFS_DEVICE must exist and this PC must be on the office network (docs/misc/gotchas.md section 15). Otherwise see docs/move-to-new-pc.md.'
     }
     Write-Ok 'App is running'
-
-    Write-Step 'Catching up on email labelled while the app was off'
-    $rc = Invoke-Native -Exe 'docker' -Arguments @('compose', 'exec', '-T', 'api', 'python', '-m', 'gb_automations.scripts.reconcile') -AllowFail
-    if ($rc -eq 0) { Write-Ok 'Caught up (the work queue finishes it in the background)' }
-    else { Write-Attention 'Catch-up reported a problem - re-run later: docker compose exec api python -m gb_automations.scripts.reconcile' }
+    # No catch-up step here: every app start already queues any labelled thread
+    # the database has never synced (main.py _recover_and_reconcile_queue).
+    # scripts.reconcile would re-sync EVERY thread of every project through
+    # Notion - hours, Notion rate limits, and it grows with every project.
 
     # --------------------------------------------------------- shortcuts
     Write-Step 'Adding the GB Automations icon'
     $startPs1 = Join-Path $InstallDir 'deploy\windows\Start-GbAutomations.ps1'
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    New-Shortcut -Path (Join-Path ([Environment]::GetFolderPath('Desktop')) 'GB Automations.lnk') -Target $psExe `
-        -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$startPs1`"" -WorkDir $InstallDir
+    $startArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$startPs1`""
+    $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'GB Automations.lnk'
+    New-Shortcut -Path $desktopLnk -Target $psExe -Arguments $startArgs -WorkDir $InstallDir
     # Our own sign-in autostart (Startup folder), instead of relying on Docker
     # Desktop's "start at sign-in" setting: it also starts Ollama, and it runs
     # `docker compose up -d`, so the app comes back even if its containers were
-    # removed. Runs minimised and only speaks up if something fails.
+    # removed. Same window as the icon: start-up, then the live log.
     New-Shortcut -Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'GB Automations (autostart).lnk') -Target $psExe `
-        -Arguments "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$startPs1`" -AtLogon" -WorkDir $InstallDir -WindowStyle 7
+        -Arguments $startArgs -WorkDir $InstallDir
     Write-Ok 'Desktop icon "GB Automations" + start at sign-in'
 
     Write-Host ''
     Write-Host 'INSTALLED.' -ForegroundColor Green
-    Write-Note 'The status page opens now. Every row should turn green within a few minutes.'
+    Write-Note 'The status page and the live log window open now. Every status row should turn'
+    Write-Note 'green within a few minutes. From now on the GB Automations icon (and every'
+    Write-Note 'Windows sign-in) opens that live log window. Closing it never stops the app.'
     Write-Note ''
     Write-Note 'Left for a human:'
     Write-Note ' - In Notion, open the Automations panel on the Projects, Oppgaver and Korreksjoner'
@@ -497,8 +499,10 @@ try {
         Write-Note ' - If the Frame row on the status page is red, see "Frame" in docs/move-to-new-pc.md.'
     }
     Write-Note ' - Keep the old PC switched off. Delete the move folder from the USB stick.'
-    # explorer.exe opens the URL in the signed-in user's (non-admin) browser.
+    # explorer.exe opens both as the signed-in user, not elevated: the status
+    # page in their browser, and the live log window through the new icon.
     Start-Process -FilePath 'explorer.exe' -ArgumentList $script:GbStatusUrl
+    Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$desktopLnk`""
 } catch {
     $failed = $true
     Write-Host ''
