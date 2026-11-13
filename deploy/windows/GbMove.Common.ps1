@@ -12,6 +12,9 @@
 
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 can default to TLS 1.0/1.1, which GitHub and the
+# installer download sites refuse.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $script:GbRepoUrl = 'https://github.com/cs-tobias/gb-automations.git'
 $script:GbStatusUrl = 'http://localhost:8000/status'
@@ -89,6 +92,16 @@ function Invoke-Native {
     try {
         if ($Quiet) { & $Exe @Arguments *> $null } else { & $Exe @Arguments | Out-Host }
         $code = $LASTEXITCODE
+    } catch {
+        # A program that exists but cannot be started throws instead of
+        # returning an exit code - e.g. winget on a fresh PC, where its App
+        # Installer package isn't registered for this Windows account yet.
+        # The message carries PowerShell's "At <file>:<line>" position glued
+        # on; only the reason means anything to the person installing.
+        $reason = ($_.Exception.Message -replace '(?s)\s*At [A-Za-z]:\\.*$', '')
+        if (-not $AllowFail) { throw "Could not start $Exe`: $reason" }
+        Write-Attention "Could not start $Exe`: $reason"
+        $code = -1
     } finally {
         $ErrorActionPreference = $old
     }
@@ -111,6 +124,9 @@ function Get-NativeOutput {
     try {
         $out = & $Exe @Arguments 2> $null
         $code = $LASTEXITCODE
+    } catch {
+        if (-not $AllowFail) { throw "Could not start $Exe`: $($_.Exception.Message)" }
+        return $null
     } finally {
         $ErrorActionPreference = $old
     }

@@ -97,7 +97,7 @@ Each step checks first whether it's already done, so re-running is always safe.
    - `winget` exists (if not, install **App Installer** from the Microsoft Store);
    - the signed-in Windows account matches the installer's account.
 3. Turns on the Windows features `Microsoft-Windows-Subsystem-Linux` and `VirtualMachinePlatform`.
-4. Installs with winget, skipping anything present:
+4. Installs with winget, skipping anything present. If winget can't run, it downloads each installer directly from its maker and checks the signature before running it:
    - Git;
    - Docker Desktop (silent, license accepted, WSL2 backend);
    - Ollama.
@@ -174,6 +174,7 @@ Check the log first: `C:\ProgramData\gb-automations\install-*.log` (or `export-*
 
 | Symptom | Fix |
 |---|---|
+| "Could not start winget" / "Kan ikke starte programmet" | Handled automatically: Install re-registers winget's App Installer package for the account, and if winget still won't run it downloads Docker Desktop, Ollama and Git straight from their makers (each installer's signature is checked first). A move folder made **before 2026-11-13** has the old installer: replace its `Install.ps1` and `GbMove.Common.ps1` with the current ones from `deploy\windows\`. |
 | Install says **RESTART NEEDED** every time | Check that **Virtual Machine Platform** and **Windows Subsystem for Linux** show as on in "Turn Windows features on or off". If they won't turn on, enable virtualization (Intel VT-x / AMD SVM) in the BIOS. |
 | "Docker Desktop did not finish starting" | Open Docker Desktop from the Start menu and read what it says. Usually it's a first-run screen, or WSL needs `wsl --update`. When it shows *Engine running*, run Install/the icon again. |
 | "Can't reach the NAS" / `mount error(13)` / `mount error(2)` / "no such file or directory" / app container won't start | **One bad NAS mount stops the whole app, not just NAS folders.** The PC must be on the office network. The **folder** in `NAS_CIFS_DEVICE` must still exist on the NAS: a renamed or deleted folder gives "no such file or directory" (`cifs_mount failed w/return code = -2` in `wsl -d docker-desktop dmesg`). `NAS_USER` and `NAS_PASS` must be right (wrong ones give error 13). Docker caches the NAS mount options, so after changing them run `docker compose down`, then `docker volume rm gb-automations_nas`, then `docker compose up -d`. See [misc/gotchas.md](misc/gotchas.md) §15 and [misc/nas-setup.md](misc/nas-setup.md). |

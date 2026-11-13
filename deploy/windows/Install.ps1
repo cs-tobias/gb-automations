@@ -41,6 +41,7 @@ $logPath = Start-GbLog 'install'
 $staging = $null
 $restartNeeded = $false
 $failed = $false
+$script:WingetReady = $false
 
 function Request-Restart([string]$Why) {
     Write-Host ''
@@ -118,10 +119,83 @@ function Invoke-RestoreTest($PayloadDir, $Manifest) {
     }
 }
 
-function Install-WingetPackage([string]$Id, [string]$Label, [string[]]$Extra = @()) {
+function Test-WingetWorks {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & winget --version *> $null; return ($LASTEXITCODE -eq 0) }
+    catch { return $false }
+    finally { $ErrorActionPreference = $old }
+}
+
+function Initialize-Winget {
+    # winget lives in the "App Installer" Store package, which Windows registers
+    # per account - on a fresh PC or a first sign-in the winget.exe alias exists
+    # but "can't start". Re-registering is Microsoft's documented fix. If winget
+    # still won't run, Install-Program downloads from the vendors instead.
+    if (Test-WingetWorks) { return $true }
+    try { Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop } catch { }
+    Update-SessionPath
+    return (Test-WingetWorks)
+}
+
+# Vendor downloads used when winget can't do the job. Only the vendors'
+# official URLs, and every installer must carry a valid Authenticode
+# signature before it runs.
+$script:DirectInstallers = @{
+    'Git.Git'              = @{ Url = $null; File = 'GitSetup.exe'; Args = @('/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES') }
+    'Docker.DockerDesktop' = @{ Url = 'https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe'; File = 'DockerDesktopInstaller.exe'; Args = @('install', '--quiet', '--accept-license', '--backend=wsl-2') }
+    'Ollama.Ollama'        = @{ Url = 'https://ollama.com/download/OllamaSetup.exe'; File = 'OllamaSetup.exe'; Args = @('/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES') }
+}
+
+function Get-GitInstallerUrl {
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -UseBasicParsing -TimeoutSec 30
+    $asset = @($release.assets | Where-Object { $_.name -match '^Git-[\d.]+-64-bit\.exe$' }) | Select-Object -First 1
+    if (-not $asset) { throw 'Could not find the Git for Windows installer on GitHub.' }
+    return $asset.browser_download_url
+}
+
+function Save-Download([string]$Url, [string]$OutFile) {
+    # curl.exe (in Windows since 10 1803) shows progress and is far faster than
+    # PS 5.1's Invoke-WebRequest, whose progress bar throttles big downloads.
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        Invoke-Native -Exe 'curl.exe' -Arguments @('-fL', '--retry', '3', '--progress-bar', '-o', $OutFile, $Url) | Out-Null
+        return
+    }
+    $old = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try { Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing } finally { $ProgressPreference = $old }
+}
+
+function Install-Direct([string]$Id, [string]$Label) {
+    $spec = $script:DirectInstallers[$Id]
+    $url = if ($spec.Url) { $spec.Url } else { Get-GitInstallerUrl }
+    $dir = Join-Path $env:TEMP 'gb-move-downloads'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $file = Join-Path $dir $spec.File
+    Write-Note "Downloading $Label from $(([Uri]$url).Host)..."
+    Save-Download $url $file
+    $sig = Get-AuthenticodeSignature -FilePath $file
+    if ($sig.Status -ne 'Valid') { throw "The downloaded $Label installer is not validly signed ($($sig.Status)) - not running it." }
+    Write-Note "Running the $Label installer (signed by $($sig.SignerCertificate.GetNameInfo('SimpleName', $false)))..."
+    $p = Start-Process -FilePath $file -ArgumentList $spec.Args -PassThru
+    # WaitForExit, not Start-Process -Wait: in Windows PowerShell -Wait also
+    # waits for every child process, and installers like Ollama's launch the
+    # app at the end - the install would never return.
+    $p.WaitForExit()
+    Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+}
+
+function Install-Program([string]$Id, [string]$Label, [scriptblock]$IsInstalled, [string[]]$WingetExtra = @()) {
     Write-Note "Installing $Label (a few minutes)..."
-    $wingetArgs = @('install', '-e', '--id', $Id, '--accept-package-agreements', '--accept-source-agreements') + $Extra
-    Invoke-Native -Exe 'winget' -Arguments $wingetArgs -AllowFail | Out-Null
+    if ($script:WingetReady) {
+        $wingetArgs = @('install', '-e', '--id', $Id, '--accept-package-agreements', '--accept-source-agreements') + $WingetExtra
+        Invoke-Native -Exe 'winget' -Arguments $wingetArgs -AllowFail | Out-Null
+        Update-SessionPath
+        if (& $IsInstalled) { return }
+        Write-Attention "winget could not install $Label - downloading it directly instead."
+    }
+    Install-Direct $Id $Label
     Update-SessionPath
 }
 
@@ -167,8 +241,10 @@ try {
         Write-Attention 'Virtualization looks switched off in this PC''s BIOS/UEFI. Docker needs it.'
         Write-Note 'If Docker fails to start later: enable "Intel VT-x" / "AMD-V" (SVM) in the BIOS.'
     }
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        throw 'winget is missing. Install "App Installer" from the Microsoft Store, then run Install.cmd again.'
+    $script:WingetReady = Initialize-Winget
+    if (-not $script:WingetReady) {
+        Write-Attention 'winget (the Windows package manager) does not work on this PC.'
+        Write-Note 'Anything missing will be downloaded straight from Docker, Ollama and Git instead.'
     }
     $explorerOwner = $null
     try {
@@ -200,7 +276,7 @@ try {
     Update-SessionPath
     if (Get-Command git -ErrorAction SilentlyContinue) { Write-Ok 'Git already installed' }
     else {
-        Install-WingetPackage 'Git.Git' 'Git' @('--silent')
+        Install-Program 'Git.Git' 'Git' { [bool](Get-Command git -ErrorAction SilentlyContinue) } @('--silent')
         if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git did not install. Install it from git-scm.com and run Install.cmd again.' }
     }
 
@@ -208,14 +284,14 @@ try {
     else {
         # Docker Desktop's license is free for businesses under 250 employees
         # AND under USD 10M revenue (see docs/move-to-new-pc.md).
-        Install-WingetPackage 'Docker.DockerDesktop' 'Docker Desktop' @('--override', 'install --quiet --accept-license --backend=wsl-2')
+        Install-Program 'Docker.DockerDesktop' 'Docker Desktop' { [bool](Get-DockerDesktopExe) } @('--override', 'install --quiet --accept-license --backend=wsl-2')
         if (-not (Get-DockerDesktopExe)) { throw 'Docker Desktop did not install. See the log, or install it from docker.com and run Install.cmd again.' }
         $restartNeeded = $true
     }
 
     if (Get-OllamaExe) { Write-Ok 'Ollama already installed' }
     else {
-        Install-WingetPackage 'Ollama.Ollama' 'Ollama' @('--silent')
+        Install-Program 'Ollama.Ollama' 'Ollama' { [bool](Get-OllamaExe) } @('--silent')
         if (-not (Get-OllamaExe)) { throw 'Ollama did not install. Install it from ollama.com and run Install.cmd again.' }
     }
 
@@ -264,7 +340,11 @@ try {
         Write-Note "Downloading $model (about 5 GB - the slowest step)..."
         # Straight to the console: ollama draws its progress bar with carriage
         # returns, which looks frozen when piped through PowerShell.
-        $pull = Start-Process -FilePath $ollamaExe -ArgumentList @('pull', $model) -NoNewWindow -Wait -PassThru
+        $pull = Start-Process -FilePath $ollamaExe -ArgumentList @('pull', $model) -NoNewWindow -PassThru
+        # Touching .Handle makes .NET keep it, so ExitCode is still readable
+        # after the process ends (PS 5.1 otherwise often returns $null).
+        $null = $pull.Handle
+        $pull.WaitForExit()
         if ($pull.ExitCode -ne 0) { throw "Downloading the AI model failed (exit $($pull.ExitCode)). Check the internet connection and run Install.cmd again." }
         Write-Ok "Model $model downloaded"
     }
