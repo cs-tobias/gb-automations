@@ -199,17 +199,6 @@ function Install-Program([string]$Id, [string]$Label, [scriptblock]$IsInstalled,
     Update-SessionPath
 }
 
-function New-Shortcut([string]$Path, [string]$Target, [string]$Arguments, [string]$WorkDir, [int]$WindowStyle = 1) {
-    $shell = New-Object -ComObject WScript.Shell
-    $lnk = $shell.CreateShortcut($Path)
-    $lnk.TargetPath = $Target
-    $lnk.Arguments = $Arguments
-    $lnk.WorkingDirectory = $WorkDir
-    $lnk.WindowStyle = $WindowStyle
-    $lnk.IconLocation = "$env:SystemRoot\System32\imageres.dll,109"
-    $lnk.Save()
-}
-
 try {
     Write-Host 'GB Automations - install' -ForegroundColor White
     if ($RestoreTestOnly) { Write-Attention 'TEST MODE: only checks the move file restores correctly. Installs nothing.' }
@@ -470,24 +459,20 @@ try {
 
     # --------------------------------------------------------- shortcuts
     Write-Step 'Adding the GB Automations icon'
-    $startPs1 = Join-Path $InstallDir 'deploy\windows\Start-GbAutomations.ps1'
-    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $startArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$startPs1`""
+    # The desktop icon, plus our own sign-in autostart (Startup folder) rather
+    # than Docker Desktop's "start at sign-in": it also starts Ollama, and it
+    # runs `docker compose up -d`, so the app comes back even if its containers
+    # were removed. Both open the GB Automations program (GbAutomations.ps1).
+    Set-GbShortcuts $InstallDir
     $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'GB Automations.lnk'
-    New-Shortcut -Path $desktopLnk -Target $psExe -Arguments $startArgs -WorkDir $InstallDir
-    # Our own sign-in autostart (Startup folder), instead of relying on Docker
-    # Desktop's "start at sign-in" setting: it also starts Ollama, and it runs
-    # `docker compose up -d`, so the app comes back even if its containers were
-    # removed. Same window as the icon: start-up, then the live log.
-    New-Shortcut -Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'GB Automations (autostart).lnk') -Target $psExe `
-        -Arguments $startArgs -WorkDir $InstallDir
     Write-Ok 'Desktop icon "GB Automations" + start at sign-in'
 
     Write-Host ''
     Write-Host 'INSTALLED.' -ForegroundColor Green
-    Write-Note 'The status page and the live log window open now. Every status row should turn'
-    Write-Note 'green within a few minutes. From now on the GB Automations icon (and every'
-    Write-Note 'Windows sign-in) opens that live log window. Closing it never stops the app.'
+    Write-Note 'The status page and the GB Automations program open now. Every status row'
+    Write-Note 'should turn green within a few minutes. From now on the GB Automations icon'
+    Write-Note '(and every Windows sign-in) opens the program: status, live log and updates.'
+    Write-Note 'Closing it never stops the app.'
     Write-Note ''
     Write-Note 'Left for a human:'
     Write-Note ' - In Notion, open the Automations panel on the Projects, Oppgaver and Korreksjoner'
@@ -500,7 +485,7 @@ try {
     }
     Write-Note ' - Keep the old PC switched off. Delete the move folder from the USB stick.'
     # explorer.exe opens both as the signed-in user, not elevated: the status
-    # page in their browser, and the live log window through the new icon.
+    # page in their browser, and the program through the new icon.
     Start-Process -FilePath 'explorer.exe' -ArgumentList $script:GbStatusUrl
     Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$desktopLnk`""
 } catch {

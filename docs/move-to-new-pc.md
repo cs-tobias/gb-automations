@@ -20,11 +20,11 @@ The whole move is two double-clicks: **Export** on the old PC, **Install** on th
 1. Copy the folder from the USB stick onto the PC (e.g. the Desktop). The installer runs as administrator, which can't see mapped network drives, and after a restart the USB stick may be gone.
 2. Double-click `Install.cmd`, click **Yes** on the Windows prompt, and type the password.
 3. If it says **RESTART NEEDED**: restart, sign in, and double-click `Install.cmd` again. It continues where it stopped.
-4. When it says **INSTALLED**, the status page and the live log window open. Every status row should turn green within a few minutes. The first run downloads about 5 GB.
+4. When it says **INSTALLED**, the status page and the **GB Automations** program open. Every status row should turn green within a few minutes. The first run downloads about 5 GB.
 5. Do the **Left for a human** items it prints (see [After installing](#after-installing)).
 6. Delete the move folder from the USB stick and from the new PC. It contains every password the system uses.
 
-After that, nothing is needed day to day. GB Automations starts by itself whenever someone signs in to Windows, and opens a window with its live log. Docker starts in the background, with no Docker window. The **GB Automations** icon on the desktop does the same: it starts whatever isn't running, then shows the live log. Closing the log window never stops the app.
+After that, nothing is needed day to day. Whenever someone signs in to Windows, the **GB Automations** program opens by itself and starts whatever isn't running. Docker starts in the background, with no Docker window. The program shows whether the app is running and its live log, and has a **Check for updates** button. The **GB Automations** icon on the desktop opens it. Closing it never stops the app.
 
 ## Rules
 
@@ -130,28 +130,59 @@ Each step checks first whether it's already done, so re-running is always safe.
     - the **GB Automations** desktop icon;
     - **GB Automations (autostart)** in the Startup folder.
 
-    Both open the same window, described below. Install then opens the status page and that window.
+    Both open the GB Automations program, described below. Install then opens the status page and the program.
 
 `-RestoreTestOnly` decrypts the move file and restores the dump into a throwaway `postgres:16-alpine` container. It compares migration level and row counts, then deletes the container. It installs nothing and doesn't touch a running app, so it's safe on the old PC too. `GBMOVE_PASSWORD` (environment variable) and `-NoPause` exist so the test can run unattended.
 
-### Start-GbAutomations (the desktop icon and the sign-in autostart)
+### The GB Automations program (the desktop icon and the sign-in autostart)
 
-One window that does this:
+[deploy/windows/GbAutomations.ps1](../deploy/windows/GbAutomations.ps1) is one window, with no console:
+
+- **A status light:** *Starting*, *Running*, *Not running* or *Installing update*. It comes from `/health`, checked every few seconds.
+- **The version** this PC runs: the git commit and its date.
+- **Check for updates:** runs [Update-GbAutomations.ps1](../deploy/windows/Update-GbAutomations.ps1). See [Updating](#updating).
+- **Status page:** opens `http://localhost:8000/status`.
+- **The live log:** `docker compose logs --follow api`, in the app's colours.
+  - It carries on where it stopped after a restart (an update, a crash, Docker restarting).
+  - Emoji in the log are left out, because the window can't draw them.
+
+When it opens, it runs `Start-GbAutomations.ps1 -NoLiveLog` (below) and shows its output at the top of the log. It also makes sure the desktop icon and the sign-in autostart point at itself, so `deploy\windows\GB Automations.cmd`, run once, sets up the icons on a PC that doesn't have them.
+
+Only one window opens at a time: clicking the icon again brings the open window forward. Closing it never stops the app. It can't be closed while an update is being installed.
+
+Everything slow (start-up, updates, the log) runs as a hidden child process whose output the window reads, so the window never freezes. It is plain Windows PowerShell 5.1 with WinForms, so it needs nothing installed. `-Preview` (optionally with `-ScreenshotPath`) shows the window with sample lines and starts nothing. Use it to check the look on the dev PC, which must never start the app.
+
+### Start-GbAutomations
+
+The start-up the program runs when it opens. Double-clicking `Start-GbAutomations.cmd` runs the same thing in a plain console, which then becomes the live log. That's useful for troubleshooting.
 
 1. Starts Ollama if it isn't answering.
 2. Starts Docker Desktop in the background if it's closed. Every run, it sets Docker's *Open Docker Dashboard when Docker Desktop starts* setting to off (`OpenUIOnStartupDisabled` in `%APPDATA%\Docker\settings-store.json`), so no Docker window appears. It never launches Docker a second time while Docker is still starting.
 3. Makes sure `cifs-utils` is still in Docker's VM. A Docker Desktop upgrade can drop it.
 4. Runs `docker compose up -d`. It never rebuilds.
 5. Waits up to 3 minutes for `/health`.
-6. Becomes the **live log**: `docker compose logs --follow api`, under the title *GB Automations - live log*.
-   - If the app restarts (an update, a crash, Docker restarting), the log carries on where it stopped.
-   - If the app didn't answer in step 5, it says so and shows the log anyway, since the log shows why.
-   - Clicking the icon while a live log window is open switches to that window instead of opening a second one.
-   - Closing the window only closes the view. The app keeps running.
+6. With `-NoLiveLog` (how the program runs it) it exits here: 0 if started, 1 if not. On its own, it becomes the live log in the console.
 
-If step 1–4 fails, the window shows the problem in red and stays open until Enter. Each start is logged to `C:\ProgramData\gb-automations\start-*.log`, but the live log itself isn't. It's always in `docker compose logs api`.
+Each start is logged to `C:\ProgramData\gb-automations\start-*.log`. The live log itself isn't; it's always in `docker compose logs api`. Shortcuts from before the program pass `-AtLogon`, which now just opens the program.
 
-Installs from before 2026-11-13 have a hidden sign-in shortcut that passes `-AtLogon`. The script answers that by reopening itself in a normal window, so old shortcuts get the live log too.
+## Updating
+
+The new PC's code folder is a git clone whose `origin` is `https://github.com/cs-tobias/gb-automations.git`. An update is whatever is on `main` there.
+
+1. **On the dev PC:** commit, then push to cs-tobias `main`. Nothing else is needed.
+2. **On the GB Automations PC:** click **Check for updates**. It lists the waiting changes (their commit messages) and asks before installing.
+
+Installing does this:
+
+- **Refuses** if tracked files were edited on that PC, or if the PC has commits that aren't on GitHub. It never overwrites local changes.
+- **Fast-forwards** to the new version.
+- **Rebuilds the app** (`docker compose up -d --build`) only if something baked into the app's image changed: code, migrations, Dockerfile, compose file or prompts. Docs and `deploy/windows` changes need no rebuild, and the app keeps running untouched. A rebuild means the app is offline for about a minute.
+- **Rolls back** if the rebuilt app doesn't answer within 4 minutes. It goes back to the previous version and rebuilds that. The exception is an update with a database migration: old code refuses to start against a newer database, so it stops and says so instead.
+- **Reopens the program** when the update changed the program itself.
+
+Each run is logged to `C:\ProgramData\gb-automations\update-*.log`. From a terminal, run `powershell -File deploy\windows\Update-GbAutomations.ps1` (add `-CheckOnly` to only look).
+
+New or changed `.env` settings don't travel with an update; secrets never go through GitHub. Set them on the PC itself, then run `docker compose up -d --force-recreate api`. If an update needs a setting that's missing, the app won't start, and the update rolls itself back.
 
 ### The status page
 
@@ -195,6 +226,10 @@ Check the log first: `C:\ProgramData\gb-automations\install-*.log` (or `export-*
 | Gmail row red | `secrets\gcp-service-account.json` is missing, or `SYNCED_MAILBOXES` in `.env` is empty. Delegation is tied to the key, not the PC, so it doesn't need redoing. |
 | "Restored database does not match the old PC" | The move file is damaged, or was made while the app was still writing. Make a new one on the old PC (normal mode, not `-TestOnly`). |
 | "This PC already has a GB Automations database" | Install never overwrites a database. If this PC's database is a leftover you really want replaced: `docker compose down`, then `docker volume rm gb-automations_db_data`, then run Install again. **This deletes that data.** |
+| Check for updates: "Files in the program folder were changed on this PC" | Someone edited code on the GB Automations PC. In `C:\Automatisering\gb-automations`, run `git status` to see what. Then either commit it from the dev PC instead, or discard it with `git checkout -- <file>`, and check again. |
+| Check for updates: "This PC has code that is not on GitHub" | A commit was made on the GB Automations PC itself. Push it from there or move it to the dev PC, then make the PC match GitHub: `git reset --hard origin/main` (this discards that commit on that PC). |
+| "The new version did not start correctly, so the previous version was put back" | The update was rolled back and the app runs as before. On the dev PC, read the update log (`C:\ProgramData\gb-automations\update-*.log` on the GB Automations PC) and `docker compose logs api`, fix it, then push again. |
+| The program doesn't open, or opens and closes | Run `deploy\windows\Start-GbAutomations.cmd` to see the start-up in a console. To see the program's own error, run `powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\GbAutomations.ps1` from a PowerShell window. |
 | Edited `.env` but nothing changed | `docker compose up -d --force-recreate api`. A plain restart doesn't reload `.env` ([misc/gotchas.md](misc/gotchas.md) §1). |
 | Status page shows "Work queue: N failed" | Fix the cause (the row shows it), then `Invoke-RestMethod -Method Post http://localhost:8000/debug/queue/retry-failed`. |
 

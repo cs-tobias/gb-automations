@@ -21,6 +21,14 @@ $script:GbStatusUrl = 'http://localhost:8000/status'
 $script:GbHealthUrl = 'http://localhost:8000/health'
 $script:GbDefaultInstallDir = 'C:\Automatisering\gb-automations'
 
+# When the GB Automations program runs a script, it reads the script's output
+# through a pipe as UTF-8. Without this, PS 5.1 writes to that pipe in the
+# old OEM codepage and decodes git/docker output with it too, which garbles
+# the Norwegian letters. A real console is left alone.
+if ([Console]::IsOutputRedirected) {
+    try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+}
+
 # Tables whose row counts go into the move manifest. These hold the state that
 # cannot be rebuilt from Notion/Gmail/Frame/Fiken (see docs/move-to-new-pc.md),
 # so a count mismatch after restore is the signal that something went wrong.
@@ -215,6 +223,60 @@ function Test-AppHealthy {
         return ($h.db -eq 'ok')
     } catch {
         return $false
+    }
+}
+
+function Wait-AppHealthy([int]$TimeoutSec = 180) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-AppHealthy) { return $true }
+        Start-Sleep -Seconds 3
+    }
+    return $false
+}
+
+# ------------------------------------------------------------ the program
+
+# The GB Automations program (GbAutomations.ps1) is a window, not a console:
+# it runs PowerShell with its console hidden. Every way of opening it - the
+# desktop icon, the sign-in autostart, "GB Automations.cmd", a relaunch after
+# an update - goes through these, so they all behave the same.
+function Get-GbProgramArguments([string]$RepoRoot) {
+    $program = Join-Path $RepoRoot 'deploy\windows\GbAutomations.ps1'
+    return "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$program`""
+}
+
+function Start-GbProgram([string]$RepoRoot) {
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Start-Process -FilePath $psExe -ArgumentList (Get-GbProgramArguments $RepoRoot) -WorkingDirectory $RepoRoot -WindowStyle Hidden
+}
+
+function Set-GbShortcuts([string]$RepoRoot) {
+    # The desktop icon and the sign-in autostart (Startup folder). Rewritten
+    # only when missing or pointing somewhere else, so this is cheap enough
+    # to run on every program start - which is also how installs from before
+    # the program get their shortcuts switched over.
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments = Get-GbProgramArguments $RepoRoot
+    $icon = Join-Path $RepoRoot 'deploy\windows\gb-automations.ico'
+    if (-not (Test-Path -LiteralPath $icon)) { $icon = "$env:SystemRoot\System32\imageres.dll,109" }
+    $shell = New-Object -ComObject WScript.Shell
+    $paths = @(
+        (Join-Path ([Environment]::GetFolderPath('Desktop')) 'GB Automations.lnk'),
+        (Join-Path ([Environment]::GetFolderPath('Startup')) 'GB Automations (autostart).lnk')
+    )
+    foreach ($path in $paths) {
+        $lnk = $shell.CreateShortcut($path)
+        if ((Test-Path -LiteralPath $path) -and $lnk.TargetPath -eq $psExe -and $lnk.Arguments -eq $arguments -and $lnk.IconLocation -like "$icon*") { continue }
+        $lnk.TargetPath = $psExe
+        $lnk.Arguments = $arguments
+        $lnk.WorkingDirectory = $RepoRoot
+        # 7 = start minimised: the console PowerShell briefly gets before
+        # -WindowStyle Hidden applies doesn't flash up on screen.
+        $lnk.WindowStyle = 7
+        $lnk.IconLocation = $icon
+        $lnk.Description = 'Open GB Automations'
+        $lnk.Save()
     }
 }
 

@@ -1,23 +1,26 @@
-# The "GB Automations" desktop icon, and the automatic start at Windows
-# sign-in (-AtLogon). Both are created by Install.ps1.
+# Starts GB Automations. The GB Automations program (GbAutomations.ps1) runs
+# this with -NoLiveLog when it opens; run on its own (Start-GbAutomations.cmd)
+# it's the same thing in a plain console, for troubleshooting.
 #
-# Opens one window that:
+# It:
 #   1. starts Ollama (AI tagging) if it isn't answering,
 #   2. starts Docker Desktop in the background (no Docker window) if it's off,
 #   3. makes sure the NAS helper is installed (a Docker upgrade can drop it),
 #   4. runs `docker compose up -d` (starts whatever isn't running; never
 #      rebuilds),
 #   5. waits until the app answers,
-#   6. then stays open as the app's live log, so you always see what it does.
+#   6. then (unless -NoLiveLog) stays open as the app's live log.
 #
 # Safe to run any time: every step is a no-op when that part is already up.
 # Closing the window only closes the log view. The app keeps running.
 #
-# -AtLogon: the sign-in autostart. Installs from before the live log made that
-# shortcut a hidden window, so it reopens this script in a normal window.
+# -NoLiveLog: just start, then exit (0 = started, 1 = couldn't). The program
+#   shows the log itself.
+# -AtLogon: what the sign-in shortcut of installs from before the program
+#   runs. It opens the program instead.
 
 [CmdletBinding()]
-param([switch]$AtLogon)
+param([switch]$AtLogon, [switch]$NoLiveLog)
 
 . (Join-Path $PSScriptRoot 'GbMove.Common.ps1')
 
@@ -25,9 +28,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $liveLogTitle = 'GB Automations - live log'
 
 if ($AtLogon) {
-    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    Start-Process -FilePath $psExe -WorkingDirectory $repoRoot `
-        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-GbProgram $repoRoot
     exit 0
 }
 
@@ -36,7 +37,7 @@ function Show-Problem([string]$Message, [string]$LogPath) {
     Write-Host "PROBLEM: $Message" -ForegroundColor Red
     Write-Note 'Help: docs\move-to-new-pc.md (Troubleshooting).'
     if ($LogPath) { Write-Note "Log of this start: $LogPath" }
-    Read-Host 'Press Enter to close this window' | Out-Null
+    if (-not $NoLiveLog) { Read-Host 'Press Enter to close this window' | Out-Null }
 }
 
 function Show-LiveLog([bool]$Answering) {
@@ -84,7 +85,8 @@ $existing = Get-Process -Name 'powershell' -ErrorAction SilentlyContinue |
     Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -eq $liveLogTitle } |
     Select-Object -First 1
 
-$Host.UI.RawUI.WindowTitle = 'GB Automations - starting'
+# Run by the program there is no console window to title.
+if (-not $NoLiveLog) { $Host.UI.RawUI.WindowTitle = 'GB Automations - starting' }
 $logPath = Start-GbLog 'start'
 $answering = $false
 try {
@@ -119,6 +121,7 @@ try {
         Start-Sleep -Seconds 3
     }
     if ($answering) { Write-Ok 'Running' }
+    elseif ($NoLiveLog) { Write-Attention 'The app has started but is not answering yet. The log shows why.' }
 } catch {
     Stop-GbLog
     Show-Problem $_.Exception.Message $logPath
@@ -127,6 +130,7 @@ try {
 # The live log runs for as long as the window is open: keep it out of the
 # start log, which is meant to record just this start.
 Stop-GbLog
+if ($NoLiveLog) { exit 0 }
 
 if ($existing) {
     Write-Ok 'The live log is already open in another window - switching to it.'
